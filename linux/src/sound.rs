@@ -48,6 +48,16 @@ pub fn play(data_dir: &Path, kind: SoundKind) {
     play_path(path);
 }
 
+pub fn play_sync(data_dir: &Path, kind: SoundKind) {
+    if std::env::var_os("PORTAL_DROP_NO_SOUND").is_some() {
+        return;
+    }
+    let Some(path) = find_sound(data_dir, kind) else {
+        return;
+    };
+    play_path_sync(path);
+}
+
 #[cfg(unix)]
 fn play_path(path: PathBuf) {
     tokio::spawn(async move {
@@ -71,9 +81,30 @@ fn play_path(path: PathBuf) {
     });
 }
 
+#[cfg(unix)]
+fn play_path_sync(path: PathBuf) {
+    for (program, args) in [
+        ("pw-play", vec![path.as_os_str().to_os_string()]),
+        ("paplay", vec![path.as_os_str().to_os_string()]),
+        ("aplay", vec!["-q".into(), path.as_os_str().to_os_string()]),
+    ] {
+        if let Ok(status) = std::process::Command::new(program)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            && status.success()
+        {
+            return;
+        }
+    }
+}
+
 #[cfg(windows)]
-fn play_path(path: PathBuf) {
+fn win_play_sound(path: &Path, async_play: bool) {
     use std::os::windows::ffi::OsStrExt;
+    const SND_SYNC: u32 = 0x0000;
     const SND_ASYNC: u32 = 0x0001;
     const SND_NODEFAULT: u32 = 0x0002;
     const SND_FILENAME: u32 = 0x0002_0000;
@@ -88,11 +119,22 @@ fn play_path(path: PathBuf) {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    std::thread::spawn(move || unsafe {
+    let mode = if async_play { SND_ASYNC } else { SND_SYNC };
+    unsafe {
         PlaySoundW(
             wide.as_ptr(),
             core::ptr::null_mut(),
-            SND_FILENAME | SND_ASYNC | SND_NODEFAULT,
+            SND_FILENAME | mode | SND_NODEFAULT,
         );
-    });
+    }
+}
+
+#[cfg(windows)]
+fn play_path(path: PathBuf) {
+    std::thread::spawn(move || win_play_sound(&path, true));
+}
+
+#[cfg(windows)]
+fn play_path_sync(path: PathBuf) {
+    win_play_sound(&path, false);
 }

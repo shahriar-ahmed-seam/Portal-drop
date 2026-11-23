@@ -435,6 +435,20 @@ fn dispatch_ipc(
                     Ok(json!({ "cancelled": true }))
                 }
             }
+            "pick_folder" => {
+                let mut dialog = rfd::FileDialog::new().set_title("Choose save folder");
+                if let Some(cur) = msg.payload["current"].as_str() {
+                    let p = Path::new(cur);
+                    if p.is_dir() {
+                        dialog = dialog.set_directory(p);
+                    }
+                }
+                if let Some(path) = dialog.pick_folder() {
+                    Ok(json!({ "path": path.to_string_lossy() }))
+                } else {
+                    Ok(json!({ "cancelled": true }))
+                }
+            }
             "send_files" => {
                 let paths: Vec<PathBuf> = msg.payload["paths"]
                     .as_array()
@@ -535,6 +549,22 @@ fn dispatch_ipc(
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 save_prefs(&dir, &prefs).map(|()| json!({ "ok": true }))
+            }
+            "get_settings" => run_cli(&cli, &["settings".into()], None)
+                .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string())),
+            "set_settings" => {
+                let settings = msg
+                    .payload
+                    .get("settings")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let body = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+                run_cli(&cli, &["settings".into(), "--stdin-json".into()], Some(&body))
+                    .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+            }
+            "test_sound" => {
+                let kind = msg.payload["kind"].as_str().unwrap_or("message").to_owned();
+                run_cli(&cli, &["test-sound".into(), kind], None).map(|_| json!({ "ok": true }))
             }
             "clear_history" => {
                 run_cli(&cli, &["clear-history".into()], None).map(|_| json!({ "ok": true }))

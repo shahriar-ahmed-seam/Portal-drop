@@ -58,6 +58,8 @@ pub struct Progress {
     pub offset: u64,
     pub transferred: u64,
     pub total: u64,
+    #[serde(default)]
+    pub started_at: i64,
     pub updated_at: i64,
 }
 
@@ -350,7 +352,10 @@ impl Store {
                AND (?2 OR (json_extract(item, '$.text_size') IS NULL
                            AND coalesce(json_extract(item, '$.chat_id'), ?3) = ?3))
                AND (?5 OR json_extract(item, '$.ttl_sec') IS NULL)
-             ORDER BY ts, rowid LIMIT 32",
+             ORDER BY CASE WHEN json_extract(item, '$.kind') = 'text'
+                            AND json_extract(item, '$.text_size') IS NULL THEN 0 ELSE 1 END,
+                      ts, rowid
+             LIMIT 32",
         )?;
         stmt.query_map(
             params![peer, modern, DEFAULT_CHAT, now, supports_ttl],
@@ -733,6 +738,7 @@ impl Store {
                     [id],
                 );
                 paths_to_remove.push(files.outgoing(id));
+                paths_to_remove.push(files.outgoing_ref(id));
                 paths_to_remove.push(files.sent_text(id));
             } else {
                 if kind == "text" {
@@ -790,6 +796,7 @@ impl Store {
         for (id, peer, raw) in expired_outbox {
             if let Ok(item) = serde_json::from_str::<Item>(&raw) {
                 paths_to_remove.push(files.outgoing(&id));
+                paths_to_remove.push(files.outgoing_ref(&id));
                 paths_to_remove.push(files.sent_text(&id));
                 let scrubbed = scrub_item(&item);
                 let _ = transaction.execute(
@@ -920,6 +927,7 @@ fn mark_chat_items_deleted(
         for (id, peer, direction, kind) in rows {
             if direction == "sent" {
                 paths.push(files.outgoing(&id));
+                paths.push(files.outgoing_ref(&id));
                 paths.push(files.sent_text(&id));
             } else if kind == "text" {
                 paths.push(files.received_text(&peer, &id));

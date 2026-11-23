@@ -12,7 +12,7 @@ use model::{Chat, Item, Kind, MAX_TTL_SEC, MIN_TTL_SEC, PORT, TEMP_TTL_SEC, vali
 use qrcode::{QrCode, render::unicode};
 use serde::Serialize;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{self, IsTerminal, Write},
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
@@ -150,6 +150,32 @@ enum Command {
     ReceiveFolder,
     /// Clear records of received files from the history list
     ClearHistory,
+    /// Get or update notification, sound, and save-folder preferences (JSON)
+    Settings {
+        /// Read full settings JSON from stdin
+        #[arg(long)]
+        stdin_json: bool,
+        #[arg(long)]
+        message_notify: Option<bool>,
+        #[arg(long)]
+        message_sound: Option<bool>,
+        #[arg(long)]
+        file_notify: Option<bool>,
+        #[arg(long)]
+        file_sound: Option<bool>,
+        #[arg(long)]
+        connected_notify: Option<bool>,
+        #[arg(long)]
+        connected_sound: Option<bool>,
+        /// Custom folder where received files are saved
+        #[arg(long = "save-dir")]
+        save_dir: Option<String>,
+        /// Reset save folder back to the default Downloads/Portal Drop location
+        #[arg(long)]
+        reset_save_dir: bool,
+    },
+    /// Preview one of the notification sounds (message, file, connected)
+    TestSound { kind: String },
 }
 
 fn main() -> Result<()> {
@@ -160,6 +186,7 @@ fn main() -> Result<()> {
             .context("set --data-dir for this desktop")?
             .join("portal-drop"),
     };
+    let receive_override = args.receive_dir.is_some();
     let receive = match args.receive_dir {
         Some(path) => std::path::absolute(path)?,
         None => dirs::download_dir()
@@ -168,7 +195,7 @@ fn main() -> Result<()> {
             .join("Portal Drop"),
     };
     let store = Store::initialize(&data)?;
-    let files = Files::new(&data, receive);
+    let files = Files::new(&data, receive, receive_override);
     match args.command {
         Command::Serve {
             listen,
@@ -428,12 +455,97 @@ fn main() -> Result<()> {
             server::wake_daemon(&data);
         }
         Command::ReceiveFolder => {
-            private_directory(files.receive_dir())?;
-            println!("{}", files.receive_dir().display());
+            let dir = files.receive_dir();
+            private_directory(&dir)?;
+            println!("{}", dir.display());
         }
         Command::ClearHistory => {
             let count = store.clear_history()?;
             println!("Cleared {count} received file entries.");
+        }
+        Command::Settings {
+            stdin_json,
+            message_notify,
+            message_sound,
+            file_notify,
+            file_sound,
+            connected_notify,
+            connected_sound,
+            save_dir,
+            reset_save_dir,
+        } => {
+            let mut settings = if stdin_json {
+                let mut raw = String::new();
+                io::Read::read_to_string(&mut io::stdin(), &mut raw)?;
+                serde_json::from_str::<model::NotificationSettings>(&raw)
+                    .context("invalid settings JSON")?
+            } else {
+                model::load_notification_settings(&data)
+            };
+            let mut changed = stdin_json;
+            if let Some(v) = message_notify {
+                settings.message_notify = v;
+                changed = true;
+            }
+            if let Some(v) = message_sound {
+                settings.message_sound = v;
+                changed = true;
+            }
+            if let Some(v) = file_notify {
+                settings.file_notify = v;
+                changed = true;
+            }
+            if let Some(v) = file_sound {
+                settings.file_sound = v;
+                changed = true;
+            }
+            if let Some(v) = connected_notify {
+                settings.connected_notify = v;
+                changed = true;
+            }
+            if let Some(v) = connected_sound {
+                settings.connected_sound = v;
+                changed = true;
+            }
+            if reset_save_dir {
+                settings.receive_dir = None;
+                changed = true;
+            } else if let Some(dir) = save_dir {
+                let trimmed = dir.trim();
+                settings.receive_dir = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(std::path::absolute(trimmed)?.to_string_lossy().into_owned())
+                };
+                changed = true;
+            }
+            if let Some(dir) = settings.receive_dir.as_deref() {
+                let trimmed = dir.trim();
+                if trimmed.is_empty() {
+                    settings.receive_dir = None;
+                } else {
+                    let abs = std::path::absolute(trimmed)?;
+                    private_directory(&abs)?;
+                    settings.receive_dir = Some(abs.to_string_lossy().into_owned());
+                }
+            }
+            if changed {
+                model::save_notification_settings(&data, &settings)?;
+            }
+            print_json(&SettingsView {
+                settings,
+                effective_receive_dir: files.receive_dir().to_string_lossy().into_owned(),
+                default_receive_dir: files.default_receive_dir().to_string_lossy().into_owned(),
+            })?;
+        }
+        Command::TestSound { kind } => {
+            let sound_kind = match kind.to_ascii_lowercase().as_str() {
+                "message" => sound::SoundKind::Message,
+                "file" => sound::SoundKind::File,
+                "connected" => sound::SoundKind::Connected,
+                other => bail!("unknown sound kind: {other} (use message, file, or connected)"),
+            };
+            sound::play_sync(&data, sound_kind);
         }
     }
     Ok(())
@@ -473,12 +585,20 @@ fn queue(
     item.ttl_sec = ttl;
     if let Err(error) = store.queue(peer, &item) {
         if item.payload().is_some() {
-            let _ = fs::remove_file(files.outgoing_payload(&item));
+            files.remove_outgoing(&item);
         }
         return Err(error);
     }
     println!("Queued {}", item.id);
     Ok(())
+}
+
+#[derive(Serialize)]
+struct SettingsView {
+    #[serde(flatten)]
+    settings: model::NotificationSettings,
+    effective_receive_dir: String,
+    default_receive_dir: String,
 }
 
 #[derive(Serialize)]

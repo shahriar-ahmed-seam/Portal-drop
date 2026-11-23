@@ -5,20 +5,26 @@ import android.net.ConnectivityManager
 import android.net.InetAddresses
 import android.net.Network
 import android.net.NetworkCapabilities
+import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.net.InetAddress
 import java.net.Proxy
+import java.net.Socket
 import java.net.URI
 import java.security.MessageDigest
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.X509TrustManager
 import org.json.JSONArray
 import org.json.JSONObject
@@ -116,7 +122,7 @@ internal fun InputStream.copyTransfer(
     progress: (Long) -> Unit,
 ): Long {
     var copied = 0L
-    val buffer = ByteArray(64 * 1024)
+    val buffer = ByteArray(256 * 1024)
     while (true) {
         val count = read(buffer)
         if (count == -1) return copied
@@ -126,38 +132,65 @@ internal fun InputStream.copyTransfer(
     }
 }
 
+private class NoDelaySslSocketFactory(private val delegate: SSLSocketFactory) : SSLSocketFactory() {
+    override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
+    override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
+
+    private fun tune(socket: Socket): Socket = socket.apply {
+        runCatching { tcpNoDelay = true }
+    }
+
+    override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket =
+        tune(delegate.createSocket(s, host, port, autoClose))
+    override fun createSocket(host: String, port: Int): Socket =
+        tune(delegate.createSocket(host, port))
+    override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+        tune(delegate.createSocket(host, port, localHost, localPort))
+    override fun createSocket(host: InetAddress, port: Int): Socket =
+        tune(delegate.createSocket(host, port))
+    override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket =
+        tune(delegate.createSocket(address, port, localAddress, localPort))
+}
+
 internal class PortalSession(
     private val peer: Peer,
     private val network: Network,
     private val onPeerMeta: ((PeerMeta) -> Unit)? = null,
 ) {
-    private val active = AtomicReference<HttpsURLConnection?>()
+    private val activeConnections: MutableSet<HttpsURLConnection> =
+        Collections.newSetFromMap(ConcurrentHashMap())
     private val eventConnection = AtomicReference<HttpsURLConnection?>()
     @Volatile private var cancelled = false
 
     private val localDeviceName = localAndroidDeviceName()
 
-    private val socketFactory = SSLContext.getInstance("TLS").apply {
-        init(null, arrayOf(object : X509TrustManager {
-            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+    private val socketFactory: SSLSocketFactory = NoDelaySslSocketFactory(
+        SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf(object : X509TrustManager {
+                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
 
-            override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) {
-                throw CertificateException("Unexpected client certificate.")
-            }
-
-            override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
-                val leaf = chain.firstOrNull()
-                if (leaf == null || !isPinned(leaf)) {
-                    throw CertificateException("The certificate does not match the paired device.")
+                override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) {
+                    throw CertificateException("Unexpected client certificate.")
                 }
-                leaf.checkValidity()
-            }
-        }), null)
-    }.socketFactory
+
+                override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
+                    val leaf = chain.firstOrNull()
+                    if (leaf == null || !isPinned(leaf)) {
+                        throw CertificateException("The certificate does not match the paired device.")
+                    }
+                    leaf.checkValidity()
+                }
+            }), null)
+        }.socketFactory,
+    )
 
     fun cancel() {
         cancelled = true
-        active.getAndSet(null)?.disconnect()
+        val snapshot = activeConnections.toList()
+        activeConnections.clear()
+        for (connection in snapshot) {
+            runCatching { connection.disconnect() }
+        }
         eventConnection.getAndSet(null)?.disconnect()
     }
 
@@ -204,13 +237,30 @@ internal class PortalSession(
     fun upload(item: PortalItem, offset: Long, file: File, progress: (Long) -> Unit) {
         val size = checkNotNull(item.binarySize)
         if (!file.isFile || file.length() != size) throw IOException("The queued file is missing or incomplete.")
+        uploadStream(item, offset, {
+            file.inputStream().apply { channel.position(offset) }
+        }, progress)
+    }
+
+    fun uploadStream(
+        item: PortalItem,
+        offset: Long,
+        openAtOffset: () -> InputStream,
+        progress: (Long) -> Unit,
+    ) {
+        val size = checkNotNull(item.binarySize)
         request("PUT", "/v1/inbox/${item.id}/file", "offset=$offset", 204, output = { http ->
             http.doOutput = true
             http.setFixedLengthStreamingMode(size - offset)
             http.setRequestProperty("Content-Type", "application/octet-stream")
-            file.inputStream().use { input ->
-                input.channel.position(offset)
-                http.outputStream.use { output -> input.copyTransfer(output, offset, progress) }
+            openAtOffset().use { input ->
+                BufferedOutputStream(http.outputStream, 64 * 1024).use { output ->
+                    val copied = input.copyTransfer(output, offset, progress)
+                    output.flush()
+                    if (copied != size - offset) {
+                        throw IOException("The file changed while uploading.")
+                    }
+                }
             }
         }) { }
     }
@@ -295,7 +345,7 @@ internal class PortalSession(
         if (cancelled) throw IOException("The connection is paused.")
         val url = URI("https", null, peer.host, peer.port, path, query, null).toURL()
         val http = network.openConnection(url, Proxy.NO_PROXY) as HttpsURLConnection
-        active.set(http)
+        activeConnections.add(http)
         var failed = true
         try {
             if (cancelled) throw IOException("The connection is paused.")
@@ -312,7 +362,7 @@ internal class PortalSession(
             failed = false
             return result
         } finally {
-            active.compareAndSet(http, null)
+            activeConnections.remove(http)
             // Keep healthy connections pooled for instant TLS keep-alive reuse; disconnect only on error/cancel.
             if (failed || cancelled) http.disconnect()
         }

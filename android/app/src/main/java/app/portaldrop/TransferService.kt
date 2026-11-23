@@ -15,21 +15,28 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.MediaPlayer
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Log
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.io.InputStream
 import java.io.RandomAccessFile
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -49,6 +56,8 @@ class TransferService : Service() {
     enum class Status { PAUSED, CONNECTING, CONNECTED, OFFLINE, UNPAIRED }
 
     private val wakeups = LinkedBlockingQueue<Unit>(1)
+    private val messageWakeups = LinkedBlockingQueue<Unit>(1)
+    private val inFlight = ConcurrentHashMap.newKeySet<String>()
     private val store by lazy { PortalStore.get(this) }
     private val discovery by lazy { PortalDiscovery(applicationContext) }
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
@@ -93,8 +102,10 @@ class TransferService : Service() {
             connectivity.registerNetworkCallback(request, observer)
             observing = true
             worker.execute(::runTransfers)
+            messageExecutor.execute(::runFastMessages)
         }
         signal()
+        signalMessages()
         return START_STICKY
     }
 
@@ -104,6 +115,7 @@ class TransferService : Service() {
         discovery.stop()
         if (observing) connectivity.unregisterNetworkCallback(observer)
         signal()
+        signalMessages()
         if (instance === this) {
             instance = null
             if (status != Status.UNPAIRED) {
@@ -239,7 +251,10 @@ class TransferService : Service() {
                     try {
                         link.session.streamEvents(
                             onReady = { link.supportsEvents = true },
-                            onSync = { signal() },
+                            onSync = {
+                                signal()
+                                signalMessages()
+                            },
                         )
                         if (running && currentLink === link) {
                             Thread.sleep(300L)
@@ -360,36 +375,181 @@ class TransferService : Service() {
             (received && incomingTransfers.size > 1) || (sent && outgoingTransfers.size > 1))
     }
 
+    private fun runFastMessages() {
+        while (running) {
+            try {
+                messageWakeups.poll(3_000L, TimeUnit.MILLISECONDS)
+                if (!running) break
+                val link = currentLink ?: continue
+                if (status != Status.CONNECTED) continue
+                val peer = store.peer() ?: continue
+                if (peer.fingerprint != link.peer.fingerprint) continue
+                syncFastMessages(peer, link)
+            } catch (_: Exception) {
+                // Main transfer loop handles reconnects/backoff; fast lane retries quietly.
+            }
+        }
+    }
+
+    private fun syncFastMessages(peer: Peer, link: Link) {
+        val session = link.session
+        // 1. Send outgoing inline text messages immediately even while bulk files upload/download.
+        val outgoing = store.outgoingTexts(peer)
+        for (row in outgoing) {
+            if (!running || currentLink !== link) return
+            if (link.supportsChats == false &&
+                (row.item.chatId != DEFAULT_CHAT_ID || row.item.replyTo != null || row.item.ttlSec != null)
+            ) {
+                fail(peer, row, "Update Portal Drop on your computer to deliver this item.")
+                continue
+            }
+            if (row.item.ttlSec != null && link.protocolVersion < 3) {
+                fail(peer, row, "Update Portal Drop on your computer to send temporary messages.")
+                continue
+            }
+            send(peer, row, session)
+        }
+        // 2. Receive & acknowledge incoming inline text messages without waiting for bulk files.
+        val available = session.outbox()
+        val fastIncoming = available.filter { it.binarySize == null }
+        if (fastIncoming.isNotEmpty()) {
+            if (link.supportsChats != false && fastIncoming.any { store.needsChat(peer, it.chatId) }) {
+                runCatching {
+                    if (store.mergeChats(peer, session.chats())) publishUpdate(this)
+                }
+            }
+            var changed = false
+            for (item in fastIncoming) {
+                if (!running || currentLink !== link) return
+                val key = "in:${item.id}"
+                if (!inFlight.add(key)) continue
+                try {
+                    val row = store.incoming(peer, item)
+                    if (!row.deleted && !row.notified) notifyIncoming(peer, row.item)
+                    session.acknowledge(row.item.id)
+                    changed = true
+                } finally {
+                    inFlight.remove(key)
+                }
+            }
+            if (changed) publishUpdate(this)
+        }
+        // 3. Push any local chat renames/creates/deletes immediately.
+        if (link.supportsChats == true && store.dirtyChats(peer).isNotEmpty()) {
+            for (chat in store.dirtyChats(peer)) {
+                if (!running || currentLink !== link) return
+                session.publishChat(chat)
+                store.markChatSynced(peer, chat)
+            }
+        }
+    }
+
     private fun send(peer: Peer, row: ChatItem, session: PortalSession): Boolean {
         val item = row.item
-        if (store.isDeleted(peer, row)) return false
-        val path = when {
-            item.kind == "file" -> store.stagedFile(item.id)
-            item.textSize != null -> store.textFile(peer.fingerprint, item.id, incoming = false)
-            else -> null
-        }
+        val key = "out:${item.id}"
+        if (!inFlight.add(key)) return false
         try {
-            val offer = session.offer(item)
-            if (!offer.received) {
-                if (path == null) throw IOException("Your computer did not save the text message.")
-                if (!path.isFile || path.length() != item.binarySize) {
-                    return fail(peer, row, "The queued data is missing or has changed.")
+            if (store.isDoneOrDeleted(peer, row)) return false
+            val sourceUri = if (item.kind == "file") row.sourceUri else null
+            val path = when {
+                sourceUri != null -> null
+                item.kind == "file" -> store.stagedFile(item.id)
+                item.textSize != null -> store.textFile(peer.fingerprint, item.id, incoming = false)
+                else -> null
+            }
+            try {
+                val offer = session.offer(item)
+                if (!offer.received) {
+                    if (sourceUri != null) {
+                        showTransfer(row, offer.offset) { progress ->
+                            session.uploadStream(item, offer.offset, {
+                                openSourceUriAtOffset(sourceUri, offer.offset)
+                            }, progress)
+                        }
+                    } else {
+                        if (path == null) throw IOException("Your computer did not save the text message.")
+                        if (!path.isFile || path.length() != item.binarySize) {
+                            return fail(peer, row, "The queued data is missing or has changed.")
+                        }
+                        showTransfer(row, offer.offset) { progress ->
+                            session.upload(item, offer.offset, path, progress)
+                        }
+                    }
                 }
-                showTransfer(row, offer.offset) { progress -> session.upload(item, offer.offset, path, progress) }
+            } catch (error: PortalHttpException) {
+                if (error.status in listOf(400, 413, 415, 422)) {
+                    return fail(peer, row, "Computer could not accept this item (HTTP ${error.status}).")
+                }
+                throw error
+            } catch (error: FileNotFoundException) {
+                if (sourceUri != null) {
+                    return fail(peer, row, "The original file is no longer accessible.")
+                }
+                throw error
+            } catch (error: SecurityException) {
+                if (sourceUri != null) {
+                    return fail(peer, row, "Permission to read the original file was lost.")
+                }
+                throw error
             }
-        } catch (error: PortalHttpException) {
-            if (error.status in listOf(400, 413, 415, 422)) {
-                return fail(peer, row, "Computer could not accept this item (HTTP ${error.status}).")
-            }
-            throw error
+            store.complete(peer, item.id, incoming = false)
+            if (item.kind == "file" && sourceUri == null) path?.delete()
+            publishUpdate(this)
+            return true
+        } finally {
+            inFlight.remove(key)
         }
-        store.complete(peer, item.id, incoming = false)
-        if (item.kind == "file") path?.delete()
-        publishUpdate(this)
-        return true
+    }
+
+    private fun openSourceUriAtOffset(uri: Uri, offset: Long): InputStream {
+        val pfd = try {
+            contentResolver.openFileDescriptor(uri, "r")
+        } catch (_: Exception) {
+            null
+        }
+        if (pfd != null) {
+            val stream = ParcelFileDescriptor.AutoCloseInputStream(pfd)
+            if (offset > 0) {
+                try {
+                    stream.channel.position(offset)
+                } catch (_: IOException) {
+                    skipFully(stream, offset)
+                }
+            }
+            return stream
+        }
+        val input = contentResolver.openInputStream(uri)
+            ?: throw FileNotFoundException("Could not open source file.")
+        if (offset > 0) skipFully(input, offset)
+        return input
+    }
+
+    private fun skipFully(input: InputStream, bytes: Long) {
+        var remaining = bytes
+        val discard = ByteArray(64 * 1024)
+        while (remaining > 0) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0) {
+                remaining -= skipped
+            } else {
+                val read = input.read(discard, 0, minOf(remaining, discard.size.toLong()).toInt())
+                if (read == -1) throw IOException("Source file ended unexpectedly.")
+                remaining -= read
+            }
+        }
     }
 
     private fun receive(peer: Peer, row: ChatItem, session: PortalSession): Boolean {
+        val key = "in:${row.item.id}"
+        if (!inFlight.add(key)) return false
+        try {
+            return receiveLocked(peer, row, session)
+        } finally {
+            inFlight.remove(key)
+        }
+    }
+
+    private fun receiveLocked(peer: Peer, row: ChatItem, session: PortalSession): Boolean {
         if (store.isDeleted(peer, row)) return false
         if (row.item.textSize != null) return receiveText(peer, row, session)
         val item = row.item
@@ -402,6 +562,8 @@ class TransferService : Service() {
         val descriptor = try {
             contentResolver.openFileDescriptor(uri, "rw")
         } catch (_: FileNotFoundException) {
+            null
+        } catch (_: SecurityException) {
             null
         } ?: return fail(peer, row, "Could not open the download for writing.")
         ParcelFileDescriptor.AutoCloseOutputStream(descriptor).use { output ->
@@ -421,19 +583,30 @@ class TransferService : Service() {
         }
         val digest = contentResolver.openInputStream(uri)?.use { it.sha256() }
         if (digest != item.sha256) {
-            contentResolver.delete(uri, null, null)
+            deleteTargetUri(uri)
             store.setDownloadUri(peer, item.id, null)
             return fail(peer, row, "The downloaded file failed verification. Portal Drop will retry.")
         }
-        val published = contentResolver.update(uri,
-            ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-        if (published == 0) return fail(peer, row, "Could not finish saving the download.")
+        if (uri.authority == MediaStore.AUTHORITY) {
+            val published = contentResolver.update(uri,
+                ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            if (published == 0) return fail(peer, row, "Could not finish saving the download.")
+        }
         item.ttlSec?.let { store.refreshExpiry(peer, item.id, it) }
         store.complete(peer, item.id, incoming = true)
         if (!store.isDeleted(peer, row)) notifyIncoming(peer, item)
         publishUpdate(this)
         session.acknowledge(item.id)
         return true
+    }
+
+    private fun deleteTargetUri(uri: Uri) {
+        if (uri.authority == MediaStore.AUTHORITY) {
+            runCatching { contentResolver.delete(uri, null, null) }
+            return
+        }
+        val deleted = runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }.getOrDefault(false)
+        if (!deleted) runCatching { contentResolver.delete(uri, null, null) }
     }
 
     private fun receiveText(peer: Peer, row: ChatItem, session: PortalSession): Boolean {
@@ -471,21 +644,71 @@ class TransferService : Service() {
         row.downloadUri?.let { uri ->
             try {
                 contentResolver.openFileDescriptor(uri, "r")?.use { return uri }
-            } catch (_: FileNotFoundException) {
-                // The media provider can expire an abandoned partial file.
+            } catch (_: Exception) {
+                // The media provider or custom storage can expire/remove an abandoned partial file.
             }
         }
         val name = safeFilename(checkNotNull(row.item.name))
         val mime = resolveMimeType(name)
+        val category = downloadCategory(name, mime)
+        val customTree = store.saveTreeUri()
+        if (customTree != null) {
+            val uri = createSafDownload(customTree, category, name, mime)
+            store.setDownloadUri(peer, row.item.id, uri)
+            return uri
+        }
         val downloads = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val uri = contentResolver.insert(downloads, ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Portal Drop/${downloadCategory(name, mime)}")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Portal Drop/$category")
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }) ?: throw IOException("Could not create a file in Downloads.")
         store.setDownloadUri(peer, row.item.id, uri)
         return uri
+    }
+
+    private fun createSafDownload(treeUri: Uri, category: String, name: String, mime: String): Uri {
+        try {
+            val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+            val targetFolderUri = findOrCreateSubdir(treeUri, rootDocId, rootDocUri, category) ?: rootDocUri
+            return DocumentsContract.createDocument(contentResolver, targetFolderUri, mime, name)
+                ?: throw IOException("Could not create file in the chosen save folder. Check your SD card or Save location.")
+        } catch (error: IOException) {
+            throw error
+        } catch (error: Exception) {
+            throw IOException("Could not write to the chosen save folder. Check your SD card or pick another Save location.", error)
+        }
+    }
+
+    private fun findOrCreateSubdir(treeUri: Uri, parentDocId: String, parentDocUri: Uri, name: String): Uri? {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+        )
+        runCatching {
+            contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val docId = cursor.getString(0) ?: continue
+                    val display = cursor.getString(1) ?: continue
+                    val mimeType = cursor.getString(2) ?: ""
+                    if (display == name && mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        return DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                    }
+                }
+            }
+        }
+        return runCatching {
+            DocumentsContract.createDocument(
+                contentResolver,
+                parentDocUri,
+                DocumentsContract.Document.MIME_TYPE_DIR,
+                name,
+            )
+        }.getOrNull()
     }
 
     private fun downloadCategory(name: String, mime: String): String {
@@ -520,9 +743,31 @@ class TransferService : Service() {
             publishUpdate(this)
         }
         report(start)
+        val wifiLock = runCatching {
+            val wm = applicationContext.getSystemService(WifiManager::class.java)
+            val mode = if (Build.VERSION.SDK_INT >= 29) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wm?.createWifiLock(mode, "PortalDrop:Transfer")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.getOrNull()
+        val wakeLock = runCatching {
+            val pm = applicationContext.getSystemService(PowerManager::class.java)
+            pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PortalDrop:Transfer")?.apply {
+                setReferenceCounted(false)
+                acquire(30 * 60 * 1000L)
+            }
+        }.getOrNull()
         try {
             transfer(report)
         } finally {
+            runCatching { if (wifiLock?.isHeld == true) wifiLock.release() }
+            runCatching { if (wakeLock?.isHeld == true) wakeLock.release() }
             progress = null
             publishUpdate(this)
         }
@@ -560,15 +805,59 @@ class TransferService : Service() {
             setSound(soundUri("portal_file"), audioAttrs)
         })
         notifications.createNotificationChannel(NotificationChannel(
+            FILE_SILENT_CHANNEL, "Received files (silent)", NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            setSound(null, null)
+            enableVibration(false)
+        })
+        notifications.createNotificationChannel(NotificationChannel(
             MESSAGE_CHANNEL, "Received messages", NotificationManager.IMPORTANCE_HIGH,
         ).apply {
             setSound(soundUri("portal_message"), audioAttrs)
+        })
+        notifications.createNotificationChannel(NotificationChannel(
+            MESSAGE_SILENT_CHANNEL, "Received messages (silent)", NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            setSound(null, null)
+            enableVibration(false)
         })
         notifications.createNotificationChannel(NotificationChannel(
             CONNECTED_CHANNEL, "Device connected", NotificationManager.IMPORTANCE_DEFAULT,
         ).apply {
             setSound(soundUri("portal_connected"), audioAttrs)
         })
+        notifications.createNotificationChannel(NotificationChannel(
+            CONNECTED_SILENT_CHANNEL, "Device connected (silent)", NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply {
+            setSound(null, null)
+            enableVibration(false)
+        })
+    }
+
+    private fun playRawSound(resId: Int) {
+        try {
+            val audio = getSystemService(AudioManager::class.java)
+            if (audio?.ringerMode != AudioManager.RINGER_MODE_NORMAL) return
+            val player = MediaPlayer()
+            player.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build(),
+            )
+            resources.openRawResourceFd(resId).use { afd ->
+                player.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+            }
+            player.setOnCompletionListener { it.release() }
+            player.setOnErrorListener { mp, _, _ ->
+                mp.release()
+                true
+            }
+            player.prepare()
+            player.start()
+        } catch (error: Exception) {
+            Log.d(TAG, "Could not play notification sound.", error)
+        }
     }
 
     private fun serviceNotification(): Notification =
@@ -590,13 +879,19 @@ class TransferService : Service() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
     private fun notifyConnected(peer: Peer) {
+        val prefs = store.notificationSettings()
+        if (!prefs.connectedNotify) {
+            if (prefs.connectedSound) playRawSound(R.raw.portal_connected)
+            return
+        }
         if (!notificationsAllowed()) return
         try {
             val label = peer.shortLabel()
+            val channel = if (prefs.connectedSound) CONNECTED_CHANNEL else CONNECTED_SILENT_CHANNEL
             notifications.notify(
                 "portal-connected",
                 CONNECTED_ID,
-                Notification.Builder(this, CONNECTED_CHANNEL)
+                Notification.Builder(this, channel)
                     .setSmallIcon(R.drawable.ic_portal_notification)
                     .setContentTitle("Device connected")
                     .setContentText("Connected to $label")
@@ -610,17 +905,27 @@ class TransferService : Service() {
     }
 
     private fun notifyIncoming(peer: Peer, item: PortalItem) {
+        val prefs = store.notificationSettings()
+        val isText = item.kind == "text"
+        val showBanner = if (isText) prefs.messageNotify else prefs.fileNotify
+        val playSound = if (isText) prefs.messageSound else prefs.fileSound
         try {
-            if (notificationsAllowed()) {
-                if (item.kind == "text") showMessageNotification(peer, item)
-                else notifications.notify(item.id, RECEIVED_ID, Notification.Builder(this, FILE_CHANNEL)
-                    .setSmallIcon(R.drawable.ic_portal_notification)
-                    .setContentTitle("File received from ${peer.platformLabel()}")
-                    .setContentText(item.name)
-                    .setContentIntent(openApp(item.chatId))
-                    .setAutoCancel(true)
-                    .setOnlyAlertOnce(true)
-                    .build())
+            if (!showBanner) {
+                if (playSound) playRawSound(if (isText) R.raw.portal_message else R.raw.portal_file)
+            } else if (notificationsAllowed()) {
+                if (isText) {
+                    showMessageNotification(peer, item, if (playSound) MESSAGE_CHANNEL else MESSAGE_SILENT_CHANNEL)
+                } else {
+                    val channel = if (playSound) FILE_CHANNEL else FILE_SILENT_CHANNEL
+                    notifications.notify(item.id, RECEIVED_ID, Notification.Builder(this, channel)
+                        .setSmallIcon(R.drawable.ic_portal_notification)
+                        .setContentTitle("File received from ${peer.platformLabel()}")
+                        .setContentText(item.name)
+                        .setContentIntent(openApp(item.chatId))
+                        .setAutoCancel(true)
+                        .setOnlyAlertOnce(true)
+                        .build())
+                }
             }
         } catch (error: RuntimeException) {
             // Notifications are secondary to the durable chat and transfer receipt.
@@ -629,7 +934,7 @@ class TransferService : Service() {
         store.markNotified(peer, item.id)
     }
 
-    private fun showMessageNotification(peer: Peer, item: PortalItem) {
+    private fun showMessageNotification(peer: Peer, item: PortalItem, channelId: String) {
         val title = store.chat(peer, item.chatId)?.title ?: "Portal Drop"
         val preview = item.text?.take(1000) ?: "Long message received"
         val user = Person.Builder().setName("You").build()
@@ -648,7 +953,7 @@ class TransferService : Service() {
             .setSemanticAction(Notification.Action.SEMANTIC_ACTION_REPLY)
             .setAllowGeneratedReplies(false)
             .build()
-        notifications.notify(item.id, MESSAGE_ID, Notification.Builder(this, MESSAGE_CHANNEL)
+        notifications.notify(item.id, MESSAGE_ID, Notification.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_portal_notification)
             .setContentTitle(title)
             .setContentText(preview)
@@ -676,6 +981,7 @@ class TransferService : Service() {
     }
 
     private fun signal() { wakeups.offer(Unit) }
+    private fun signalMessages() { messageWakeups.offer(Unit) }
     private fun await(milliseconds: Long) { wakeups.poll(milliseconds, TimeUnit.MILLISECONDS) }
 
     private fun setStatus(newStatus: Status) {
@@ -701,8 +1007,11 @@ class TransferService : Service() {
         private const val ACTION_PAUSE = "app.portaldrop.PAUSE"
         private const val CONNECTION_CHANNEL = "background_connection"
         private const val FILE_CHANNEL = "received_files_v3"
+        private const val FILE_SILENT_CHANNEL = "received_files_silent_v3"
         private const val MESSAGE_CHANNEL = "received_messages_v3"
+        private const val MESSAGE_SILENT_CHANNEL = "received_messages_silent_v3"
         private const val CONNECTED_CHANNEL = "device_connected_v3"
+        private const val CONNECTED_SILENT_CHANNEL = "device_connected_silent_v3"
         private const val SERVICE_ID = 100
         private const val RECEIVED_ID = 101
         internal const val MESSAGE_ID = 102
@@ -717,6 +1026,9 @@ class TransferService : Service() {
 
         private val worker = Executors.newSingleThreadExecutor { task ->
             Thread(task, "Portal Drop transfers").apply { isDaemon = true }
+        }
+        private val messageExecutor = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "Portal Drop messages").apply { isDaemon = true }
         }
         private val eventExecutor = Executors.newSingleThreadExecutor { task ->
             Thread(task, "Portal Drop events").apply { isDaemon = true }
@@ -743,7 +1055,15 @@ class TransferService : Service() {
             publishUpdate(context)
         }
 
-        fun wake() { instance?.signal() }
+        fun wake() {
+            instance?.signal()
+            instance?.signalMessages()
+        }
+
+        fun wakeMessages() {
+            instance?.signalMessages()
+            instance?.signal()
+        }
 
         internal fun publishUpdate(context: Context) {
             context.sendBroadcast(Intent(ACTION_UPDATE).setPackage(context.packageName))

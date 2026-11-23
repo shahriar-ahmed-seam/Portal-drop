@@ -367,6 +367,82 @@ def v3_smoke(desktop):
     )
 
 
+    # 5. Notification, sound & custom save folder settings CLI round-trip
+    default_settings = json.loads(desktop.cli("settings"))
+    for key in (
+        "message_notify",
+        "message_sound",
+        "file_notify",
+        "file_sound",
+        "connected_notify",
+        "connected_sound",
+    ):
+        assert default_settings[key] is True, default_settings
+    assert "effective_receive_dir" in default_settings and "default_receive_dir" in default_settings
+    custom_dir = desktop.directory / "custom-save"
+    updated_settings = json.loads(
+        desktop.cli(
+            "settings",
+            "--connected-notify=false",
+            "--connected-sound=false",
+            "--message-sound=false",
+            "--save-dir",
+            str(custom_dir),
+        )
+    )
+    assert updated_settings["connected_notify"] is False and updated_settings["connected_sound"] is False
+    assert updated_settings["message_notify"] is True and updated_settings["message_sound"] is False
+    assert updated_settings.get("receive_dir") == str(custom_dir)
+    assert custom_dir.is_dir()
+    assert json.loads(desktop.cli("settings")) == updated_settings
+    reset_settings = json.loads(desktop.cli("settings", "--reset-save-dir"))
+    assert "receive_dir" not in reset_settings
+
+    # 6. Concurrent text message delivery while a file upload is in progress (per-item lock)
+    slow_data = b"0123456789abcdef" * 4096
+    slow_file = {
+        "id": str(uuid.uuid4()),
+        "kind": "file",
+        "ts": int(time.time() * 1000),
+        "name": "concurrent-video.mp4",
+        "size": len(slow_data),
+        "sha256": hashlib.sha256(slow_data).hexdigest(),
+    }
+    assert desktop.request("POST", "/v1/inbox", payload=slow_file, version=3) == {"received": False, "offset": 0}
+    conn = desktop.connect(timeout=10)
+    conn.putrequest("PUT", f"/v1/inbox/{slow_file['id']}/file?offset=0")
+    conn.putheader("Authorization", f"Bearer {desktop.token}")
+    conn.putheader("Content-Type", "application/octet-stream")
+    conn.putheader("Content-Length", str(len(slow_data)))
+    conn.putheader("X-Portal-Drop-Version", "3")
+    conn.endheaders()
+    half = len(slow_data) // 2
+    conn.send(slow_data[:half])
+    # Verify progress reports started_at while upload is mid-stream
+    wait_until(
+        lambda: any(
+            p["id"] == slow_file["id"] and p["direction"] == "received" and p.get("started_at", 0) > 0
+            for p in json.loads(desktop.cli("progress", "--json"))
+        ),
+        timeout=5,
+    )
+    # Send an inline text message on a separate connection while file upload is still open!
+    concurrent_msg = {
+        "id": str(uuid.uuid4()),
+        "kind": "text",
+        "ts": int(time.time() * 1000),
+        "text": "Hello while video is uploading!",
+    }
+    assert desktop.request("POST", "/v1/inbox", payload=concurrent_msg, version=3) == {"received": True, "offset": 0}
+    # Finish the paused upload cleanly
+    conn.send(slow_data[half:])
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 204, resp.status
+    assert (desktop.directory / "received" / "Videos" / "concurrent-video.mp4").read_bytes() == slow_data
+
+
 if __name__ == "__main__":
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "linux/target/debug/portal-drop").resolve()
     with tempfile.TemporaryDirectory(prefix="portal-drop-smoke-") as directory:

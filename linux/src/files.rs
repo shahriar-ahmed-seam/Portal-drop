@@ -11,12 +11,13 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const BUFFER_SIZE: usize = 128 * 1024;
+pub const BUFFER_SIZE: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct Files {
     data: PathBuf,
-    receive: PathBuf,
+    default_receive: PathBuf,
+    receive_override: bool,
 }
 
 pub enum Complete {
@@ -26,10 +27,11 @@ pub enum Complete {
 }
 
 impl Files {
-    pub fn new(data: &Path, receive: PathBuf) -> Self {
+    pub fn new(data: &Path, receive: PathBuf, receive_override: bool) -> Self {
         Self {
             data: data.to_owned(),
-            receive,
+            default_receive: receive,
+            receive_override,
         }
     }
 
@@ -37,8 +39,21 @@ impl Files {
         &self.data
     }
 
-    pub fn receive_dir(&self) -> &Path {
-        &self.receive
+    pub fn default_receive_dir(&self) -> &Path {
+        &self.default_receive
+    }
+
+    pub fn receive_dir(&self) -> PathBuf {
+        if !self.receive_override
+            && let Some(custom) = crate::model::load_notification_settings(&self.data)
+                .receive_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(custom);
+        }
+        self.default_receive.clone()
     }
 
     pub fn stage_text(&self, mut input: impl Read) -> Result<Item> {
@@ -64,23 +79,26 @@ impl Files {
     }
 
     pub fn stage_outgoing(&self, source: &Path) -> Result<Item> {
-        ensure!(source.metadata()?.is_file(), "choose an ordinary file");
+        let abs = std::path::absolute(source)?;
+        ensure!(abs.metadata()?.is_file(), "choose an ordinary file");
         let name = safe_name(
-            &source
-                .file_name()
+            &abs.file_name()
                 .context("missing filename")?
                 .to_string_lossy(),
         );
         let id = Uuid::new_v4().to_string();
         let target = self.outgoing(&id);
-        let mut input = BufReader::with_capacity(BUFFER_SIZE, File::open(source)?);
-        let result = self
-            .stage_payload(&mut input, &target, false)
-            .map(|(size, hash)| Item::outgoing_file(id, name, size, hash));
-        if result.is_err() {
-            let _ = fs::remove_file(&target);
+        let directory = target.parent().context("missing outgoing folder")?;
+        private_directory(directory)?;
+        let mut input = BufReader::with_capacity(BUFFER_SIZE, File::open(&abs)?);
+        let (size, hash, _) = digest_copy(&mut input, &mut io::sink(), false)?;
+        if fs::hard_link(&abs, &target).is_err() {
+            let ref_path = self.outgoing_ref(&id);
+            let mut ref_file = open_private_create_new(&ref_path)?;
+            ref_file.write_all(abs.to_string_lossy().as_bytes())?;
+            ref_file.flush()?;
         }
-        result
+        Ok(Item::outgoing_file(id, name, size, hash))
     }
 
     fn stage_payload(
@@ -102,10 +120,38 @@ impl Files {
         self.data.join("outgoing").join(id)
     }
 
+    pub fn outgoing_ref(&self, id: &str) -> PathBuf {
+        self.data.join("outgoing").join(format!("{id}.ref"))
+    }
+
     pub fn outgoing_payload(&self, item: &Item) -> PathBuf {
         match item.kind {
-            Kind::File => self.outgoing(&item.id),
+            Kind::File => {
+                let staged = self.outgoing(&item.id);
+                if staged.is_file() {
+                    return staged;
+                }
+                if let Ok(raw) = fs::read_to_string(self.outgoing_ref(&item.id)) {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        return PathBuf::from(trimmed);
+                    }
+                }
+                staged
+            }
             Kind::Text => self.sent_text(&item.id),
+        }
+    }
+
+    pub fn remove_outgoing(&self, item: &Item) {
+        match item.kind {
+            Kind::File => {
+                let _ = fs::remove_file(self.outgoing(&item.id));
+                let _ = fs::remove_file(self.outgoing_ref(&item.id));
+            }
+            Kind::Text => {
+                let _ = fs::remove_file(self.sent_text(&item.id));
+            }
         }
     }
 
@@ -118,7 +164,19 @@ impl Files {
     }
 
     pub fn received_file(&self, name: &str) -> PathBuf {
-        self.receive.join(name)
+        let path = Path::new(name);
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        let active = self.receive_dir().join(path);
+        if active.exists() {
+            return active;
+        }
+        let fallback = self.default_receive.join(path);
+        if fallback.exists() {
+            return fallback;
+        }
+        active
     }
 
     pub fn partial(&self, peer: &Peer, item: &Item) -> PathBuf {
@@ -127,7 +185,7 @@ impl Files {
 
     pub fn partial_by_kind(&self, peer: &Peer, kind: Kind, id: &str) -> PathBuf {
         match kind {
-            Kind::File => self.receive.join(".portal-drop-partial"),
+            Kind::File => self.receive_dir().join(".portal-drop-partial"),
             Kind::Text => self.data.join("messages").join(".partial"),
         }
         .join(peer_filename(peer, id))
@@ -135,7 +193,14 @@ impl Files {
 
     pub fn initial_name(&self, store: &Store, item: &Item) -> Result<String> {
         let base = safe_name(item.name.as_deref().context("missing filename")?);
-        self.available_name(store, Path::new(category(&base)), &base, &item.id, None)
+        let cat = category(&base);
+        let active = self.receive_dir();
+        let folder = if active != self.default_receive {
+            active.join(cat)
+        } else {
+            PathBuf::from(cat)
+        };
+        self.available_name(store, &folder, &base, &item.id, None)
     }
 
     pub async fn finish(
@@ -220,15 +285,11 @@ impl Files {
                             "receive filename is already in use"
                         );
                     }
-                    Err(error) => {
-                        // Cross-device fallback (e.g. Windows FAT/ExFAT or mounted drives)
-                        #[cfg(windows)]
-                        {
-                            let _ = error;
+                    Err(_) => {
+                        // Fallback for filesystems without hard links (FAT32/exFAT/SD cards) or cross-device moves.
+                        if fs::rename(&part, &target).is_err() {
                             fs::copy(&part, &target)?;
                         }
-                        #[cfg(unix)]
-                        return Err(error.into());
                     }
                 }
                 sync_directory(directory);

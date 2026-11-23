@@ -522,6 +522,58 @@ svg { display: block; flex-shrink: 0; }
 .files-row:hover { background: var(--side-hover); }
 .files-row .file-icon { width: 42px; height: 42px; }
 .files-row .meta2 { font-size: 12.5px; color: var(--muted); }
+.files-row .row-act { flex: 0 0 auto; opacity: .75; }
+.files-row:hover .row-act { opacity: 1; }
+.path-card { padding: 14px; border-radius: 12px; background: var(--input-bg); border: 1px solid var(--line); }
+.path-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.path-badge { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
+.path-value { font-family: var(--mono); font-size: 12.5px; color: var(--text); word-break: break-all; line-height: 1.45; }
+.path-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+
+/* Notification settings matrix */
+.set-intro { font-size: 13.5px; color: var(--muted); margin-bottom: 14px; }
+.set-table { display: flex; flex-direction: column; gap: 10px; }
+.set-card {
+  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 14px;
+  padding: 12px 14px; border-radius: 12px; background: var(--input-bg); border: 1px solid var(--line);
+}
+.set-head-row {
+  display: grid; grid-template-columns: 1fr 78px 78px; gap: 14px; padding: 0 14px 4px;
+  font-size: 11.5px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .5px;
+}
+.set-head-row span:not(:first-child) { text-align: center; }
+.set-info { min-width: 0; }
+.set-title-row { display: flex; align-items: center; gap: 6px; }
+.set-title { font-size: 14.5px; font-weight: 600; color: var(--text); }
+.set-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.set-preview {
+  width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: var(--muted);
+  transition: background .15s, color .15s;
+}
+.set-preview:hover { background: var(--accent-soft); color: var(--accent); }
+.set-cell { width: 78px; display: flex; justify-content: center; }
+.switch { position: relative; display: inline-flex; align-items: center; width: 44px; height: 24px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch i {
+  position: absolute; inset: 0; border-radius: 99px;
+  background: color-mix(in srgb, var(--muted) 35%, transparent);
+  transition: background .18s var(--ease);
+}
+.switch i::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .24);
+  transition: transform .18s var(--ease);
+}
+.switch input:checked + i { background: var(--accent); }
+.switch input:checked + i::after { transform: translateX(20px); }
+.switch input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 2px; }
+.set-presets { display: flex; gap: 6px; margin-top: 14px; flex-wrap: wrap; }
+.set-chip {
+  height: 30px; padding: 0 12px; border-radius: 15px; font-size: 12.5px; font-weight: 600;
+  color: var(--text-2); background: var(--input-bg); border: 1px solid var(--line);
+  transition: border-color .15s, color .15s, background .15s;
+}
+.set-chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 
 .toast {
   position: fixed; left: 50%; bottom: 96px; z-index: 80; transform: translate(-50%, 12px); opacity: 0; pointer-events: none;
@@ -628,7 +680,7 @@ svg { display: block; flex-shrink: 0; }
     <div class="drawer-status"><i class="dot" id="drawer-dot"></i><span id="drawer-status">Checking…</span></div>
   </div>
   <div class="drawer-items scroll" id="drawer-items"></div>
-  <div class="drawer-foot">Portal Drop 0.3.1 · Local network only</div>
+  <div class="drawer-foot">Portal Drop 0.3.2 · Local network only</div>
 </nav>
 <div class="toast" id="toast"></div>
 
@@ -704,6 +756,8 @@ const ICONS = {
   archive: '<rect x="3.5" y="4" width="17" height="4.5" rx="1.2"/><path d="M5 8.5V18a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5M10 12.5h4"/>',
   android: '<path d="M7 10h10v7.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 7 17.5zM7 9a5 5 0 0 1 10 0zM9.5 19v2.2M14.5 19v2.2M4.5 11v4.5M19.5 11v4.5M8.5 4.2 9.6 6M15.5 4.2 14.4 6"/>',
   link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+  bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 8.5-3 8.5h18s-3-1.5-3-8.5"/><path d="M10.3 20a2 2 0 0 0 3.4 0"/>',
+  volume: '<path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12"/>',
 };
 function icon(name, size = 22, stroke = 1.8) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -723,6 +777,27 @@ function fmtSize(n) {
   const u = ["KB", "MB", "GB", "TB"]; let v = n / 1024, i = 0;
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return `${v.toFixed(v < 10 ? 1 : 0)} ${u[i]}`;
+}
+function fmtEta(sec) {
+  sec = Math.max(1, Math.ceil(sec));
+  if (sec < 60) return `${sec}s left`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return s ? `${m}m ${s}s left` : `${m}m left`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return rm ? `${h}h ${rm}m left` : `${h}h left`;
+}
+function transferSub(prog) {
+  const pct = prog.total ? Math.min(100, Math.round((prog.transferred * 100) / prog.total)) : 0;
+  let text = `${fmtSize(prog.transferred)} of ${fmtSize(prog.total)} · ${pct}%`;
+  const elapsedMs = prog.started_at ? Math.max(0, (prog.updated_at || Date.now()) - prog.started_at) : 0;
+  const moved = Math.max(0, (prog.transferred || 0) - (prog.offset || 0));
+  if (elapsedMs >= 350 && moved > 0) {
+    const bps = (moved * 1000) / elapsedMs;
+    text += ` · ${fmtSize(bps)}/s`;
+    const left = Math.max(0, (prog.total || 0) - (prog.transferred || 0));
+    if (left > 0 && bps > 0) text += ` · ${fmtEta(left / bps)}`;
+  }
+  return { pct, text };
 }
 const sameDay = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 function dayLabel(ms) {
@@ -908,6 +983,13 @@ function renderStatus() {
    Chat list
    ======================================================================== */
 function previewHtml(chat) {
+  for (const prog of state.progress.values()) {
+    if (prog.chat_id === chat.id && prog.total > 0) {
+      const pct = Math.min(100, Math.round((prog.transferred * 100) / prog.total));
+      const verb = prog.direction === "received" ? "Receiving" : "Sending";
+      return `${icon(prog.direction === "received" ? "download" : "upload", 14, 2)}<b>${verb} </b>${esc(prog.name || "file")} · ${pct}%`;
+    }
+  }
   const p = state.previews[chat.id];
   if (!p) return `<span>No messages yet</span>`;
   const mine = p.direction === "sent";
@@ -924,7 +1006,8 @@ function renderChats() {
     .map((c) => ({ c, ts: (state.previews[c.id] && state.previews[c.id].ts) || c.updated_at || c.created_at || 0 }))
     .filter(({ c }) => !q || c.title.toLowerCase().includes(q))
     .sort((a, b) => b.ts - a.ts);
-  const sig = JSON.stringify([chats.map(({ c, ts }) => [c.id, c.title, ts, state.previews[c.id]]), state.chatId, q, Math.floor(Date.now() / 60000)]);
+  const progSig = [...state.progress.values()].map((p) => [p.chat_id, p.id, p.direction, Math.round((p.transferred * 100) / Math.max(1, p.total))]);
+  const sig = JSON.stringify([chats.map(({ c, ts }) => [c.id, c.title, ts, state.previews[c.id]]), progSig, state.chatId, q, Math.floor(Date.now() / 60000)]);
   if (sig === state.chatSig) return;
   state.chatSig = sig;
   list.innerHTML = "";
@@ -948,7 +1031,26 @@ $("search").addEventListener("input", (e) => { state.filter = e.target.value; re
    Timeline rendering (keyed reconciliation → no flicker, stable scroll)
    ======================================================================== */
 const tl = $("timeline"), inner = $("timeline-inner");
-function visibleRows() { const m = new Map(); for (const r of [...state.older, ...state.rows]) m.set(r.id, r); return [...m.values()]; }
+function visibleRows() {
+  const m = new Map();
+  for (const r of [...state.older, ...state.rows]) m.set(r.id, r);
+  for (const p of state.progress.values()) {
+    if (p.direction === "received" && p.chat_id === state.chatId && !m.has(p.id)) {
+      m.set(p.id, {
+        id: p.id,
+        kind: p.kind || "file",
+        ts: p.started_at || p.updated_at || Date.now(),
+        chat_id: p.chat_id,
+        direction: "received",
+        delivered: false,
+        name: p.name || "Receiving file…",
+        size: p.total,
+        _live: true,
+      });
+    }
+  }
+  return [...m.values()];
+}
 function rowById(id) { return visibleRows().find((r) => r.id === id); }
 const distBottom = () => tl.scrollHeight - tl.clientHeight - tl.scrollTop;
 
@@ -1008,18 +1110,20 @@ function buildMessage(r, ctx) {
     if (url) html += `<div class="thumb" data-open="1"><img src="${esc(url)}" alt="" loading="lazy" onerror="this.parentNode.remove()"></div>`;
     const kind = fileKind(r.name);
     const ic = !r.delivered ? (out ? "upload" : "download") : kind;
-    const pct = prog && prog.total ? Math.min(100, Math.round((prog.transferred * 100) / prog.total)) : null;
+    const tInfo = prog && !r.delivered ? transferSub(prog) : null;
     let sub = fmtSize(r.size);
-    if (prog && !r.delivered) sub = `${fmtSize(prog.transferred)} of ${fmtSize(prog.total)} · ${pct}%`;
+    if (tInfo) sub = tInfo.text;
     else if (!r.delivered) sub += out ? " · waiting for phone" : " · receiving";
     html += `<div class="file${r.path ? " clickable" : ""}" ${r.path ? 'data-open="1"' : ""}>
       <div class="file-icon">${icon(ic, 22, 2)}</div>
       <div class="file-info"><div class="file-name" title="${esc(r.name || "File")}">${esc(r.name || "File")}</div>
-      <div class="file-sub">${esc(sub)}</div>${prog && !r.delivered ? `<div class="progress"><i style="width:${pct || 0}%"></i></div>` : ""}</div></div>`;
+      <div class="file-sub">${esc(sub)}</div>${tInfo ? `<div class="progress"><i style="width:${tInfo.pct}%"></i></div>` : ""}</div></div>`;
     html += metaHtml(r, true);
   }
   bubble.innerHTML = html;
-  bubble.oncontextmenu = (e) => { if (state.selecting) return; e.preventDefault(); messageMenu(e.clientX, e.clientY, r); };
+  if (!r._live) {
+    bubble.oncontextmenu = (e) => { if (state.selecting) return; e.preventDefault(); messageMenu(e.clientX, e.clientY, r); };
+  }
   bubble.addEventListener("click", (e) => {
     const t = e.target.closest("[data-url],[data-full],[data-open],[data-jump]");
     if (!t) return;
@@ -1028,16 +1132,16 @@ function buildMessage(r, ctx) {
     else if (t.dataset.open && r.path) openFile(r.path);
     else if (t.dataset.jump) jumpTo(t.dataset.jump);
   });
-  bubble.addEventListener("dblclick", (e) => { if (!state.selecting && !e.target.closest(".text")) setReply(r); });
+  bubble.addEventListener("dblclick", (e) => { if (!r._live && !state.selecting && !e.target.closest(".text")) setReply(r); });
 
   const tools = el("div", "hover-tools");
-  if (!state.selecting) {
+  if (!state.selecting && !r._live) {
     const rb = el("button", "tool", icon("reply", 17, 2)); rb.title = "Reply"; rb.onclick = () => setReply(r);
     const mb = el("button", "tool", icon("more", 17, 2)); mb.title = "More";
     mb.onclick = (e) => { const b = mb.getBoundingClientRect(); messageMenu(b.left, b.bottom + 4, r); e.stopPropagation(); };
     tools.append(rb, mb);
   }
-  if (state.selecting) {
+  if (state.selecting && !r._live) {
     const ck = el("div", "check", icon("check", 14, 3));
     wrap.append(ck);
     wrap.onclick = () => toggleSelect(r.id);
@@ -1070,7 +1174,7 @@ function renderMessages(mode) {
     const ctx = { first: gap(prev, r), last: gap(r, next) };
     const prog = state.progress.get(r.id);
     const ref = r.reply_to ? rowById(r.reply_to) : null;
-    const sig = JSON.stringify([r, ctx, prog && [prog.transferred, prog.total], state.selecting, state.selected.has(r.id), r.expires_at ? bucket : 0, ref ? [ref.text, ref.name, ref.direction] : 0, peerLabel().name]);
+    const sig = JSON.stringify([r, ctx, prog && [prog.transferred, prog.total, prog.updated_at], state.selecting, state.selected.has(r.id), r.expires_at ? bucket : 0, ref ? [ref.text, ref.name, ref.direction] : 0, peerLabel().name]);
     items.push({ key: r.id, sig, build: () => buildMessage(r, ctx) });
   });
   // reconcile
@@ -1220,8 +1324,10 @@ function renderDrawer() {
   add("qr", state.status.paired ? "Pair a new phone" : "Pair Android device", showPair);
   add("edit", "New chat", newChat);
   add("sidebar", state.prefs.sidebarCollapsed ? "Show chat list" : "Hide chat list", toggleSidebar);
+  add("bell", "Notifications & sounds", showNotificationSettings);
+  add("folder", "Save location", showSaveFolderSettings);
   add("history", "Received files", showReceived);
-  add("folder", "Open download folder", () => ipc("open_receive_folder").catch((e) => toast(e.message)));
+  add("open", "Open save folder", () => ipc("open_receive_folder").catch((e) => toast(e.message)));
   add(state.serviceActive ? "pause" : "play", state.serviceActive ? "Pause background service" : "Resume background service",
     () => ipc(state.serviceActive ? "pause_service" : "resume_service").then(refresh).catch((e) => toast(e.message)));
   box.appendChild(el("div", "drawer-sep"));
@@ -1344,15 +1450,160 @@ function showReceived() {
     for (const it of res.items || []) {
       const row = el("div", "files-row", `<div class="file-icon">${icon(fileKind(it.name), 20, 2)}</div>
         <div class="file-info"><div class="file-name">${esc(it.name || "File")}</div><div class="meta2">${esc(fmtSize(it.size))} · ${esc(dayLabel(it.ts))}, ${esc(fmtTime(it.ts))}</div></div>`);
-      if (it.path) row.onclick = () => openFile(it.path); else row.style.opacity = ".55";
+      if (it.path) {
+        row.onclick = () => openFile(it.path);
+        const reveal = el("button", "icon-btn sm row-act", icon("folder", 18, 2));
+        reveal.title = "Show in folder";
+        reveal.onclick = (e) => { e.stopPropagation(); ipc("show_in_folder", { path: it.path }).catch(() => ipc("open_receive_folder")); };
+        row.appendChild(reveal);
+      } else {
+        row.style.opacity = ".55";
+      }
       list.appendChild(row);
     }
     modal({ title: "Received files", body: list, wide: true, actions: [{ label: "Open folder", onClick: () => ipc("open_receive_folder") }, { label: "Close", cls: "solid" }] });
   }).catch((e) => toast(e.message));
 }
+async function showSaveFolderSettings() {
+  let cur;
+  try { cur = await ipc("get_settings"); }
+  catch (e) { toast(e.message); return; }
+
+  const wrap = el("div");
+  wrap.appendChild(el("p", "set-intro", "Choose where incoming files from your phone are saved. New files go into this folder immediately."));
+  const card = el("div", "path-card");
+  const head = el("div", "path-head", `<span class="set-title">Current save folder</span><span class="path-badge" id="save-badge"></span>`);
+  const val = el("div", "path-value");
+  const acts = el("div", "path-actions");
+  const chooseBtn = el("button", "pill-btn solid", "Choose folder…");
+  const openBtn = el("button", "pill-btn", "Open folder");
+  const resetBtn = el("button", "pill-btn", "Reset to default");
+  acts.append(chooseBtn, openBtn, resetBtn);
+  card.append(head, val, acts);
+  wrap.appendChild(card);
+
+  const render = () => {
+    const custom = !!(cur.receive_dir && String(cur.receive_dir).trim());
+    val.textContent = cur.effective_receive_dir || cur.receive_dir || cur.default_receive_dir || "Downloads/Portal Drop";
+    const badge = card.querySelector("#save-badge");
+    if (badge) badge.textContent = custom ? "Custom" : "Default";
+    resetBtn.hidden = !custom;
+  };
+  render();
+
+  const saveUpdate = async (newDir) => {
+    const payload = {
+      message_notify: cur.message_notify !== false,
+      message_sound: cur.message_sound !== false,
+      file_notify: cur.file_notify !== false,
+      file_sound: cur.file_sound !== false,
+      connected_notify: cur.connected_notify !== false,
+      connected_sound: cur.connected_sound !== false,
+    };
+    if (newDir) payload.receive_dir = newDir;
+    try {
+      cur = await ipc("set_settings", { settings: payload });
+      render();
+      toast(newDir ? "Save folder updated" : "Reset to default folder");
+    } catch (e) { toast(e.message); }
+  };
+
+  chooseBtn.onclick = async () => {
+    try {
+      const picked = await ipc("pick_folder", { current: cur.effective_receive_dir || cur.default_receive_dir || "" });
+      if (picked && picked.path) await saveUpdate(picked.path);
+    } catch (e) { toast(e.message); }
+  };
+  openBtn.onclick = () => ipc("open_receive_folder").catch((e) => toast(e.message));
+  resetBtn.onclick = () => saveUpdate(null);
+
+  modal({ title: "Save location", body: wrap, wide: true, actions: [{ label: "Done", cls: "solid" }] });
+}
 function confirmClearHistory() {
   modal({ title: "Clear received-files list?", body: "<p>Only the list is cleared. Saved files stay in your download folder.</p>",
     actions: [{ label: "Cancel" }, { label: "Clear", cls: "danger", onClick: () => ipc("clear_history").then(() => toast("List cleared")).catch((e) => toast(e.message)) }] });
+}
+async function showNotificationSettings() {
+  const defaults = { message_notify: true, message_sound: true, file_notify: true, file_sound: true, connected_notify: true, connected_sound: true };
+  let cur;
+  try { cur = Object.assign({}, defaults, await ipc("get_settings")); }
+  catch (e) { toast(e.message); return; }
+
+  const wrap = el("div");
+  wrap.appendChild(el("p", "set-intro", "Choose independently which desktop alerts and custom chimes play. Changes apply immediately."));
+  wrap.appendChild(el("div", "set-head-row", "<span>Event</span><span>Notification</span><span>Sound</span>"));
+  const table = el("div", "set-table");
+  const inputs = {};
+
+  const rows = [
+    { key: "message", title: "Incoming messages", sub: "New texts and replies from your phone" },
+    { key: "file", title: "Received files", sub: "Completed file downloads" },
+    { key: "connected", title: "Device connected", sub: "When your phone connects on the network" },
+  ];
+
+  const persist = () => {
+    const payload = {
+      message_notify: !!cur.message_notify,
+      message_sound: !!cur.message_sound,
+      file_notify: !!cur.file_notify,
+      file_sound: !!cur.file_sound,
+      connected_notify: !!cur.connected_notify,
+      connected_sound: !!cur.connected_sound,
+    };
+    if (cur.receive_dir) payload.receive_dir = cur.receive_dir;
+    ipc("set_settings", { settings: payload }).catch((e) => toast(e.message));
+  };
+
+  for (const row of rows) {
+    const nKey = `${row.key}_notify`, sKey = `${row.key}_sound`;
+    const card = el("div", "set-card");
+    const info = el("div", "set-info");
+    const titleRow = el("div", "set-title-row", `<span class="set-title">${esc(row.title)}</span>`);
+    const preview = el("button", "set-preview", icon("volume", 15, 2));
+    preview.type = "button";
+    preview.title = `Preview ${row.title.toLowerCase()} sound`;
+    preview.onclick = () => ipc("test_sound", { kind: row.key }).catch((e) => toast(e.message));
+    titleRow.appendChild(preview);
+    info.append(titleRow, el("div", "set-sub", esc(row.sub)));
+
+    const makeSwitch = (field, ariaLabel) => {
+      const cell = el("div", "set-cell");
+      const lab = el("label", "switch");
+      const inp = el("input");
+      inp.type = "checkbox";
+      inp.checked = !!cur[field];
+      inp.setAttribute("aria-label", ariaLabel);
+      inp.onchange = () => { cur[field] = inp.checked; persist(); };
+      inputs[field] = inp;
+      lab.append(inp, el("i"));
+      cell.appendChild(lab);
+      return cell;
+    };
+
+    card.append(info, makeSwitch(nKey, `${row.title} notification`), makeSwitch(sKey, `${row.title} sound`));
+    table.appendChild(card);
+  }
+  wrap.appendChild(table);
+
+  const presets = el("div", "set-presets");
+  const applyPreset = (patch) => {
+    Object.assign(cur, patch);
+    for (const [k, inp] of Object.entries(inputs)) inp.checked = !!cur[k];
+    persist();
+  };
+  for (const [label, patch] of [
+    ["Enable all", { message_notify: true, message_sound: true, file_notify: true, file_sound: true, connected_notify: true, connected_sound: true }],
+    ["Silent alerts", { message_notify: true, message_sound: false, file_notify: true, file_sound: false, connected_notify: true, connected_sound: false }],
+    ["Mute all", { message_notify: false, message_sound: false, file_notify: false, file_sound: false, connected_notify: false, connected_sound: false }],
+  ]) {
+    const b = el("button", "set-chip", label);
+    b.type = "button";
+    b.onclick = () => applyPreset(patch);
+    presets.appendChild(b);
+  }
+  wrap.appendChild(presets);
+
+  modal({ title: "Notifications & sounds", body: wrap, wide: true, actions: [{ label: "Done", cls: "solid" }] });
 }
 function confirmUnpair() {
   modal({ title: "Unpair phone?", body: `<p>${esc(peerLabel().name)} will be disconnected and must be paired again with a new QR code.</p>`,
@@ -1450,7 +1701,14 @@ $("attach").onclick = async () => {
   const wasTemp = state.tempArmed;
   const meta = consumeMeta();
   state.forceBottom = true;
-  try { const res = await ipc("pick_files", meta); if (res && res.cancelled) { if (wasTemp) setTemp(true); } else refresh(); }
+  try {
+    const res = await ipc("pick_files", meta);
+    if (res && res.cancelled) { if (wasTemp) setTemp(true); }
+    else {
+      if (res && res.errors && res.errors.length) toast(`Added ${res.sent || 0} file(s); ${res.errors.length} failed`);
+      refresh();
+    }
+  }
   catch (e) { if (wasTemp) setTemp(true); toast(e.message); }
 };
 $("new-chat").onclick = newChat;
@@ -1572,7 +1830,10 @@ const Demo = {
       ],
       previews: [{ chat_id: c1, ts: t(1), direction: "sent", kind: "file", name: "project-backup-2026.zip" }, { chat_id: c2, ts: t(90), direction: "received", kind: "text", text: "Signed contract attached, please review before Friday" },
         { chat_id: c3, ts: t(1500), direction: "received", kind: "file", name: "beach-sunset.jpg" }, { chat_id: c4, ts: t(4500), direction: "sent", kind: "text", text: "ok" }],
-      progress: [{ id: "m10", transferred: 96e6, total: 248e6 }],
+      progress: [
+        { id: "m10", chat_id: c1, kind: "file", name: "project-backup-2026.zip", direction: "sent", offset: 0, transferred: 96e6, total: 248e6, started_at: this.now - 9000, updated_at: this.now },
+        { id: "m11", chat_id: c1, kind: "file", name: "holiday-clip-4k.mp4", direction: "received", offset: 0, transferred: 88e6, total: 269e6, started_at: this.now - 8400, updated_at: this.now },
+      ],
     };
   },
   handle(action, p) {
@@ -1588,6 +1849,10 @@ const Demo = {
       case "received_files": return ok({ items: d.rows.filter((r) => r.kind === "file" && r.direction === "received").map((r) => ({ ...r, path: r.path || "/tmp/x" })) });
       case "delete_messages": d.rows = d.rows.filter((r) => !p.ids.includes(r.id)); return ok({ ok: true });
       case "message_text": return ok({ text: (d.rows.find((r) => r.id === p.id) || {}).text || "" });
+      case "get_settings": return ok(this.settings || (this.settings = { message_notify: true, message_sound: true, file_notify: true, file_sound: true, connected_notify: false, connected_sound: false, default_receive_dir: "/home/user/Downloads/Portal Drop", effective_receive_dir: "/home/user/Downloads/Portal Drop" }));
+      case "set_settings": this.settings = Object.assign({}, this.settings, p.settings || {}, { effective_receive_dir: (p.settings && p.settings.receive_dir) || "/home/user/Downloads/Portal Drop" }); return ok(this.settings);
+      case "pick_folder": return ok({ path: "/mnt/storage/Portal Drop" });
+      case "test_sound": toast(`Playing ${p.kind || "message"} sound`); return ok({ ok: true });
       default: return ok({ ok: true, cancelled: true });
     }
   },
@@ -1600,6 +1865,8 @@ refresh();
 setInterval(refresh, 5000);
 setInterval(() => { if (visibleRows().some((r) => r.expires_at)) renderMessages(); }, 15000);
 if (HOST !== "demo") applyTheme(true);
+if (urlParams.get("settings") === "1") setTimeout(showNotificationSettings, 150);
+if (urlParams.get("save") === "1") setTimeout(showSaveFolderSettings, 150);
 </script>
 </body>
 </html>

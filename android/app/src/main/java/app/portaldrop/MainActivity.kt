@@ -2,6 +2,7 @@ package app.portaldrop
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.DownloadManager
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.ClipData
@@ -12,11 +13,15 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Typeface
+import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.Settings
 import android.text.InputFilter
 import android.text.InputType
@@ -34,6 +39,7 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.PopupMenu
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -99,7 +105,10 @@ class MainActivity : ComponentActivity() {
     private var pairing = false
     private var stagingFiles = false
     private var queueingText = false
+    private var saveLocationLabelView: TextView? = null
+    private var saveLocationResetBtn: View? = null
     private val worker = Executors.newSingleThreadExecutor()
+    private val fileWorker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val expiryTick = object : Runnable {
@@ -136,6 +145,21 @@ class MainActivity : ComponentActivity() {
 
     private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         reviewAttachments(uris)
+    }
+
+    private val pickSaveFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        try {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            contentResolver.takePersistableUriPermission(uri, flags)
+            val label = store.formatTreeLabel(uri)
+            store.setSaveTreeUri(uri, label)
+            saveLocationLabelView?.text = label
+            saveLocationResetBtn?.visibility = View.VISIBLE
+            notifyUser("Save location set to $label")
+        } catch (_: Exception) {
+            notifyUser("Could not save access to this folder. Try picking a folder inside internal storage or your SD card.")
+        }
     }
 
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -192,6 +216,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         worker.shutdown()
+        fileWorker.shutdown()
         super.onDestroy()
     }
 
@@ -1008,7 +1033,7 @@ class MainActivity : ComponentActivity() {
         worker.execute {
             val error = try {
                 store.enqueueText(text, destination, reply, ttlSec)
-                TransferService.wake()
+                TransferService.wakeMessages()
                 null
             } catch (issue: IllegalArgumentException) {
                 issue.message ?: "This message could not be queued."
@@ -1156,30 +1181,48 @@ class MainActivity : ComponentActivity() {
         stagingFiles = true
         updateFileButton()
         if (ttlSec != null && tempArmed) setTempArmed(false)
-        notifyUser(if (uris.size == 1) "Preparing file…" else "Preparing ${uris.size} files…")
-        worker.execute {
-            val committed = try {
+        notifyUser(if (uris.size == 1) "Preparing file…" else "Adding ${uris.size} files…")
+        fileWorker.execute {
+            var draftCleared = false
+            val result = try {
                 if (store.peer()?.fingerprint != peer) throw IOException("The paired computer changed.")
-                store.enqueueFiles(uris, destination, reply, ttlSec)
-                TransferService.wake()
-                true
-            } catch (_: Exception) {
-                false
+                store.enqueueFiles(
+                    uris = uris,
+                    chatId = destination,
+                    replyTo = reply,
+                    ttlSec = ttlSec,
+                    onFileQueued = {
+                        TransferService.wake()
+                        onUi {
+                            if (!draftCleared) {
+                                draftCleared = true
+                                val draft = drafts[destination]
+                                if (draft?.reply?.item?.id == reply && draft != null) {
+                                    val currentText = if (destination == chatId) composer?.text?.toString() else null
+                                    drafts[destination] = Draft(currentText ?: draft.text, null)
+                                }
+                                fillReplyArea()
+                            }
+                            refreshAfterSend(destination, sendingTimeline)
+                        }
+                    },
+                )
+            } catch (error: Exception) {
+                BatchEnqueueResult(0, listOf("Files" to (error.message ?: "Check access and available storage.")))
             }
             onUi {
                 stagingFiles = false
                 updateFileButton()
-                if (committed) {
-                    val draft = drafts[destination]
-                    if (draft?.reply?.item?.id == reply && draft != null) {
-                        val currentText = if (destination == chatId) composer?.text?.toString() else null
-                        drafts[destination] = Draft(currentText ?: draft.text, null)
+                if (result.queued > 0) {
+                    if (result.failed.isNotEmpty()) {
+                        val first = result.failed.first()
+                        notifyUser("Added ${result.queued} file(s); ${result.failed.size} failed (${first.first}: ${first.second}).")
                     }
-                    fillReplyArea()
                     refreshAfterSend(destination, sendingTimeline)
                 } else {
                     if (ttlSec != null) setTempArmed(true)
-                    notifyUser("Could not add the files. Check access and available storage.")
+                    val reason = result.failed.firstOrNull()?.second ?: "Check access and available storage."
+                    notifyUser("Could not add files: $reason")
                 }
             }
         }
@@ -1209,14 +1252,18 @@ class MainActivity : ComponentActivity() {
                 if (store.chats().size > 1) menu.add(0, MENU_DELETE_CHAT, 2, "Delete chat")
                 menu.add(0, MENU_RECEIVED, 3, "Received files")
             }
-            menu.add(0, MENU_PAUSE, 4, if (store.backgroundEnabled()) "Pause connection" else "Resume connection")
-            menu.add(0, MENU_FORGET, 5, "Forget this computer")
+            menu.add(0, MENU_NOTIFICATIONS, 4, "Notifications & sounds")
+            menu.add(0, MENU_SAVE_LOCATION, 5, "Save location")
+            menu.add(0, MENU_PAUSE, 6, if (store.backgroundEnabled()) "Pause connection" else "Resume connection")
+            menu.add(0, MENU_FORGET, 7, "Forget this computer")
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_SELECT -> enterSelection()
                     MENU_RENAME -> currentChat()?.let(::renameChat)
                     MENU_DELETE_CHAT -> currentChat()?.let(::confirmDeleteChat)
                     MENU_RECEIVED -> switchPage(Page.RECEIVED)
+                    MENU_NOTIFICATIONS -> showNotificationSettings()
+                    MENU_SAVE_LOCATION -> showSaveLocationSettings()
                     MENU_PAUSE -> {
                         if (store.backgroundEnabled()) TransferService.pause(this@MainActivity)
                         else enableBackground()
@@ -1228,6 +1275,134 @@ class MainActivity : ComponentActivity() {
             }
             show()
         }
+    }
+
+    private fun previewSound(resId: Int) {
+        try {
+            val player = MediaPlayer()
+            player.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build(),
+            )
+            resources.openRawResourceFd(resId).use { afd ->
+                player.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+            }
+            player.setOnCompletionListener { it.release() }
+            player.setOnErrorListener { mp, _, _ ->
+                mp.release()
+                true
+            }
+            player.prepare()
+            player.start()
+        } catch (_: Exception) {
+            notifyUser("Could not play sound preview.")
+        }
+    }
+
+    @Suppress("UseSwitchCompatOrMaterialCode")
+    private fun showNotificationSettings() {
+        var cur = store.notificationSettings()
+        val content = ui.column().apply {
+            setPadding(ui.dp(18), ui.dp(12), ui.dp(18), ui.dp(8))
+        }
+        content.addView(ui.label(
+            "Turn notifications and sounds on or off independently for each event.",
+            13, ui.muted,
+        ))
+
+        val thumbColors = ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(ui.accent, ui.muted),
+        )
+        val trackColors = ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(ui.mint, ui.line),
+        )
+
+        fun switchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit): LinearLayout {
+            val row = ui.row().apply {
+                setPadding(0, ui.dp(6), 0, ui.dp(6))
+            }
+            row.addView(ui.label(label, 14, ui.ink), LinearLayout.LayoutParams(0, WRAP, 1f))
+            val toggle = Switch(this).apply {
+                isChecked = checked
+                thumbTintList = thumbColors
+                trackTintList = trackColors
+                setOnCheckedChangeListener { _, isChecked -> onChange(isChecked) }
+            }
+            row.addView(toggle, LinearLayout.LayoutParams(WRAP, WRAP))
+            return row
+        }
+
+        fun section(
+            title: String,
+            subtitle: String,
+            soundRes: Int,
+            notifyChecked: Boolean,
+            soundChecked: Boolean,
+            onNotify: (Boolean) -> Unit,
+            onSound: (Boolean) -> Unit,
+        ) {
+            val card = ui.column().apply {
+                background = ui.shape(ui.surface, 14, ui.line)
+                setPadding(ui.dp(14), ui.dp(12), ui.dp(14), ui.dp(10))
+            }
+            val head = ui.row()
+            val titles = ui.column().apply {
+                addView(ui.label(title, 15, ui.ink, bold = true))
+                addView(ui.label(subtitle, 12, ui.muted))
+            }
+            head.addView(titles, LinearLayout.LayoutParams(0, WRAP, 1f))
+            val testBtn = ui.action("Test") { previewSound(soundRes) }.apply {
+                textSize = 12f
+                setPadding(ui.dp(10), ui.dp(4), ui.dp(10), ui.dp(4))
+                background = ui.tapShape(ui.mint, 14, ui.line)
+            }
+            head.addView(testBtn, LinearLayout.LayoutParams(WRAP, WRAP))
+            card.addView(head, LinearLayout.LayoutParams(MATCH, WRAP))
+            card.addWithGap(switchRow("Show notification", notifyChecked, onNotify), 6)
+            card.addView(switchRow("Play sound", soundChecked, onSound), LinearLayout.LayoutParams(MATCH, WRAP))
+            content.addWithGap(card, 12)
+        }
+
+        section(
+            "Incoming messages",
+            "New text messages and replies",
+            R.raw.portal_message,
+            cur.messageNotify,
+            cur.messageSound,
+            onNotify = { cur = cur.copy(messageNotify = it); store.setNotificationSettings(cur) },
+            onSound = { cur = cur.copy(messageSound = it); store.setNotificationSettings(cur) },
+        )
+        section(
+            "Received files",
+            "Completed file downloads",
+            R.raw.portal_file,
+            cur.fileNotify,
+            cur.fileSound,
+            onNotify = { cur = cur.copy(fileNotify = it); store.setNotificationSettings(cur) },
+            onSound = { cur = cur.copy(fileSound = it); store.setNotificationSettings(cur) },
+        )
+        section(
+            "Device connected",
+            "When your computer connects on Wi-Fi",
+            R.raw.portal_connected,
+            cur.connectedNotify,
+            cur.connectedSound,
+            onNotify = { cur = cur.copy(connectedNotify = it); store.setNotificationSettings(cur) },
+            onSound = { cur = cur.copy(connectedSound = it); store.setNotificationSettings(cur) },
+        )
+
+        val scroll = ScrollView(this).apply {
+            addView(content, FrameLayout.LayoutParams(MATCH, WRAP))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Notifications & sounds")
+            .setView(scroll)
+            .setPositiveButton("Done", null)
+            .show()
     }
 
     private fun forgetComputer() {
@@ -1266,8 +1441,9 @@ class MainActivity : ComponentActivity() {
             }
             if (message.item.kind == "file" && message.incoming && message.delivered && message.downloadUri != null) {
                 menu.add(0, MESSAGE_OPEN, 3, "Open with app")
+                menu.add(0, MESSAGE_OPEN_FOLDER, 4, "Open in folder")
             }
-            menu.add(0, MESSAGE_DELETE, 4, "Delete here")
+            menu.add(0, MESSAGE_DELETE, 5, "Delete here")
             setOnMenuItemClickListener { option ->
                 when (option.itemId) {
                     MESSAGE_REPLY -> replyTo(message)
@@ -1275,12 +1451,159 @@ class MainActivity : ComponentActivity() {
                     MESSAGE_COPY -> copyText(message)
                     MESSAGE_FULL -> showFullMessage(message)
                     MESSAGE_OPEN -> openFile(message, forceChooser = true)
+                    MESSAGE_OPEN_FOLDER -> openFileFolder(message)
                     MESSAGE_DELETE -> deleteMessage(message)
                 }
                 true
             }
             show()
         }
+    }
+
+    private fun showSaveLocationSettings() {
+        val content = ui.column().apply {
+            setPadding(ui.dp(20), ui.dp(12), ui.dp(20), ui.dp(8))
+        }
+        content.addView(ui.label(
+            "Choose where incoming files are saved. You can select any folder on internal storage or your microSD card.",
+            13, ui.muted,
+        ))
+        val card = ui.column().apply {
+            background = ui.shape(ui.surface, 14, ui.line)
+            setPadding(ui.dp(14), ui.dp(12), ui.dp(14), ui.dp(12))
+        }
+        card.addView(ui.label("Current save folder", 12, ui.muted, bold = true))
+        val pathView = ui.label(store.saveLocationLabel(), 14, ui.ink, bold = true).apply {
+            setPadding(0, ui.dp(4), 0, ui.dp(10))
+        }
+        card.addView(pathView)
+
+        val btnRow = ui.row()
+        val chooseBtn = ui.action("Choose folder…") {
+            try {
+                pickSaveFolder.launch(store.saveTreeUri())
+            } catch (_: ActivityNotFoundException) {
+                notifyUser("No folder picker is available on this device.")
+            }
+        }.apply {
+            textSize = 13f
+            setTextColor(ui.onAccent)
+            setPadding(ui.dp(14), ui.dp(8), ui.dp(14), ui.dp(8))
+            background = ui.tapShape(ui.accent, 18)
+        }
+        val openBtn = ui.action("Open folder") {
+            openSaveFolder()
+        }.apply {
+            textSize = 13f
+            setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(8))
+            background = ui.tapShape(ui.mint, 18, ui.line)
+        }
+        btnRow.addView(chooseBtn, LinearLayout.LayoutParams(WRAP, WRAP))
+        btnRow.addView(openBtn, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = ui.dp(8) })
+        card.addView(btnRow, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        val resetBtn = ui.action("Reset to Downloads") {
+            store.setSaveTreeUri(null)
+            pathView.text = store.saveLocationLabel()
+            saveLocationResetBtn?.visibility = View.GONE
+            notifyUser("Reset to Downloads/Portal Drop")
+        }.apply {
+            textSize = 13f
+            setPadding(ui.dp(12), ui.dp(6), ui.dp(12), ui.dp(6))
+            visibility = if (store.saveTreeUri() != null) View.VISIBLE else View.GONE
+        }
+        card.addWithGap(resetBtn, 8)
+        content.addWithGap(card, 12)
+
+        saveLocationLabelView = pathView
+        saveLocationResetBtn = resetBtn
+        AlertDialog.Builder(this)
+            .setTitle("Save location")
+            .setView(content)
+            .setPositiveButton("Done", null)
+            .setOnDismissListener {
+                saveLocationLabelView = null
+                saveLocationResetBtn = null
+            }
+            .show()
+    }
+
+    private fun openSaveFolder() {
+        val tree = store.saveTreeUri()
+        if (tree != null) {
+            val docId = runCatching { DocumentsContract.getTreeDocumentId(tree) }.getOrNull()
+            val folderUri = if (docId != null) DocumentsContract.buildDocumentUriUsingTree(tree, docId) else tree
+            if (launchFolderIntent(folderUri) || launchFolderIntent(tree)) return
+        } else {
+            val docUri = DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents",
+                "primary:Download/Portal Drop",
+            )
+            if (launchFolderIntent(docUri)) return
+        }
+        if (!openSystemDownloads()) {
+            notifyUser("Files are saved in ${store.saveLocationLabel()}.")
+        }
+    }
+
+    private fun openFileFolder(message: ChatItem) {
+        val uri = message.downloadUri ?: return
+        var folderLabel = store.saveLocationLabel()
+        val folderUri = if (uri.authority == MediaStore.AUTHORITY) {
+            val rel = runCatching {
+                contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.RELATIVE_PATH), null, null, null)
+                    ?.use { if (it.moveToFirst()) it.getString(0) else null }
+            }.getOrNull()?.trim('/')?.takeIf { it.isNotEmpty() } ?: "Download/Portal Drop"
+            folderLabel = rel
+            DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:$rel")
+        } else {
+            val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+            val parentDocId = docId?.let { id ->
+                val slash = id.lastIndexOf('/')
+                if (slash > 0) id.substring(0, slash) else id.substringBefore(':', "") + ":"
+            }
+            val tree = store.saveTreeUri()
+            when {
+                tree != null && parentDocId != null ->
+                    DocumentsContract.buildDocumentUriUsingTree(tree, parentDocId)
+                uri.authority != null && parentDocId != null ->
+                    DocumentsContract.buildDocumentUri(uri.authority!!, parentDocId)
+                tree != null -> tree
+                else -> null
+            }
+        }
+        if (folderUri != null && launchFolderIntent(folderUri)) return
+        val fallbackTree = store.saveTreeUri()
+        if (fallbackTree != null && launchFolderIntent(fallbackTree)) return
+        if (!openSystemDownloads()) {
+            notifyUser("Saved in $folderLabel")
+        }
+    }
+
+    private fun launchFolderIntent(folderUri: Uri): Boolean {
+        for (mime in listOf(DocumentsContract.Document.MIME_TYPE_DIR, "resource/folder")) {
+            val intent = Intent(Intent.ACTION_VIEW)
+                .setDataAndType(folderUri, mime)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (tryStartActivity(intent)) return true
+        }
+        val plain = Intent(Intent.ACTION_VIEW, folderUri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return tryStartActivity(plain)
+    }
+
+    private fun openSystemDownloads(): Boolean =
+        tryStartActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+
+    private fun tryStartActivity(intent: Intent): Boolean = try {
+        startActivity(intent)
+        true
+    } catch (_: ActivityNotFoundException) {
+        false
+    } catch (_: SecurityException) {
+        false
     }
 
     private fun deleteMessage(message: ChatItem) {
@@ -1474,6 +1797,8 @@ class MainActivity : ComponentActivity() {
         const val MENU_RECEIVED = 4
         const val MENU_PAUSE = 5
         const val MENU_FORGET = 6
+        const val MENU_NOTIFICATIONS = 7
+        const val MENU_SAVE_LOCATION = 8
         const val CHAT_MENU_RENAME = 1
         const val CHAT_MENU_DELETE = 2
         const val MESSAGE_REPLY = 1
@@ -1481,7 +1806,8 @@ class MainActivity : ComponentActivity() {
         const val MESSAGE_COPY = 3
         const val MESSAGE_FULL = 4
         const val MESSAGE_OPEN = 5
-        const val MESSAGE_DELETE = 6
+        const val MESSAGE_OPEN_FOLDER = 6
+        const val MESSAGE_DELETE = 7
         const val DIRECT_CLIPBOARD_BYTES = 128 * 1024
         const val FULL_MESSAGE_VIEW_BYTES = 256 * 1024
     }

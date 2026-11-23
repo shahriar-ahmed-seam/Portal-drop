@@ -511,6 +511,9 @@ class PortalWindow(Gtk.ApplicationWindow):
         if action == "pick_files":
             self._handle_pick_files(req_id, payload)
             return
+        if action == "pick_folder":
+            self._handle_pick_folder(req_id, payload)
+            return
         if action == "set_theme":
             self.apply_native_theme(payload.get("theme", "light"))
             self.reply(req_id, ok=True, data={"ok": True})
@@ -560,6 +563,25 @@ class PortalWindow(Gtk.ApplicationWindow):
                 self.reply(req_id, ok=False, error=error_details(err))
 
         self.work.submit(send_job)
+
+    def _handle_pick_folder(self, req_id, payload):
+        dialog = Gtk.FileChooserNative.new(
+            "Choose save folder",
+            self,
+            Gtk.FileChooserAction.SELECT_FOLDER,
+            "Select",
+            "Cancel",
+        )
+        current = str(payload.get("current") or "").strip()
+        if current and Path(current).is_dir():
+            dialog.set_current_folder(current)
+        response = dialog.run()
+        folder = dialog.get_filename() if response == Gtk.ResponseType.ACCEPT else None
+        dialog.destroy()
+        if not folder:
+            self.reply(req_id, ok=True, data={"cancelled": True})
+            return
+        self.reply(req_id, ok=True, data={"path": folder})
 
     def _dispatch_worker(self, req_id, action, payload):
         try:
@@ -660,6 +682,15 @@ class PortalWindow(Gtk.ApplicationWindow):
             return {"serviceActive": True}
         if action == "set_prefs":
             save_prefs(payload.get("prefs") or {})
+            return {"ok": True}
+        if action == "get_settings":
+            return get_json("settings")
+        if action == "set_settings":
+            body = json.dumps(payload.get("settings") or {})
+            return json.loads(run_cli("settings", "--stdin-json", data=body))
+        if action == "test_sound":
+            kind = str(payload.get("kind") or "message")
+            run_cli("test-sound", kind)
             return {"ok": True}
         raise ValueError(f"Unknown action: {action}")
 

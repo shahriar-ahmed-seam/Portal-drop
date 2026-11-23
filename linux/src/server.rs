@@ -2,7 +2,8 @@ use crate::{
     files::{BUFFER_SIZE, Complete, Files, preview_file, preview_text},
     model::{
         Chat, DeviceInfo, Item, Kind, Offset, PROTOCOL_VERSION, PairRequest, Receipt,
-        format_peer_label, local_name, local_os, now_ms, random_secret, valid_id,
+        format_peer_label, load_notification_settings, local_name, local_os, now_ms, random_secret,
+        valid_id,
     },
     sound::{self, SoundKind},
     store::{Incoming, Peer, Progress, Store, private_directory},
@@ -20,18 +21,22 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use axum_server::tls_rustls::RustlsConfig;
+use axum_server::{
+    accept::NoDelayAcceptor,
+    tls_rustls::{RustlsAcceptor, RustlsConfig},
+};
 use futures_util::{StreamExt, stream};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -39,7 +44,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::{
     fs::{File, OpenOptions as TokioOpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom},
     sync::{Mutex, broadcast, mpsc},
 };
 use tokio_util::io::ReaderStream;
@@ -57,13 +62,32 @@ static HEADER_VERSION: HeaderName = HeaderName::from_static("x-portal-drop-versi
 struct App {
     store: Store,
     files: Files,
-    inbox_lock: Arc<Mutex<()>>,
+    inbox_locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
     desktop_helper: Option<PathBuf>,
     events_tx: broadcast::Sender<&'static str>,
     connected_clients: Arc<AtomicUsize>,
     last_disconnect: Arc<StdMutex<Option<Instant>>>,
     local_os: &'static str,
     local_name: String,
+}
+
+impl App {
+    fn item_lock(&self, peer: &Peer, id: &str) -> Arc<Mutex<()>> {
+        let key = format!("{}:{id}", hex::encode(peer));
+        let mut guard = self
+            .inbox_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.len() > 64 {
+            guard.retain(|_, value| value.strong_count() > 0);
+        }
+        if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let fresh = Arc::new(Mutex::new(()));
+        guard.insert(key, Arc::downgrade(&fresh));
+        fresh
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -105,7 +129,7 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
     let app_state = App {
         store: store.clone(),
         files: files.clone(),
-        inbox_lock: Arc::new(Mutex::new(())),
+        inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
         desktop_helper: desktop_helper(),
         events_tx: events_tx.clone(),
         connected_clients: Arc::new(AtomicUsize::new(0)),
@@ -155,9 +179,16 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
         .with_state(app_state.clone());
 
     let handle = axum_server::Handle::new();
-    let server = axum_server::from_tcp_rustls(listener, tls)?
-        .handle(handle.clone())
-        .serve(app.into_make_service());
+    let acceptor = RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new());
+    let mut server = axum_server::from_tcp(listener)?
+        .acceptor(acceptor)
+        .handle(handle.clone());
+    server
+        .http_builder()
+        .http2()
+        .adaptive_window(true)
+        .max_frame_size(64 * 1024);
+    let server = server.serve(app.into_make_service());
 
     let _discovery = if discover && !address.ip().is_loopback() {
         match advertise(
@@ -648,6 +679,7 @@ async fn ack(
     {
         eprintln!("Failed to remove delivered file from outgoing queue: {error}");
     }
+    let _ = tokio::fs::remove_file(app.files.outgoing_ref(&id)).await;
     let _ = app.events_tx.send("ack");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -664,7 +696,12 @@ async fn download(
     let (item, delivered) = app.store.outgoing(&peer, &id)?.ok_or(MISSING_ITEM)?;
     let (size, _) = item.payload().filter(|_| !delivered).ok_or(MISSING_ITEM)?;
     let remaining = size.checked_sub(offset).ok_or(OFFSET_ERROR)?;
-    let mut file = File::open(app.files.outgoing_payload(&item)).await?;
+    let mut file = File::open(app.files.outgoing_payload(&item))
+        .await
+        .map_err(|_| MISSING_ITEM)?;
+    if file.metadata().await?.len() != size {
+        return Err(MISSING_ITEM);
+    }
     file.seek(SeekFrom::Start(offset)).await?;
     let mut progress = ProgressWatch::new(app.store, app.events_tx, &item, "sent", offset, size);
     let stream = ReaderStream::with_capacity(file.take(remaining), BUFFER_SIZE).map(move |chunk| {
@@ -695,7 +732,8 @@ async fn offer(
             "invalid item metadata",
         ));
     }
-    let _guard = app.inbox_lock.lock().await;
+    let item_lock = app.item_lock(&peer, &item.id);
+    let _guard = item_lock.lock().await;
     if let Some(incoming) = app.store.incoming(&peer, &item.id)? {
         if incoming.item.chat_id() == item.chat_id() {
             item.chat_id.clone_from(&incoming.item.chat_id);
@@ -775,7 +813,8 @@ async fn upload(
     if !valid_id(&id) {
         return Err(MISSING_ITEM);
     }
-    let _guard = app.inbox_lock.lock().await;
+    let item_lock = app.item_lock(&peer, &id);
+    let _guard = item_lock.lock().await;
     let incoming = app.store.incoming(&peer, &id)?.ok_or(MISSING_ITEM)?;
     let (size, _) = incoming.item.payload().ok_or(MISSING_ITEM)?;
     if incoming.received {
@@ -799,7 +838,7 @@ async fn upload(
 
     let path = app.files.partial(&peer, &incoming.item);
     private_directory(path.parent().expect("partial folder"))?;
-    let mut file = open_private_append(&path).await?;
+    let file = open_private_append(&path).await?;
     if file.metadata().await?.len() != offset {
         return Err(OFFSET_ERROR);
     }
@@ -812,8 +851,10 @@ async fn upload(
         offset,
         size,
     );
-    let transferred = append_upload(&mut file, body, length, &mut progress).await;
-    file.flush().await?;
+    let mut writer = BufWriter::with_capacity(BUFFER_SIZE, file);
+    let transferred = append_upload(&mut writer, body, length, &mut progress).await;
+    writer.flush().await?;
+    let file = writer.into_inner();
     file.sync_all().await?;
     progress.save();
     transferred?;
@@ -873,17 +914,27 @@ async fn complete(app: &App, peer: &Peer, incoming: &Incoming) -> ApiResult<bool
 }
 
 async fn append_upload(
-    file: &mut File,
+    file: &mut BufWriter<File>,
     body: Body,
     bytes: u64,
     progress: &mut ProgressWatch,
 ) -> ApiResult<()> {
     let mut remaining = bytes;
     let mut stream = body.into_data_stream();
+    let mut last_flush = Instant::now();
     loop {
-        let next = tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, stream.next())
-            .await
-            .map_err(|_| ApiError::Client(StatusCode::REQUEST_TIMEOUT, "upload paused too long"))?;
+        let next = match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
+            Ok(item) => item,
+            Err(_) => {
+                file.flush().await?;
+                last_flush = Instant::now();
+                tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, stream.next())
+                    .await
+                    .map_err(|_| {
+                        ApiError::Client(StatusCode::REQUEST_TIMEOUT, "upload paused too long")
+                    })?
+            }
+        };
         let Some(chunk) = next else { break };
         let chunk =
             chunk.map_err(|_| ApiError::Client(StatusCode::BAD_REQUEST, "upload interrupted"))?;
@@ -895,6 +946,10 @@ async fn append_upload(
             ))?;
         file.write_all(&chunk).await?;
         progress.advance(chunk.len() as u64);
+        if last_flush.elapsed() >= Duration::from_millis(350) {
+            file.flush().await?;
+            last_flush = Instant::now();
+        }
     }
     if remaining != 0 {
         return Err(ApiError::Client(
@@ -921,6 +976,7 @@ impl ProgressWatch {
         offset: u64,
         total: u64,
     ) -> Self {
+        let now = now_ms();
         let mut watch = Self {
             store,
             events_tx,
@@ -933,7 +989,8 @@ impl ProgressWatch {
                 offset,
                 transferred: offset,
                 total,
-                updated_at: now_ms(),
+                started_at: now,
+                updated_at: now,
             },
             last_write: Instant::now(),
         };
@@ -959,7 +1016,13 @@ impl ProgressWatch {
 }
 
 fn notify_message(app: &App, item: &Item, text: &str) {
-    sound::play(app.files.data_dir(), SoundKind::Message);
+    let prefs = load_notification_settings(app.files.data_dir());
+    if prefs.message_sound {
+        sound::play(app.files.data_dir(), SoundKind::Message);
+    }
+    if !prefs.message_notify {
+        return;
+    }
     let helper = app.desktop_helper.clone();
     let files = app.files.clone();
     let chat = item.chat_id().to_owned();
@@ -967,13 +1030,14 @@ fn notify_message(app: &App, item: &Item, text: &str) {
     let text = text.to_owned();
     let title = peer_title(&app.store, "New message");
     tokio::spawn(async move {
+        let receive_dir = files.receive_dir();
         if let Some(helper) = helper
             && run_helper_stdin(
                 &helper,
                 &["--notify-chat", &chat],
                 &[
                     ("PORTAL_DROP_DATA_DIR", files.data_dir().as_os_str()),
-                    ("PORTAL_DROP_RECEIVE_DIR", files.receive_dir().as_os_str()),
+                    ("PORTAL_DROP_RECEIVE_DIR", receive_dir.as_os_str()),
                     ("PORTAL_DROP_REPLY_TO", reply_to.as_ref()),
                 ],
                 &text,
@@ -987,7 +1051,13 @@ fn notify_message(app: &App, item: &Item, text: &str) {
 }
 
 fn notify_file(app: &App, item: &Item, name: &str, full_path: &FsPath) {
-    sound::play(app.files.data_dir(), SoundKind::File);
+    let prefs = load_notification_settings(app.files.data_dir());
+    if prefs.file_sound {
+        sound::play(app.files.data_dir(), SoundKind::File);
+    }
+    if !prefs.file_notify {
+        return;
+    }
     let helper = app.desktop_helper.clone();
     let files = app.files.clone();
     let chat = item.chat_id().to_owned();
@@ -995,6 +1065,7 @@ fn notify_file(app: &App, item: &Item, name: &str, full_path: &FsPath) {
     let name = name.to_owned();
     let full_path = full_path.to_owned();
     tokio::spawn(async move {
+        let receive_dir = files.receive_dir();
         if let Some(helper) = helper
             && helper_supports(&helper, "--notify-file")
             && run_helper_stdin(
@@ -1002,7 +1073,7 @@ fn notify_file(app: &App, item: &Item, name: &str, full_path: &FsPath) {
                 &["--notify-file", &chat],
                 &[
                     ("PORTAL_DROP_DATA_DIR", files.data_dir().as_os_str()),
-                    ("PORTAL_DROP_RECEIVE_DIR", files.receive_dir().as_os_str()),
+                    ("PORTAL_DROP_RECEIVE_DIR", receive_dir.as_os_str()),
                     ("PORTAL_DROP_ITEM_ID", item_id.as_ref()),
                     ("PORTAL_DROP_FILE_PATH", full_path.as_os_str()),
                 ],
@@ -1017,7 +1088,13 @@ fn notify_file(app: &App, item: &Item, name: &str, full_path: &FsPath) {
 }
 
 fn notify_connected(app: &App) {
-    sound::play(app.files.data_dir(), SoundKind::Connected);
+    let prefs = load_notification_settings(app.files.data_dir());
+    if prefs.connected_sound {
+        sound::play(app.files.data_dir(), SoundKind::Connected);
+    }
+    if !prefs.connected_notify {
+        return;
+    }
     let helper = app.desktop_helper.clone();
     let label = peer_label(&app.store);
     let body = format!("{label} is now connected");

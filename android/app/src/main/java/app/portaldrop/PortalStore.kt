@@ -2,11 +2,14 @@ package app.portaldrop
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
 import android.os.Build
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
@@ -39,6 +42,20 @@ private const val CHAT_RANGE =
     "peer = ? AND chat_id = ? AND deleted = 0 AND (expires_at IS NULL OR expires_at > ?)"
 private val hex256 = Regex("[0-9a-f]{64}")
 private val itemId = Regex("[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+
+data class NotificationSettings(
+    val messageNotify: Boolean = true,
+    val messageSound: Boolean = true,
+    val fileNotify: Boolean = true,
+    val fileSound: Boolean = true,
+    val connectedNotify: Boolean = true,
+    val connectedSound: Boolean = true,
+)
+
+data class BatchEnqueueResult(
+    val queued: Int,
+    val failed: List<Pair<String, String>>,
+)
 
 data class Peer(
     val host: String,
@@ -192,6 +209,7 @@ data class ChatItem(
     internal val notified: Boolean = false,
     internal val peerFingerprint: String,
     val expiresAt: Long? = null,
+    val sourceUri: Uri? = null,
 )
 
 data class ChatRoom(
@@ -307,7 +325,7 @@ internal fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }
 
 internal fun InputStream.sha256(): String {
     val digest = MessageDigest.getInstance("SHA-256")
-    val buffer = ByteArray(64 * 1024)
+    val buffer = ByteArray(256 * 1024)
     while (true) {
         val read = read(buffer)
         if (read == -1) break
@@ -317,7 +335,7 @@ internal fun InputStream.sha256(): String {
 }
 
 class PortalStore private constructor(private val app: Context) :
-    SQLiteOpenHelper(app, "portal-drop.db", null, 3) {
+    SQLiteOpenHelper(app, "portal-drop.db", null, 4) {
 
     private val settings = app.getSharedPreferences("portal_drop", Context.MODE_PRIVATE)
     private val staging = File(app.noBackupFilesDir, "outbox")
@@ -356,6 +374,7 @@ class PortalStore private constructor(private val app: Context) :
                 notified INTEGER NOT NULL DEFAULT 0,
                 ttl_sec INTEGER,
                 expires_at INTEGER,
+                source_uri TEXT,
                 UNIQUE (peer, incoming, id)
             )
             """.trimIndent(),
@@ -381,6 +400,9 @@ class PortalStore private constructor(private val app: Context) :
             db.execSQL("ALTER TABLE items ADD COLUMN expires_at INTEGER")
             db.execSQL("CREATE INDEX IF NOT EXISTS items_expires ON items (peer, expires_at)")
             db.execSQL("ALTER TABLE chats ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+        }
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE items ADD COLUMN source_uri TEXT")
         }
     }
 
@@ -418,6 +440,60 @@ class PortalStore private constructor(private val app: Context) :
 
     internal fun setBackgroundEnabled(enabled: Boolean) {
         settings.edit().putBoolean("background_enabled", enabled).commit()
+    }
+
+    fun notificationSettings(): NotificationSettings = NotificationSettings(
+        messageNotify = settings.getBoolean("notify_message", true),
+        messageSound = settings.getBoolean("sound_message", true),
+        fileNotify = settings.getBoolean("notify_file", true),
+        fileSound = settings.getBoolean("sound_file", true),
+        connectedNotify = settings.getBoolean("notify_connected", true),
+        connectedSound = settings.getBoolean("sound_connected", true),
+    )
+
+    fun setNotificationSettings(value: NotificationSettings) {
+        settings.edit()
+            .putBoolean("notify_message", value.messageNotify)
+            .putBoolean("sound_message", value.messageSound)
+            .putBoolean("notify_file", value.fileNotify)
+            .putBoolean("sound_file", value.fileSound)
+            .putBoolean("notify_connected", value.connectedNotify)
+            .putBoolean("sound_connected", value.connectedSound)
+            .apply()
+    }
+
+    fun saveTreeUri(): Uri? = settings.getString("save_tree_uri", null)?.let(Uri::parse)
+
+    fun saveLocationLabel(): String {
+        val uri = saveTreeUri() ?: return "Default (Downloads/Portal Drop)"
+        return settings.getString("save_tree_label", null)?.takeIf { it.isNotBlank() } ?: formatTreeLabel(uri)
+    }
+
+    fun setSaveTreeUri(uri: Uri?, label: String? = null) {
+        val editor = settings.edit()
+        if (uri == null) {
+            editor.remove("save_tree_uri").remove("save_tree_label")
+        } else {
+            editor.putString("save_tree_uri", uri.toString())
+            editor.putString("save_tree_label", label ?: formatTreeLabel(uri))
+        }
+        editor.apply()
+    }
+
+    fun formatTreeLabel(uri: Uri): String {
+        val docId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()
+        if (docId != null) {
+            val volume = docId.substringBefore(':', "")
+            val rel = docId.substringAfter(':', "").trim('/')
+            val rootName = when {
+                volume.equals("primary", ignoreCase = true) -> "Internal storage"
+                volume.equals("home", ignoreCase = true) -> "Documents"
+                volume.isNotEmpty() -> "SD card ($volume)"
+                else -> "Custom folder"
+            }
+            return if (rel.isEmpty()) rootName else "$rootName / $rel"
+        }
+        return uri.lastPathSegment?.takeIf { it.isNotBlank() } ?: "Custom folder"
     }
 
     @Synchronized
@@ -661,8 +737,19 @@ class PortalStore private constructor(private val app: Context) :
             db.endTransaction()
         }
         toRemovePrivate.forEach { it.delete() }
-        toRemoveMedia.forEach { uri -> runCatching { app.contentResolver.delete(uri, null, null) } }
+        toRemoveMedia.forEach { uri -> deleteSavedUri(uri) }
         return count
+    }
+
+    private fun deleteSavedUri(uri: Uri) {
+        if (uri.authority == MediaStore.AUTHORITY) {
+            runCatching { app.contentResolver.delete(uri, null, null) }
+            return
+        }
+        val deleted = runCatching { DocumentsContract.deleteDocument(app.contentResolver, uri) }.getOrDefault(false)
+        if (!deleted) {
+            runCatching { app.contentResolver.delete(uri, null, null) }
+        }
     }
 
     fun purgeExpired(): List<Pair<String, Boolean>> {
@@ -702,7 +789,7 @@ class PortalStore private constructor(private val app: Context) :
             if (row.item.textSize != null) textFile(current.fingerprint, row.item.id, row.incoming).delete()
             if (row.item.kind == "file" && !row.incoming) File(staging, row.item.id).delete()
             if (row.item.kind == "file" && row.incoming && row.downloadUri != null) {
-                runCatching { app.contentResolver.delete(row.downloadUri, null, null) }
+                deleteSavedUri(row.downloadUri)
             }
         }
         return removed
@@ -930,28 +1017,35 @@ class PortalStore private constructor(private val app: Context) :
         chatId: String = activeChatId(),
         replyTo: String? = null,
         ttlSec: Long? = null,
-    ) {
+        onProgress: ((done: Int, total: Int, name: String) -> Unit)? = null,
+        onFileQueued: (() -> Unit)? = null,
+    ): BatchEnqueueResult {
         val current = peer() ?: error("Pair your computer first.")
         require(ttlSec == null || ttlSec in MIN_TTL_SEC..MAX_TTL_SEC) { "Invalid temporary timer." }
         validateComposeTarget(current, chatId, replyTo)
-        val idByUri = uris.distinct().associateWith { newId() }
+        val unique = uris.distinct()
         val expiresAt = ttlSec?.let { System.currentTimeMillis() + it * 1000L }
-        try {
-            val items = idByUri.map { (uri, id) -> stageFile(uri, id, chatId, replyTo, ttlSec) }
-            val db = writableDatabase
-            db.beginTransaction()
+        var queued = 0
+        val failed = mutableListOf<Pair<String, String>>()
+
+        unique.forEachIndexed { index, uri ->
+            val id = newId()
+            val name = runCatching { attachmentName(uri) }.getOrDefault("file")
+            onProgress?.invoke(index + 1, unique.size, name)
             try {
                 check(peer()?.token == current.token) { "The paired device changed during import." }
                 validateComposeTarget(current, chatId, replyTo)
-                for (item in items) insert(current, item, incoming = false, done = false, expiresAt = expiresAt)
-                db.setTransactionSuccessful()
-            } finally {
-                db.endTransaction()
+                val (item, directUri) = prepareOutgoingFile(uri, id, name, chatId, replyTo, ttlSec)
+                insert(current, item, incoming = false, done = false, expiresAt = expiresAt, sourceUri = directUri)
+                queued += 1
+                onFileQueued?.invoke()
+            } catch (error: Exception) {
+                File(staging, id).delete()
+                val msg = error.message?.takeIf { it.isNotBlank() } ?: "Could not read file"
+                failed.add(name to msg)
             }
-        } catch (error: Exception) {
-            for (id in idByUri.values) File(staging, id).delete()
-            throw error
         }
+        return BatchEnqueueResult(queued, failed)
     }
 
     private fun validateComposeTarget(peer: Peer, chatId: String, replyTo: String?) {
@@ -962,18 +1056,52 @@ class PortalStore private constructor(private val app: Context) :
         require(target != null && !target.deleted) { "This chat is unavailable." }
     }
 
-    private fun stageFile(uri: Uri, id: String, chatId: String, replyTo: String?, ttlSec: Long?): PortalItem {
-        val name = attachmentName(uri)
+    private fun prepareOutgoingFile(
+        uri: Uri,
+        id: String,
+        name: String,
+        chatId: String,
+        replyTo: String?,
+        ttlSec: Long?,
+    ): Pair<PortalItem, Uri?> {
+        val persisted = try {
+            app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            true
+        } catch (_: SecurityException) {
+            false
+        } catch (_: IllegalArgumentException) {
+            false
+        }
         val digest = MessageDigest.getInstance("SHA-256")
+        if (persisted) {
+            var total = 0L
+            val buffer = ByteArray(256 * 1024)
+            app.contentResolver.openInputStream(uri)?.use { input ->
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count == -1) break
+                    digest.update(buffer, 0, count)
+                    total += count
+                }
+            } ?: throw IOException("Could not open file.")
+            val item = PortalItem(
+                id, "file", System.currentTimeMillis(), name = name, size = total,
+                sha256 = digest.digest().hex(), chatId = chatId, replyTo = replyTo, ttlSec = ttlSec,
+            )
+            return item to uri
+        }
         val size = app.contentResolver.openInputStream(uri)?.use { input ->
             stagedFile(id).outputStream().use { output ->
-                val copied = DigestInputStream(input, digest).copyTo(output, 64 * 1024)
-                output.fd.sync()
+                val copied = DigestInputStream(input, digest).copyTo(output, 256 * 1024)
+                output.flush()
                 copied
             }
         } ?: throw IOException("Could not read the selected file.")
-        return PortalItem(id, "file", System.currentTimeMillis(), name = name, size = size,
-            sha256 = digest.digest().hex(), chatId = chatId, replyTo = replyTo, ttlSec = ttlSec)
+        val item = PortalItem(
+            id, "file", System.currentTimeMillis(), name = name, size = size,
+            sha256 = digest.digest().hex(), chatId = chatId, replyTo = replyTo, ttlSec = ttlSec,
+        )
+        return item to null
     }
 
     internal fun stagedFile(id: String): File = storageFile(staging, id)
@@ -1048,7 +1176,14 @@ class PortalStore private constructor(private val app: Context) :
         "peer = ? AND incoming = 0 AND done = 0 AND deleted = 0 AND (expires_at IS NULL OR expires_at > ?)",
         arrayOf(peer.fingerprint, System.currentTimeMillis().toString()),
         "CASE WHEN kind = 'text' AND text_size IS NULL THEN 0 ELSE 1 END, seq",
-        "20",
+        "64",
+    )
+
+    internal fun outgoingTexts(peer: Peer): List<ChatItem> = list(
+        "peer = ? AND incoming = 0 AND done = 0 AND deleted = 0 AND kind = 'text' AND text_size IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+        arrayOf(peer.fingerprint, System.currentTimeMillis().toString()),
+        "seq",
+        "32",
     )
 
     internal fun incoming(peer: Peer, item: PortalItem): ChatItem {
@@ -1074,6 +1209,10 @@ class PortalStore private constructor(private val app: Context) :
 
     internal fun isDeleted(peer: Peer, item: ChatItem): Boolean =
         list("peer = ? AND incoming = ? AND id = ? AND deleted = 1",
+            arrayOf(peer.fingerprint, if (item.incoming) "1" else "0", item.item.id), limit = "1").isNotEmpty()
+
+    internal fun isDoneOrDeleted(peer: Peer, item: ChatItem): Boolean =
+        list("peer = ? AND incoming = ? AND id = ? AND (deleted = 1 OR done = 1)",
             arrayOf(peer.fingerprint, if (item.incoming) "1" else "0", item.item.id), limit = "1").isNotEmpty()
 
     internal fun setDownloadUri(peer: Peer, id: String, uri: Uri?) {
@@ -1105,6 +1244,7 @@ class PortalStore private constructor(private val app: Context) :
         done: Boolean,
         ignoreDuplicate: Boolean = false,
         expiresAt: Long? = null,
+        sourceUri: Uri? = null,
     ) {
         val values = ContentValues().apply {
             put("peer", peer.fingerprint)
@@ -1123,6 +1263,7 @@ class PortalStore private constructor(private val app: Context) :
             put("ttl_sec", item.ttlSec)
             put("expires_at", expiresAt)
             put("done", done)
+            if (sourceUri != null) put("source_uri", sourceUri.toString())
         }
         if (ignoreDuplicate) {
             writableDatabase.insertWithOnConflict("items", null, values, SQLiteDatabase.CONFLICT_IGNORE)
@@ -1139,6 +1280,10 @@ class PortalStore private constructor(private val app: Context) :
 
     private fun Cursor.chatItem(): ChatItem {
         fun string(column: String) = getString(getColumnIndexOrThrow(column))
+        fun optionalString(column: String): String? {
+            val index = getColumnIndex(column)
+            return if (index < 0 || isNull(index)) null else getString(index)
+        }
         fun long(column: String) = getLong(getColumnIndexOrThrow(column))
         fun optionalLong(column: String): Long? {
             val index = getColumnIndexOrThrow(column)
@@ -1160,6 +1305,7 @@ class PortalStore private constructor(private val app: Context) :
             long("notified") == 1L,
             string("peer"),
             optionalLong("expires_at"),
+            optionalString("source_uri")?.let(Uri::parse),
         )
     }
 

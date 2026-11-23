@@ -270,6 +270,77 @@ pub struct Receipt {
     pub offset: u64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSettings {
+    #[serde(default = "default_true")]
+    pub message_notify: bool,
+    #[serde(default = "default_true")]
+    pub message_sound: bool,
+    #[serde(default = "default_true")]
+    pub file_notify: bool,
+    #[serde(default = "default_true")]
+    pub file_sound: bool,
+    #[serde(default = "default_true")]
+    pub connected_notify: bool,
+    #[serde(default = "default_true")]
+    pub connected_sound: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_dir: Option<String>,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            message_notify: true,
+            message_sound: true,
+            file_notify: true,
+            file_sound: true,
+            connected_notify: true,
+            connected_sound: true,
+            receive_dir: None,
+        }
+    }
+}
+
+pub fn load_notification_settings(data_dir: &std::path::Path) -> NotificationSettings {
+    let path = data_dir.join("settings.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_notification_settings(
+    data_dir: &std::path::Path,
+    settings: &NotificationSettings,
+) -> Result<()> {
+    let path = data_dir.join("settings.json");
+    let tmp = data_dir.join("settings.json.tmp");
+    let body = serde_json::to_string_pretty(settings)?;
+    #[cfg(unix)]
+    {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, format!("{body}\n"))?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 pub fn local_os() -> &'static str {
     if cfg!(target_os = "windows") {
         "windows"
