@@ -38,7 +38,9 @@ class Desktop:
         self.token = secrets.token_hex(32)
 
     def cli(self, *args):
-        return subprocess.check_output([*self.cmd, *args], text=True).strip()
+        return subprocess.check_output(
+            [*self.cmd, *args], text=True, encoding="utf-8"
+        ).strip()
 
     def start(self):
         home = self.directory / "home"
