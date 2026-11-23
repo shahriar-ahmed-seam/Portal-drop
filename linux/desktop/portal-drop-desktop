@@ -24,6 +24,20 @@ PAGE = 50
 PORTAL = os.environ.get("PORTAL_DROP_BINARY", str(Path.home() / ".local/bin/portal-drop"))
 SERVICE = "portal-drop.service"
 
+CHROME_FRAME_CSS = b"""
+window.portal-host.csd,
+window.portal-host.csd decoration,
+window.portal-host headerbar {
+    border-radius: 0;
+}
+window.portal-host headerbar button.titlebutton,
+window.portal-host headerbar button.titlebutton image {
+    opacity: 1;
+    -gtk-icon-shadow: none;
+    -gtk-icon-style: symbolic;
+}
+"""
+
 CHROME_CSS = {
     "light": b"""
 window.portal-host {
@@ -47,6 +61,10 @@ window.portal-host headerbar .title {
     color: #0f1a15;
     font-weight: 600;
 }
+window.portal-host headerbar button.titlebutton,
+window.portal-host headerbar button.titlebutton image {
+    color: #263b32;
+}
 """,
     "dark": b"""
 window.portal-host {
@@ -69,6 +87,10 @@ window.portal-host headerbar:backdrop {
 window.portal-host headerbar .title {
     color: #e9f1ed;
     font-weight: 600;
+}
+window.portal-host headerbar button.titlebutton,
+window.portal-host headerbar button.titlebutton image {
+    color: #e9f1ed;
 }
 """,
 }
@@ -281,10 +303,11 @@ class PortalWindow(Gtk.ApplicationWindow):
         self.webview.connect("load-changed", self.on_load_changed)
         self.webview.connect("decide-policy", self.on_decide_policy)
 
-        # Native GTK 3 drag-and-drop for real local file paths.
-        targets = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
-        self.webview.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+        # Handle file drops before WebKit's handlers, including GTK's portal URI targets.
+        self.webview.drag_dest_set(Gtk.DestDefaults(0), [], Gdk.DragAction.COPY)
+        self.webview.drag_dest_add_uri_targets()
         self.webview.connect("drag-motion", self.on_drag_motion)
+        self.webview.connect("drag-drop", self.on_drag_drop)
         self.webview.connect("drag-leave", self.on_drag_leave)
         self.webview.connect("drag-data-received", self.on_drag_data_received)
 
@@ -323,7 +346,7 @@ class PortalWindow(Gtk.ApplicationWindow):
         settings = Gtk.Settings.get_default()
         if settings is not None:
             settings.set_property("gtk-application-prefer-dark-theme", mode == "dark")
-        self.chrome_provider.load_from_data(CHROME_CSS[mode])
+        self.chrome_provider.load_from_data(CHROME_FRAME_CSS + CHROME_CSS[mode])
         rgba = Gdk.RGBA()
         rgba.parse("#1f2a26" if mode == "dark" else "#ffffff")
         self.webview.set_background_color(rgba)
@@ -391,11 +414,22 @@ class PortalWindow(Gtk.ApplicationWindow):
     def open_chat(self, chat_id, reply_to=None):
         self.js_call("__portalOpenChat", {"chatId": chat_id, "replyTo": reply_to})
 
-    def on_drag_motion(self, _widget, context, _x, _y, timestamp):
-        Gdk.drag_status(context, Gdk.DragAction.COPY, timestamp)
-        if not self.drag_active:
-            self.drag_active = True
-            self.js_call("__portalDragEnter", {"names": []})
+    def on_drag_motion(self, widget, context, _x, _y, timestamp):
+        target = widget.drag_dest_find_target(context, None)
+        valid = bool(target) and bool(context.get_actions() & Gdk.DragAction.COPY)
+        Gdk.drag_status(context, Gdk.DragAction.COPY if valid else Gdk.DragAction(0), timestamp)
+        if valid != self.drag_active:
+            self.drag_active = valid
+            self.js_call("__portalDragEnter" if valid else "__portalDragLeave")
+        return True
+
+    def on_drag_drop(self, widget, context, _x, _y, timestamp):
+        target = widget.drag_dest_find_target(context, None)
+        if target and context.get_actions() & Gdk.DragAction.COPY:
+            widget.drag_get_data(context, target, timestamp)
+        else:
+            self.on_drag_leave(widget, context, timestamp)
+            Gtk.drag_finish(context, False, False, timestamp)
         return True
 
     def on_drag_leave(self, _widget, _context, _timestamp):
@@ -403,7 +437,8 @@ class PortalWindow(Gtk.ApplicationWindow):
             self.drag_active = False
             self.js_call("__portalDragLeave", {})
 
-    def on_drag_data_received(self, _widget, context, _x, _y, selection, _info, timestamp):
+    def on_drag_data_received(self, widget, context, _x, _y, selection, _info, timestamp):
+        widget.stop_emission_by_name("drag-data-received")
         self.drag_active = False
         uris = selection.get_uris() if selection else []
         paths = []
