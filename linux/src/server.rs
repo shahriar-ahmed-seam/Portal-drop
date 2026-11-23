@@ -1085,9 +1085,24 @@ fn helper_supports(helper: &FsPath, flag: &str) -> bool {
 fn desktop_helper() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        let helper = dirs::home_dir()?.join(".local/bin/portal-drop-desktop");
-        let source = fs::read_to_string(&helper).ok()?;
-        source.contains("--notify-chat").then_some(helper)
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            candidates.push(dir.join("portal-drop-desktop"));
+        }
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(".local/bin/portal-drop-desktop"));
+        }
+        candidates.push(PathBuf::from("/usr/bin/portal-drop-desktop"));
+        for helper in candidates {
+            if let Ok(source) = fs::read_to_string(&helper)
+                && source.contains("--notify-chat")
+            {
+                return Some(helper);
+            }
+        }
+        None
     }
     #[cfg(windows)]
     {

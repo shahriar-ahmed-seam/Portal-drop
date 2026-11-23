@@ -28,13 +28,15 @@ jobs:
       - name: Check desktop launcher syntax
         run: |
           sh -n linux/install.sh
+          sh -n linux/build-deb.sh
           python3 -m py_compile linux/desktop/portal-drop-desktop
       - name: Run protocol smoke tests
         env:
           PORTAL_DROP_NO_SOUND: "1"
         run: python3 tests/protocol_smoke.py linux/target/release/portal-drop
-      - name: Package Linux archive
+      - name: Package Linux archive and Debian package
         run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' linux/Cargo.toml | head -n 1)
           mkdir -p dist/portal-drop-linux/linux/desktop/icons dist/portal-drop-linux/linux/systemd dist/portal-drop-linux/assets/sounds dist/portal-drop-linux/desktop-ui
           cp linux/target/release/portal-drop dist/portal-drop-linux/portal-drop
           cp linux/install.sh dist/portal-drop-linux/linux/install.sh
@@ -53,10 +55,15 @@ jobs:
           INSTALLER
           chmod +x dist/portal-drop-linux/install.sh dist/portal-drop-linux/linux/install.sh dist/portal-drop-linux/linux/desktop/portal-drop-desktop
           tar -C dist -czf portal-drop-linux-x64.tar.gz portal-drop-linux
+
+          PORTAL_DROP_DEB_OUT="$PWD" ./linux/build-deb.sh "$version"
+          dpkg-deb --info "portal-drop_${version}_amd64.deb"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: portal-drop-linux-x64
-          path: portal-drop-linux-x64.tar.gz
+          path: |
+            portal-drop-linux-x64.tar.gz
+            portal-drop_*_amd64.deb
           if-no-files-found: error
 
   build-windows:
@@ -77,9 +84,10 @@ jobs:
         run: python tests/protocol_smoke.py linux/target/release/portal-drop.exe
       - name: Build Portal Drop desktop GUI
         run: cargo build --locked --release --manifest-path windows/Cargo.toml
-      - name: Package Windows archive
+      - name: Package Windows archive and setup EXE
         shell: pwsh
         run: |
+          $version = (Select-String -Path windows/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           New-Item -ItemType Directory -Force -Path dist/portal-drop-windows/sounds | Out-Null
           Copy-Item linux/target/release/portal-drop.exe dist/portal-drop-windows/
           Copy-Item windows/target/release/portal-drop-desktop.exe dist/portal-drop-windows/
@@ -88,10 +96,26 @@ jobs:
           Copy-Item windows/install.ps1 dist/portal-drop-windows/
           Copy-Item windows/uninstall.ps1 dist/portal-drop-windows/
           Compress-Archive -Path dist/portal-drop-windows/* -DestinationPath portal-drop-windows-x64.zip -Force
+
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $candidate = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            if (Test-Path $candidate) { $iscc = $candidate }
+          } else {
+            $iscc = $iscc.Source
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DMyAppVersion=$version" windows\installer.iss
+          Copy-Item "dist\portal-drop-$version-windows-x64-setup.exe" .
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: portal-drop-windows-x64
-          path: portal-drop-windows-x64.zip
+          path: |
+            portal-drop-windows-x64.zip
+            portal-drop-*-windows-x64-setup.exe
           if-no-files-found: error
 
   build-android:
@@ -152,6 +176,7 @@ jobs:
           PORTAL_KEY_PASSWORD: ${{ secrets.PORTAL_KEY_PASSWORD }}
         run: |
           umask 077
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' linux/Cargo.toml | head -n 1)
           keystore=$(mktemp --suffix=.jks "$RUNNER_TEMP/portal-drop-signing.XXXXXX")
           trap 'rm -f -- "$keystore"' EXIT
           printf '%s' "$PORTAL_KEYSTORE_BASE64" | base64 --decode > "$keystore"
@@ -159,12 +184,12 @@ jobs:
           PORTAL_KEYSTORE_PATH="$keystore" ./android/gradlew --no-daemon -p android assembleRelease
           apk=android/app/build/outputs/apk/release/app-release.apk
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
-          cp "$apk" portal-drop-android.apk
+          cp "$apk" "portal-drop-${version}-android.apk"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: steps.signing.outputs.enabled == 'true'
         with:
           name: portal-drop-android
-          path: portal-drop-android.apk
+          path: portal-drop-*-android.apk
           if-no-files-found: error
 
   release:
@@ -183,13 +208,10 @@ jobs:
         run: |
           {
             echo 'files<<ASSETS'
-            echo artifacts/portal-drop-linux-x64/portal-drop-linux-x64.tar.gz
-            echo artifacts/portal-drop-windows-x64/portal-drop-windows-x64.zip
-            if [ -f artifacts/portal-drop-android/portal-drop-android.apk ]; then
-              echo artifacts/portal-drop-android/portal-drop-android.apk
-            fi
+            find artifacts -type f \( -name '*.deb' -o -name '*.tar.gz' -o -name '*.exe' -o -name '*.zip' -o -name '*.apk' \) | sort
             echo ASSETS
           } >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
       - name: Publish release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:

@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -21,7 +22,22 @@ from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
 APP_ID = "app.portaldrop"
 DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001"
 PAGE = 50
-PORTAL = os.environ.get("PORTAL_DROP_BINARY", str(Path.home() / ".local/bin/portal-drop"))
+
+
+def resolve_portal_binary():
+    explicit = os.environ.get("PORTAL_DROP_BINARY")
+    if explicit:
+        return explicit
+    sibling = Path(__file__).resolve().parent / "portal-drop"
+    if sibling.is_file():
+        return str(sibling)
+    on_path = shutil.which("portal-drop")
+    if on_path:
+        return on_path
+    return str(Path.home() / ".local/bin/portal-drop")
+
+
+PORTAL = resolve_portal_binary()
 SERVICE = "portal-drop.service"
 
 CHROME_FRAME_CSS = b"""
@@ -178,16 +194,23 @@ def find_ui_html():
         return Path(explicit).resolve()
     here = Path(__file__).resolve()
     xdg = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share"))
-    candidates = [
-        here.parents[2] / "desktop-ui" / "index.html",
-        xdg / "portal-drop" / "ui" / "index.html",
-        here.parent / "ui" / "index.html",
-    ]
+    candidates = []
+    if len(here.parents) > 2:
+        candidates.append(here.parents[2] / "desktop-ui" / "index.html")
+    if len(here.parents) > 1:
+        candidates.append(here.parents[1] / "share" / "portal-drop" / "ui" / "index.html")
+    candidates.extend(
+        [
+            xdg / "portal-drop" / "ui" / "index.html",
+            Path("/usr/share/portal-drop/ui/index.html"),
+            here.parent / "ui" / "index.html",
+        ]
+    )
     for path in candidates:
         if path.is_file():
             return path.resolve()
     raise FileNotFoundError(
-        "Portal Drop UI file (index.html) not found. Re-run ./linux/install.sh."
+        "Portal Drop UI file (index.html) not found. Reinstall Portal Drop."
     )
 
 
