@@ -558,9 +558,12 @@ fn dispatch_ipc(
                     .get("settings")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let body = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-                run_cli(&cli, &["settings".into(), "--stdin-json".into()], Some(&body))
-                    .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+                serde_json::to_string(&settings)
+                    .map_err(|e| e.to_string())
+                    .and_then(|body| {
+                        run_cli(&cli, &["settings".into(), "--stdin-json".into()], Some(&body))
+                            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+                    })
             }
             "test_sound" => {
                 let kind = msg.payload["kind"].as_str().unwrap_or("message").to_owned();
