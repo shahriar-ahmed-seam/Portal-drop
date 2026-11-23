@@ -814,6 +814,7 @@ async fn upload(
     );
     let transferred = append_upload(&mut file, body, length, &mut progress).await;
     file.flush().await?;
+    file.sync_all().await?;
     progress.save();
     transferred?;
     drop(file);

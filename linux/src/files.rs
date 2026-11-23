@@ -151,7 +151,6 @@ impl Files {
             tokio::task::spawn_blocking(move || {
                 let mut file = File::open(check_path)?;
                 let (size, hash, valid) = digest_copy(&mut file, &mut io::sink(), text)?;
-                file.sync_all()?;
                 Ok::<_, anyhow::Error>((size, hash, valid, file.metadata()?))
             })
             .await??;
