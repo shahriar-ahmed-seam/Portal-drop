@@ -1,0 +1,741 @@
+#!/usr/bin/python3
+"""Portal Drop desktop window — GTK 3 + WebKit2GTK 4.1 host for the shared web UI."""
+
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
+
+APP_ID = "app.portaldrop"
+DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001"
+PAGE = 50
+PORTAL = os.environ.get("PORTAL_DROP_BINARY", str(Path.home() / ".local/bin/portal-drop"))
+SERVICE = "portal-drop.service"
+
+CHROME_CSS = {
+    "light": b"""
+window.portal-host {
+    background-color: #ffffff;
+    background-image: none;
+}
+window.portal-host headerbar {
+    background-color: #ffffff;
+    background-image: none;
+    color: #0f1a15;
+    border-bottom: 1px solid #e7ecea;
+    box-shadow: none;
+    min-height: 38px;
+}
+window.portal-host headerbar:backdrop {
+    background-color: #f9fbfa;
+    background-image: none;
+    color: #5b6b64;
+}
+window.portal-host headerbar .title {
+    color: #0f1a15;
+    font-weight: 600;
+}
+""",
+    "dark": b"""
+window.portal-host {
+    background-color: #1f2a26;
+    background-image: none;
+}
+window.portal-host headerbar {
+    background-color: #222e2a;
+    background-image: none;
+    color: #e9f1ed;
+    border-bottom: 1px solid #2d3b36;
+    box-shadow: none;
+    min-height: 38px;
+}
+window.portal-host headerbar:backdrop {
+    background-color: #1d2723;
+    background-image: none;
+    color: #8ea29a;
+}
+window.portal-host headerbar .title {
+    color: #e9f1ed;
+    font-weight: 600;
+}
+""",
+}
+
+
+def run_cli(*args, data=None):
+    result = subprocess.run(
+        [PORTAL, *args],
+        input=None if data is None else data.encode("utf-8"),
+        capture_output=True,
+        check=True,
+    )
+    return result.stdout.decode("utf-8")
+
+
+def get_json(*args):
+    return json.loads(run_cli(*args))
+
+
+def service_ctl(action):
+    subprocess.run(
+        ["systemctl", "--user", action, SERVICE],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def service_active():
+    return (
+        subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", SERVICE],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def error_details(error):
+    details = getattr(error, "stderr", None) or str(error)
+    return details.decode(errors="replace").strip() if isinstance(details, bytes) else str(details).strip()
+
+
+def data_dir_path():
+    env_dir = os.environ.get("PORTAL_DROP_DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    return Path(xdg) / "portal-drop"
+
+
+def config_dir_path():
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "portal-drop"
+
+
+def prefs_path():
+    return config_dir_path() / "ui-prefs.json"
+
+
+def load_prefs():
+    try:
+        raw = prefs_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return {"theme": "light", **data}
+    except Exception:
+        pass
+    return {"theme": "light"}
+
+
+def save_prefs(prefs):
+    if not isinstance(prefs, dict):
+        return
+    path = prefs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(prefs, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def find_ui_html():
+    explicit = os.environ.get("PORTAL_DROP_UI")
+    if explicit and Path(explicit).is_file():
+        return Path(explicit).resolve()
+    here = Path(__file__).resolve()
+    xdg = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share"))
+    candidates = [
+        here.parents[2] / "desktop-ui" / "index.html",
+        xdg / "portal-drop" / "ui" / "index.html",
+        here.parent / "ui" / "index.html",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    raise FileNotFoundError(
+        "Portal Drop UI file (index.html) not found. Re-run ./linux/install.sh."
+    )
+
+
+def open_uri(uri):
+    Gio.AppInfo.launch_default_for_uri(uri, None)
+
+
+def show_in_file_manager(path_str):
+    target = Path(path_str).resolve()
+    uri = target.as_uri()
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.call_sync(
+            "org.freedesktop.FileManager1",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1",
+            "ShowItems",
+            GLib.Variant("(ass)", ([uri], "")),
+            None,
+            Gio.DBusCallFlags.NONE,
+            1500,
+            None,
+        )
+        return
+    except Exception:
+        pass
+    folder = target.parent if target.is_file() else target
+    open_uri(folder.as_uri())
+
+
+def queue_files_cli(payload, paths):
+    chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
+    base_args = ["send-file", "--chat", chat_id]
+    if payload.get("replyTo"):
+        base_args.extend(["--reply-to", str(payload["replyTo"])])
+    if payload.get("ttl"):
+        base_args.extend(["--ttl", str(int(payload["ttl"]))])
+    sent = 0
+    skipped = 0
+    errors = []
+    for raw in paths:
+        p = Path(raw)
+        if not p.is_file():
+            skipped += 1
+            continue
+        try:
+            run_cli(*base_args, str(p))
+            sent += 1
+        except (OSError, subprocess.CalledProcessError) as error:
+            errors.append(f"{p.name}: {error_details(error)}")
+    if errors and sent == 0:
+        raise RuntimeError("\n".join(errors))
+    return {"sent": sent, "skipped": skipped, "errors": errors}
+
+
+class PortalWindow(Gtk.ApplicationWindow):
+    def __init__(self, application):
+        super().__init__(application=application, title="Portal Drop")
+        self.get_style_context().add_class("portal-host")
+        self.set_icon_name(APP_ID)
+        self.set_default_size(1100, 740)
+        self.set_size_request(680, 480)
+
+        self.work = ThreadPoolExecutor(max_workers=4)
+        self.closed = False
+        self.ui_ready = False
+        self.queued_js = []
+        self.drag_active = False
+        self.chrome_provider = Gtk.CssProvider()
+
+        prefs = load_prefs()
+        initial_theme = prefs.get("theme", "light")
+        if initial_theme not in ("light", "dark"):
+            initial_theme = self._detect_system_theme()
+
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_title("Portal Drop")
+        self.set_titlebar(header)
+
+        ucm = WebKit2.UserContentManager()
+        ucm.register_script_message_handler("portal")
+        ucm.connect("script-message-received::portal", self.on_ipc_message)
+
+        boot_js = (
+            'window.__PORTAL_HOST = "linux";\n'
+            f"window.__PORTAL_PREFS = {json.dumps(prefs)};\n"
+        )
+        ucm.add_script(
+            WebKit2.UserScript(
+                boot_js,
+                WebKit2.UserContentInjectedFrames.TOP_FRAME,
+                WebKit2.UserScriptInjectionTime.START,
+                None,
+                None,
+            )
+        )
+
+        self.webview = WebKit2.WebView.new_with_user_content_manager(ucm)
+        self.webview.set_hexpand(True)
+        self.webview.set_vexpand(True)
+
+        settings = self.webview.get_settings()
+        settings.set_allow_file_access_from_file_urls(True)
+        settings.set_allow_universal_access_from_file_urls(True)
+        settings.set_enable_smooth_scrolling(True)
+        settings.set_javascript_can_access_clipboard(True)
+        if os.environ.get("PORTAL_DROP_DEVTOOLS"):
+            settings.set_enable_developer_extras(True)
+
+        self.ui_file = find_ui_html()
+        self.ui_uri = self.ui_file.as_uri()
+        self.webview.connect("load-changed", self.on_load_changed)
+        self.webview.connect("decide-policy", self.on_decide_policy)
+
+        # Native GTK 3 drag-and-drop for real local file paths.
+        targets = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
+        self.webview.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+        self.webview.connect("drag-motion", self.on_drag_motion)
+        self.webview.connect("drag-leave", self.on_drag_leave)
+        self.webview.connect("drag-data-received", self.on_drag_data_received)
+
+        self.add(self.webview)
+
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            Gtk.StyleContext.add_provider_for_screen(
+                screen,
+                self.chrome_provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+        self.apply_native_theme(initial_theme)
+
+        self.webview.load_uri(self.ui_uri)
+        self.connect("delete-event", self.on_close)
+        self.show_all()
+        self.start_daemon_watcher()
+
+    def _detect_system_theme(self):
+        try:
+            out = subprocess.run(
+                ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            ).stdout
+            if "dark" in out.lower():
+                return "dark"
+        except Exception:
+            pass
+        return "light"
+
+    def apply_native_theme(self, theme):
+        mode = "dark" if theme == "dark" else "light"
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.set_property("gtk-application-prefer-dark-theme", mode == "dark")
+        self.chrome_provider.load_from_data(CHROME_CSS[mode])
+        rgba = Gdk.RGBA()
+        rgba.parse("#1f2a26" if mode == "dark" else "#ffffff")
+        self.webview.set_background_color(rgba)
+
+    def on_load_changed(self, _webview, event):
+        if event == WebKit2.LoadEvent.FINISHED:
+            self.ui_ready = True
+            pending, self.queued_js = self.queued_js, []
+            for script in pending:
+                self._eval_js_now(script)
+
+    def on_decide_policy(self, _webview, decision, decision_type):
+        if decision_type in (
+            WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+            WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION,
+        ):
+            nav = decision.get_navigation_action()
+            req = nav.get_request() if nav else None
+            uri = req.get_uri() if req else ""
+            if uri and uri != self.ui_uri and not uri.startswith(self.ui_uri + "?"):
+                if uri.startswith(("http://", "https://")):
+                    try:
+                        open_uri(uri)
+                    except Exception:
+                        pass
+                decision.ignore()
+                return True
+        return False
+
+    def on_close(self, _window, _event):
+        self.closed = True
+        self.work.shutdown(wait=False, cancel_futures=True)
+        return False
+
+    def _eval_js_now(self, script):
+        if self.closed:
+            return
+        self.webview.evaluate_javascript(script, -1, None, None, None, None, None)
+
+    def js_call(self, fn_name, arg=None):
+        encoded = json.dumps(arg if arg is not None else {})
+        script = f"window.{fn_name} && window.{fn_name}({encoded});"
+
+        def dispatch():
+            if self.closed:
+                return False
+            if self.ui_ready:
+                self._eval_js_now(script)
+            else:
+                self.queued_js.append(script)
+            return False
+
+        GLib.idle_add(dispatch)
+
+    def reply(self, req_id, ok=True, data=None, error=None):
+        if req_id is None:
+            return
+        payload = {"req_id": req_id, "ok": ok}
+        if ok:
+            payload["data"] = data
+        else:
+            payload["error"] = str(error or "Action failed")
+        self.js_call("__portalReply", payload)
+
+    def open_chat(self, chat_id, reply_to=None):
+        self.js_call("__portalOpenChat", {"chatId": chat_id, "replyTo": reply_to})
+
+    def on_drag_motion(self, _widget, context, _x, _y, timestamp):
+        Gdk.drag_status(context, Gdk.DragAction.COPY, timestamp)
+        if not self.drag_active:
+            self.drag_active = True
+            self.js_call("__portalDragEnter", {"names": []})
+        return True
+
+    def on_drag_leave(self, _widget, _context, _timestamp):
+        if self.drag_active:
+            self.drag_active = False
+            self.js_call("__portalDragLeave", {})
+
+    def on_drag_data_received(self, _widget, context, _x, _y, selection, _info, timestamp):
+        self.drag_active = False
+        uris = selection.get_uris() if selection else []
+        paths = []
+        for uri in uris:
+            p = Gio.File.new_for_uri(uri).get_path()
+            if p:
+                paths.append(p)
+        Gtk.drag_finish(context, bool(paths), False, timestamp)
+        if paths:
+            self.js_call("__portalDropFiles", {"paths": paths})
+        else:
+            self.js_call("__portalDragLeave", {})
+
+    def start_daemon_watcher(self):
+        def watch_loop():
+            wake_file = data_dir_path() / "wake.json"
+            while not self.closed:
+                try:
+                    cfg = json.loads(wake_file.read_text(encoding="utf-8"))
+                    with socket.create_connection(("127.0.0.1", int(cfg["port"])), timeout=2.0) as sock:
+                        sock.settimeout(None)
+                        sock.sendall(f"watch {cfg['token']}\n".encode("utf-8"))
+                        reader = sock.makefile("r", encoding="utf-8")
+                        for line in reader:
+                            if self.closed:
+                                return
+                            event = line.strip()
+                            if event and event != "ping":
+                                self.js_call("__portalWake", {"reason": event})
+                except OSError:
+                    time.sleep(1.2)
+                except Exception:
+                    time.sleep(2.0)
+
+        threading.Thread(target=watch_loop, name="portal-drop-watch", daemon=True).start()
+
+    def on_ipc_message(self, _ucm, js_result):
+        try:
+            raw = js_result.get_js_value().to_string()
+            msg = json.loads(raw)
+        except Exception:
+            return
+        req_id = msg.get("req_id")
+        action = msg.get("action") or ""
+        payload = msg.get("payload") or {}
+
+        if action == "pick_files":
+            self._handle_pick_files(req_id, payload)
+            return
+        if action == "set_theme":
+            self.apply_native_theme(payload.get("theme", "light"))
+            self.reply(req_id, ok=True, data={"ok": True})
+            return
+        if action == "open_file":
+            try:
+                open_uri(Path(str(payload.get("path") or "")).resolve().as_uri())
+                self.reply(req_id, ok=True, data={"ok": True})
+            except Exception as err:
+                self.reply(req_id, ok=False, error=error_details(err))
+            return
+        if action == "open_url":
+            url = str(payload.get("url") or "")
+            if not url.startswith(("http://", "https://")):
+                self.reply(req_id, ok=False, error="Unsupported URL scheme")
+                return
+            try:
+                open_uri(url)
+                self.reply(req_id, ok=True, data={"ok": True})
+            except Exception as err:
+                self.reply(req_id, ok=False, error=error_details(err))
+            return
+
+        self.work.submit(self._dispatch_worker, req_id, action, payload)
+
+    def _handle_pick_files(self, req_id, payload):
+        dialog = Gtk.FileChooserNative.new(
+            "Choose files to send",
+            self,
+            Gtk.FileChooserAction.OPEN,
+            "Send",
+            "Cancel",
+        )
+        dialog.set_select_multiple(True)
+        response = dialog.run()
+        paths = dialog.get_filenames() if response == Gtk.ResponseType.ACCEPT else []
+        dialog.destroy()
+        if not paths:
+            self.reply(req_id, ok=True, data={"cancelled": True})
+            return
+
+        def send_job():
+            try:
+                res = queue_files_cli(payload, paths)
+                self.reply(req_id, ok=True, data=res)
+            except Exception as err:
+                self.reply(req_id, ok=False, error=error_details(err))
+
+        self.work.submit(send_job)
+
+    def _dispatch_worker(self, req_id, action, payload):
+        try:
+            data = self._run_action(action, payload)
+            self.reply(req_id, ok=True, data=data)
+        except Exception as err:
+            self.reply(req_id, ok=False, error=error_details(err))
+
+    def _run_action(self, action, payload):
+        if action == "snapshot":
+            chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
+            active = service_active()
+            snap = get_json("snapshot", "--chat", chat_id, "--limit", str(PAGE))
+            return {
+                "serviceActive": active,
+                "status": snap["status"],
+                "chats": snap["chats"],
+                "chatId": snap["chat_id"],
+                "history": snap["history"],
+                "progress": snap["progress"],
+                "previews": snap.get("previews", []),
+            }
+        if action == "load_older":
+            chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
+            before = str(int(payload.get("before", 0)))
+            return get_json("history", "--json", "--chat", chat_id, "--before", before, "--limit", str(PAGE))
+        if action == "send_text":
+            chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
+            text = str(payload.get("text") or "")
+            args = ["send-text", "--chat", chat_id]
+            if payload.get("replyTo"):
+                args.extend(["--reply-to", str(payload["replyTo"])])
+            if payload.get("ttl"):
+                args.extend(["--ttl", str(int(payload["ttl"]))])
+            args.append("-")
+            run_cli(*args, data=text)
+            return {"ok": True}
+        if action == "send_files":
+            paths = [str(p) for p in (payload.get("paths") or []) if p]
+            return queue_files_cli(payload, paths)
+        if action == "new_chat":
+            return get_json("new-chat")
+        if action == "rename_chat":
+            return get_json("rename-chat", str(payload.get("id") or ""), str(payload.get("title") or ""))
+        if action == "delete_chat":
+            return get_json("delete-chat", str(payload.get("id") or ""))
+        if action == "message_text":
+            return {"text": run_cli("message-text", str(payload.get("id") or ""))}
+        if action == "delete_message":
+            args = ["delete-message"]
+            if payload.get("deleteFiles"):
+                args.append("--delete-files")
+            args.append(str(payload.get("id") or ""))
+            run_cli(*args)
+            return {"ok": True}
+        if action == "delete_messages":
+            ids = [str(i) for i in (payload.get("ids") or []) if i]
+            if ids:
+                args = ["delete-message"]
+                if payload.get("deleteFiles"):
+                    args.append("--delete-files")
+                args.extend(ids)
+                run_cli(*args)
+            return {"ok": True}
+        if action == "received_files":
+            args = ["history", "--json", "--files", "--limit", str(PAGE)]
+            if payload.get("before") is not None:
+                args.extend(["--before", str(int(payload["before"]))])
+            return get_json(*args)
+        if action == "show_in_folder":
+            show_in_file_manager(str(payload.get("path") or ""))
+            return {"ok": True}
+        if action == "open_receive_folder":
+            folder = run_cli("receive-folder").strip()
+            open_uri(Path(folder).resolve().as_uri())
+            return {"ok": True}
+        if action == "clear_history":
+            run_cli("clear-history")
+            return {"ok": True}
+        if action == "pair":
+            try:
+                service_ctl("start")
+            except Exception:
+                pass
+            output = run_cli("pair").rstrip("\n")
+            lines = output.split("\n")
+            link = lines[-1] if lines else ""
+            qr = "\n".join(lines[:-2]) if len(lines) >= 2 else ""
+            return {"qr": qr, "link": link}
+        if action == "unpair":
+            run_cli("unpair")
+            return {"ok": True}
+        if action == "pause_service":
+            service_ctl("stop")
+            return {"serviceActive": False}
+        if action == "resume_service":
+            service_ctl("start")
+            return {"serviceActive": True}
+        if action == "set_prefs":
+            save_prefs(payload.get("prefs") or {})
+            return {"ok": True}
+        raise ValueError(f"Unknown action: {action}")
+
+
+class PortalApplication(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        for name in (
+            "notify-chat",
+            "notify-file",
+            "notify-connected",
+            "reply-to",
+            "item-id",
+            "file-path",
+            "data-dir",
+            "receive-dir",
+        ):
+            self.add_main_option(name, 0, GLib.OptionFlags.HIDDEN, GLib.OptionArg.STRING, "", "VALUE")
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.add_portal_action("reply", "(ssss)", self.reply_action)
+        self.add_portal_action("open-chat", "s", self.open_chat_action)
+        self.add_portal_action("open-file", "s", self.open_file_action)
+        self.add_portal_action("open-app", None, lambda _a, _p: self.activate())
+
+    def do_command_line(self, command):
+        options = command.get_options_dict()
+
+        def option(name):
+            value = options.lookup_value(name, None)
+            return value.get_string() if value else ""
+
+        def read_stdin():
+            source = command.get_stdin()
+            return source.read_bytes(4096, None).get_data().decode(errors="replace").strip() if source else ""
+
+        chat = option("notify-chat")
+        file_chat = option("notify-file")
+        connected = option("notify-connected")
+        if chat:
+            self.post_message_notification(
+                chat,
+                option("reply-to"),
+                option("data-dir"),
+                option("receive-dir"),
+                read_stdin(),
+            )
+        elif file_chat:
+            self.post_file_notification(
+                file_chat,
+                option("item-id"),
+                option("file-path"),
+                read_stdin(),
+            )
+        elif connected:
+            self.post_connected_notification(connected, read_stdin())
+        else:
+            self.activate()
+        return 0
+
+    def add_portal_action(self, name, signature, callback):
+        vtype = GLib.VariantType.new(signature) if signature else None
+        action = Gio.SimpleAction.new(name, vtype)
+        action.connect("activate", callback)
+        self.add_action(action)
+
+    def post_message_notification(self, chat, reply_to, data_dir, receive_dir, preview):
+        notification = Gio.Notification.new("New message")
+        notification.set_body(preview or "New message received")
+        notification.set_icon(Gio.ThemedIcon.new(APP_ID))
+        notification.set_category("im.received")
+        notification.set_default_action_and_target("app.open-chat", GLib.Variant("s", chat))
+        target = GLib.Variant("(ssss)", (chat, reply_to, data_dir, receive_dir))
+        notification.add_button_with_target("Reply", "app.reply", target)
+        self.send_notification(reply_to or chat, notification)
+
+    def post_file_notification(self, chat, item_id, file_path, filename):
+        notification = Gio.Notification.new("File received")
+        notification.set_body(filename or "File saved in Downloads/Portal Drop")
+        notification.set_icon(Gio.ThemedIcon.new(APP_ID))
+        notification.set_category("transfer.complete")
+        notification.set_default_action_and_target("app.open-chat", GLib.Variant("s", chat))
+        if file_path:
+            notification.add_button_with_target("Open file", "app.open-file", GLib.Variant("s", file_path))
+        self.send_notification(item_id or f"file-{chat}", notification)
+
+    def post_connected_notification(self, peer_label, body):
+        notification = Gio.Notification.new("Device connected")
+        notification.set_body(body or f"{peer_label} is now connected")
+        notification.set_icon(Gio.ThemedIcon.new(APP_ID))
+        notification.set_category("device.added")
+        notification.set_default_action("app.open-app")
+        self.send_notification("portal-connected", notification)
+
+    def reply_action(self, _, parameter):
+        chat, reply_to, _data_dir, _receive_dir = parameter.unpack()
+        self.activate()
+        window = self.get_active_window()
+        if window is not None:
+            window.open_chat(chat, reply_to or None)
+
+    def open_chat_action(self, _, parameter):
+        self.activate()
+        window = self.get_active_window()
+        if window is not None:
+            window.open_chat(parameter.get_string())
+
+    def open_file_action(self, _, parameter):
+        path = parameter.get_string()
+        try:
+            open_uri(Path(path).resolve().as_uri())
+        except Exception:
+            self.activate()
+
+    def do_activate(self):
+        window = self.get_active_window()
+        if window is None:
+            window = PortalWindow(self)
+        window.present()
+
+
+if __name__ == "__main__":
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name("Portal Drop")
+    arguments = sys.argv.copy()
+    if len(sys.argv) == 3 and sys.argv[1] in ("--notify-chat", "--notify-file", "--notify-connected"):
+        for flag, setting in (
+            ("--reply-to", "PORTAL_DROP_REPLY_TO"),
+            ("--item-id", "PORTAL_DROP_ITEM_ID"),
+            ("--file-path", "PORTAL_DROP_FILE_PATH"),
+            ("--data-dir", "PORTAL_DROP_DATA_DIR"),
+            ("--receive-dir", "PORTAL_DROP_RECEIVE_DIR"),
+        ):
+            if os.environ.get(setting):
+                arguments.extend((flag, os.environ[setting]))
+    raise SystemExit(PortalApplication().run(arguments))

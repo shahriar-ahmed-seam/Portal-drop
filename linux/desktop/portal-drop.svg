@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="46%" r="65%">
+      <stop offset="0%" stop-color="#193025"/>
+      <stop offset="100%" stop-color="#0F1B15"/>
+    </radialGradient>
+    <linearGradient id="stem" x1="15%" y1="15%" x2="85%" y2="85%">
+      <stop offset="0%" stop-color="#B0F7D6"/>
+      <stop offset="50%" stop-color="#5FD8A6"/>
+      <stop offset="100%" stop-color="#2D9B72"/>
+    </linearGradient>
+    <linearGradient id="loop" x1="20%" y1="10%" x2="90%" y2="90%">
+      <stop offset="0%" stop-color="#BAF9DC"/>
+      <stop offset="55%" stop-color="#4FD09E"/>
+      <stop offset="100%" stop-color="#28946B"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2E8664"/>
+      <stop offset="100%" stop-color="#1B563F"/>
+    </linearGradient>
+    <radialGradient id="dot" cx="38%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#E2FFF1"/>
+      <stop offset="65%" stop-color="#89ECC1"/>
+      <stop offset="100%" stop-color="#4AC596"/>
+    </radialGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- Floating top-left glowing droplet dot -->
+  <circle cx="41.5" cy="35" r="4.6" fill="url(#dot)"/>
+  <!-- Inner deep emerald shadow leaf -->
+  <path d="M57 78 C57 65 67 63 73 59 L86 72 C79 81 66 84 57 78 Z" fill="url(#leaf)"/>
+  <!-- Left ribbon stem -->
+  <path d="M47 43 L58 54 C55 57.5 54 62 54 67 V97 C43.5 96.5 36.5 89 36.5 78 V62 C36.5 54 40 48.5 47 43 Z" fill="url(#stem)"/>
+  <!-- Upper-right portal P loop -->
+  <path d="M51 39 C58 31 73 29 83 39 C94 50 93.5 64 87.5 70 L74 56.5 C76 52 74.5 47 71 44.5 C67.5 42 62.5 43.5 59.5 47.5 Z" fill="url(#loop)"/>
+</svg>

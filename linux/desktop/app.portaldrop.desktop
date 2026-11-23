@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Portal Drop
+Comment=Send files and messages between your Linux and Android devices
+Exec=portal-drop-desktop
+Icon=app.portaldrop
+Terminal=false
+StartupNotify=true
+StartupWMClass=app.portaldrop
+DBusActivatable=true
+Categories=Network;FileTransfer;
+Keywords=Android;Wi-Fi;Transfer;Chat;

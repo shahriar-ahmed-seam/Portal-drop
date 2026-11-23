@@ -1,0 +1,1557 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>Portal Drop</title>
+<style>
+/* ==========================================================================
+   Portal Drop desktop UI — shared by Linux (WebKitGTK) and Windows (WebView2)
+   ========================================================================== */
+:root {
+  --font: "Segoe UI Variable Text", "Segoe UI", "Inter", Roboto, "Noto Sans", "Ubuntu Sans", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", Consolas, "Ubuntu Sans Mono", "DejaVu Sans Mono", monospace;
+  --radius-bubble: 16px;
+  --sidebar-w: 340px;
+  --ease: cubic-bezier(.2, .8, .2, 1);
+}
+
+/* ---------- Light (default) ---------- */
+html[data-theme="light"] {
+  color-scheme: light;
+  --accent: #229e66;
+  --accent-hover: #1b8a58;
+  --accent-soft: rgba(34, 158, 102, .12);
+  --on-accent: #ffffff;
+  --text: #0f1a15;
+  --text-2: #3d4b45;
+  --muted: #74847d;
+  --line: #e7ecea;
+  --side-bg: #ffffff;
+  --side-hover: #f2f5f4;
+  --side-active: #229e66;
+  --side-active-text: #ffffff;
+  --panel: #ffffff;
+  --panel-border: #e3e9e6;
+  --input-bg: #f1f4f3;
+  --input-focus: #ffffff;
+  --wall-1: #d4e8c6;
+  --wall-2: #b6dcc0;
+  --wall-3: #dfeab9;
+  --wall-pattern: rgba(30, 90, 50, .07);
+  --bubble-in: #ffffff;
+  --bubble-out: #e2f7d6;
+  --bubble-text: #0f1a15;
+  --bubble-shadow: 0 1px 1.5px rgba(20, 50, 35, .14);
+  --meta-in: #8a9892;
+  --meta-out: #4c9a62;
+  --tick: #3aa45f;
+  --link: #1a7fc2;
+  --quote-bar: #229e66;
+  --quote-bg-in: rgba(34, 158, 102, .08);
+  --quote-bg-out: rgba(34, 140, 80, .12);
+  --code-bg: rgba(15, 40, 28, .06);
+  --file-icon-bg: #229e66;
+  --day-bg: rgba(28, 70, 48, .38);
+  --day-text: #ffffff;
+  --menu-bg: rgba(255, 255, 255, .98);
+  --menu-shadow: 0 10px 34px rgba(10, 30, 20, .18), 0 1px 3px rgba(10, 30, 20, .08);
+  --menu-hover: #f0f4f2;
+  --danger: #e04f4f;
+  --danger-soft: rgba(224, 79, 79, .1);
+  --scrim: rgba(10, 20, 15, .38);
+  --select-bg: rgba(34, 158, 102, .14);
+  --online: #2bb36f;
+  --warn: #d9932b;
+  --scroll-thumb: rgba(0, 0, 0, .18);
+}
+
+/* ---------- Dark (soft, not pitch black) ---------- */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --accent: #4cc38a;
+  --accent-hover: #5fd39a;
+  --accent-soft: rgba(76, 195, 138, .14);
+  --on-accent: #0b2018;
+  --text: #e9f1ed;
+  --text-2: #c3d1ca;
+  --muted: #8ea29a;
+  --line: #2c3a35;
+  --side-bg: #1f2a26;
+  --side-hover: #273530;
+  --side-active: #2f8a62;
+  --side-active-text: #ffffff;
+  --panel: #222e2a;
+  --panel-border: #2d3b36;
+  --input-bg: #2a3833;
+  --input-focus: #2f3e39;
+  --wall-1: #1c2925;
+  --wall-2: #18241f;
+  --wall-3: #1f2c22;
+  --wall-pattern: rgba(160, 230, 190, .045);
+  --bubble-in: #2a3934;
+  --bubble-out: #2d6047;
+  --bubble-text: #ecf3ef;
+  --bubble-shadow: 0 1px 1.5px rgba(0, 0, 0, .25);
+  --meta-in: #91a59d;
+  --meta-out: #a7dcbf;
+  --tick: #8de2b5;
+  --link: #74c6ff;
+  --quote-bar: #6fd8a3;
+  --quote-bg-in: rgba(111, 216, 163, .09);
+  --quote-bg-out: rgba(255, 255, 255, .09);
+  --code-bg: rgba(0, 0, 0, .22);
+  --file-icon-bg: #3aa877;
+  --day-bg: rgba(10, 22, 17, .55);
+  --day-text: #e3efe9;
+  --menu-bg: rgba(39, 52, 47, .98);
+  --menu-shadow: 0 12px 36px rgba(0, 0, 0, .45), 0 1px 3px rgba(0, 0, 0, .3);
+  --menu-hover: #314440;
+  --danger: #ff7b7b;
+  --danger-soft: rgba(255, 123, 123, .12);
+  --scrim: rgba(0, 0, 0, .5);
+  --select-bg: rgba(76, 195, 138, .16);
+  --online: #5fdc9c;
+  --warn: #f0b45c;
+  --scroll-thumb: rgba(255, 255, 255, .16);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: var(--font); font-size: 14px; color: var(--text); background: var(--side-bg);
+  overflow: hidden; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  user-select: none; -webkit-user-select: none;
+}
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+input, textarea { font: inherit; color: inherit; }
+svg { display: block; flex-shrink: 0; }
+[hidden] { display: none !important; }
+
+/* thin, auto-hiding scrollbars (WebKit + Chromium) */
+.scroll { overflow-y: auto; scrollbar-width: thin; scrollbar-color: transparent transparent; }
+.scroll:hover { scrollbar-color: var(--scroll-thumb) transparent; }
+.scroll::-webkit-scrollbar { width: 6px; }
+.scroll::-webkit-scrollbar-track { background: transparent; }
+.scroll::-webkit-scrollbar-thumb { background: transparent; border-radius: 6px; }
+.scroll:hover::-webkit-scrollbar-thumb { background: var(--scroll-thumb); }
+
+.app { display: grid; grid-template-columns: var(--sidebar-w) 1fr; height: 100vh; }
+
+/* ============================ Sidebar ============================ */
+.sidebar {
+  position: relative; display: flex; flex-direction: column; min-height: 0;
+  background: var(--side-bg); border-right: 1px solid var(--line);
+}
+.side-top { display: flex; align-items: center; gap: 10px; padding: 10px 12px 8px; }
+.icon-btn {
+  width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center;
+  color: var(--muted); transition: background .15s, color .15s; flex-shrink: 0;
+}
+.icon-btn:hover { background: var(--side-hover); color: var(--text); }
+.icon-btn.sm { width: 32px; height: 32px; }
+.icon-btn.accent { color: var(--accent); }
+.icon-btn.active { color: var(--accent); background: var(--accent-soft); }
+.search {
+  flex: 1; display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 14px;
+  border-radius: 20px; background: var(--input-bg); color: var(--muted);
+  border: 1.5px solid transparent; transition: border-color .15s, background .15s;
+}
+.search:focus-within { border-color: var(--accent); background: var(--input-focus); color: var(--accent); }
+.search input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; font-size: 14px; color: var(--text); }
+.search input::placeholder { color: var(--muted); }
+
+.conn-strip {
+  margin: 0 12px 6px; padding: 7px 12px; border-radius: 10px; display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; font-weight: 600; color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+.conn-strip .spinner { width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.chat-list { flex: 1; min-height: 0; padding: 2px 8px 90px; }
+.chat-row {
+  display: flex; align-items: center; gap: 12px; padding: 8px 10px; border-radius: 12px;
+  cursor: pointer; transition: background .12s; position: relative;
+}
+.chat-row:hover { background: var(--side-hover); }
+.chat-row.active { background: var(--side-active); color: var(--side-active-text); }
+.chat-row.active .row-sub, .chat-row.active .row-time { color: rgba(255, 255, 255, .82); }
+.chat-row.active .row-sub b { color: #fff; }
+.avatar {
+  width: 52px; height: 52px; border-radius: 50%; display: grid; place-items: center; flex-shrink: 0;
+  color: #fff; font-weight: 600; font-size: 18px; letter-spacing: .3px;
+  background: linear-gradient(145deg, var(--a1, #5fd8a6), var(--a2, #229e66));
+}
+.avatar.sm { width: 40px; height: 40px; font-size: 15px; }
+.avatar svg { width: 24px; height: 24px; }
+.avatar.sm svg { width: 20px; height: 20px; }
+.row-main { flex: 1; min-width: 0; }
+.row-line { display: flex; align-items: baseline; gap: 8px; }
+.row-title { flex: 1; min-width: 0; font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-time { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+.row-sub { margin-top: 3px; font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-sub b { font-weight: 500; color: var(--text-2); }
+.row-sub svg { display: inline-block; vertical-align: -2px; margin-right: 4px; opacity: .88; }
+.list-empty { padding: 40px 20px; text-align: center; color: var(--muted); font-size: 13.5px; }
+
+.fab {
+  position: absolute; right: 20px; bottom: 20px; width: 54px; height: 54px; border-radius: 50%;
+  background: var(--accent); color: var(--on-accent); display: grid; place-items: center;
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 40%, transparent), 0 2px 5px rgba(0, 0, 0, .12);
+  transition: transform .18s var(--ease), background .15s;
+}
+.fab:hover { background: var(--accent-hover); transform: scale(1.06); }
+
+/* ============================ Drawer ============================ */
+.scrim { position: fixed; inset: 0; background: var(--scrim); opacity: 0; pointer-events: none; transition: opacity .22s; z-index: 40; }
+.scrim.show { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed; top: 0; bottom: 0; left: 0; width: 300px; z-index: 41; background: var(--side-bg);
+  transform: translateX(-102%); transition: transform .26s var(--ease); display: flex; flex-direction: column;
+  box-shadow: 8px 0 32px rgba(0, 0, 0, .18);
+}
+.drawer.show { transform: none; }
+.drawer-head { padding: 22px 20px 18px; border-bottom: 1px solid var(--line); }
+.drawer-logo { width: 54px; height: 54px; border-radius: 16px; margin-bottom: 14px; box-shadow: 0 4px 14px rgba(0, 0, 0, .18); }
+.drawer-name { font-size: 16px; font-weight: 700; }
+.drawer-status { margin-top: 4px; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 7px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.dot.on { background: var(--online); box-shadow: 0 0 0 3px color-mix(in srgb, var(--online) 22%, transparent); }
+.dot.warn { background: var(--warn); }
+.drawer-items { padding: 8px; flex: 1; }
+.drawer-item {
+  width: 100%; display: flex; align-items: center; gap: 18px; padding: 11px 14px; border-radius: 10px;
+  font-size: 14.5px; font-weight: 500; text-align: left; color: var(--text);
+}
+.drawer-item svg { color: var(--muted); }
+.drawer-item:hover { background: var(--side-hover); }
+.drawer-item.danger, .drawer-item.danger svg { color: var(--danger); }
+.drawer-sep { height: 1px; background: var(--line); margin: 6px 6px; }
+.theme-switch { display: flex; gap: 6px; padding: 6px 14px 12px; }
+.theme-opt {
+  flex: 1; padding: 8px 4px; border-radius: 10px; font-size: 12.5px; font-weight: 600; color: var(--text-2);
+  background: var(--input-bg); display: flex; flex-direction: column; align-items: center; gap: 5px;
+  border: 1.5px solid transparent;
+}
+.theme-opt.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.drawer-label { padding: 10px 16px 4px; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+.drawer-foot { padding: 12px 20px 16px; font-size: 12px; color: var(--muted); }
+
+/* ============================ Chat pane ============================ */
+.chat { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--wall-2); }
+.chat-head, .sel-head {
+  position: relative; z-index: 3; height: 58px; flex-shrink: 0; display: flex; align-items: center; gap: 12px;
+  padding: 0 10px 0 18px; background: var(--panel); border-bottom: 1px solid var(--panel-border);
+}
+.head-info { flex: 1; min-width: 0; }
+.head-title { font-size: 15.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.head-sub { margin-top: 1px; font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.head-sub.on { color: var(--accent); }
+.head-actions { display: flex; align-items: center; gap: 2px; }
+.sel-head { gap: 8px; padding-left: 10px; }
+.sel-count { flex: 1; font-size: 15.5px; font-weight: 600; }
+.pill-btn {
+  height: 34px; padding: 0 16px; border-radius: 17px; font-size: 13.5px; font-weight: 600;
+  color: var(--accent); transition: background .15s;
+}
+.pill-btn:hover { background: var(--accent-soft); }
+.pill-btn.solid { background: var(--accent); color: var(--on-accent); }
+.pill-btn.solid:hover { background: var(--accent-hover); }
+.pill-btn.danger { color: var(--danger); }
+.pill-btn.danger:hover { background: var(--danger-soft); }
+.pill-btn.danger.solid { background: var(--danger); color: #fff; }
+.pill-btn:disabled { opacity: .45; pointer-events: none; }
+
+.timeline-wrap { position: relative; flex: 1; min-height: 0; }
+.wallpaper {
+  position: absolute; inset: 0; pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 22%, var(--wall-3) 0, transparent 46%),
+    radial-gradient(circle at 82% 78%, var(--wall-1) 0, transparent 50%),
+    radial-gradient(circle at 78% 18%, var(--wall-1) 0, transparent 40%),
+    var(--wall-2);
+}
+.wallpaper::after {
+  content: ""; position: absolute; inset: 0; background-color: var(--wall-pattern);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'%3E%3Cg fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 22l14-6-5 15-3-6z'/%3E%3Ccircle cx='86' cy='20' r='6'/%3E%3Cpath d='M64 62c4-6 12-6 16 0'/%3E%3Cpath d='M20 84h14M27 77v14'/%3E%3Crect x='88' y='78' width='14' height='18' rx='3'/%3E%3Cpath d='M92 84h6M92 89h4'/%3E%3Ccircle cx='52' cy='104' r='2.5'/%3E%3Ccircle cx='40' cy='48' r='2'/%3E%3Cpath d='M100 48l6 6M106 48l-6 6'/%3E%3C/g%3E%3C/svg%3E") repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'%3E%3Cg fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 22l14-6-5 15-3-6z'/%3E%3Ccircle cx='86' cy='20' r='6'/%3E%3Cpath d='M64 62c4-6 12-6 16 0'/%3E%3Cpath d='M20 84h14M27 77v14'/%3E%3Crect x='88' y='78' width='14' height='18' rx='3'/%3E%3Cpath d='M92 84h6M92 89h4'/%3E%3Ccircle cx='52' cy='104' r='2.5'/%3E%3Ccircle cx='40' cy='48' r='2'/%3E%3Cpath d='M100 48l6 6M106 48l-6 6'/%3E%3C/g%3E%3C/svg%3E") repeat;
+}
+.timeline { position: absolute; inset: 0; overflow-y: auto; overflow-x: hidden; }
+.timeline-inner {
+  min-height: 100%; display: flex; flex-direction: column; justify-content: flex-end;
+  width: 100%; max-width: 860px; margin: 0 auto; padding: 14px 22px 10px;
+}
+.load-older { align-self: center; margin: 4px 0 10px; }
+
+.day {
+  align-self: center; margin: 14px 0 8px;
+  padding: 4px 12px; border-radius: 13px; font-size: 12.5px; font-weight: 500;
+  background: var(--day-bg); color: var(--day-text); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+}
+
+.msg { display: flex; align-items: flex-end; gap: 8px; margin-top: 2px; position: relative; border-radius: 12px; }
+.msg.first { margin-top: 8px; }
+.msg.out { justify-content: flex-end; }
+.msg .spacer { flex: 1; }
+.msg.selecting { cursor: pointer; padding: 1px 4px; }
+.msg.selecting:hover { background: color-mix(in srgb, var(--select-bg) 60%, transparent); }
+.msg.selected { background: var(--select-bg); }
+.check {
+  width: 22px; height: 22px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--muted) 80%, transparent);
+  align-self: center; flex-shrink: 0; display: grid; place-items: center; color: transparent; background: var(--panel);
+  transition: background .12s, border-color .12s;
+}
+.msg.selected .check { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.bubble {
+  position: relative; max-width: min(560px, 76%); min-width: 68px;
+  padding: 7px 12px 8px 13px; border-radius: var(--radius-bubble);
+  background: var(--bubble-in); color: var(--bubble-text); box-shadow: var(--bubble-shadow);
+  user-select: text; -webkit-user-select: text; cursor: default;
+}
+.msg.out .bubble { background: var(--bubble-out); }
+.msg.in.last .bubble { border-bottom-left-radius: 4px; }
+.msg.out.last .bubble { border-bottom-right-radius: 4px; }
+.msg.in.last .bubble::before, .msg.out.last .bubble::before {
+  content: ""; position: absolute; bottom: 0; width: 10px; height: 16px; background: inherit;
+}
+.msg.in.last .bubble::before {
+  left: -7px;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16'%3E%3Cpath d='M10 0v16H1.5C0 16 -.5 14.6.6 13.6 5.6 9.5 8.6 5.8 10 0z'/%3E%3C/svg%3E") no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16'%3E%3Cpath d='M10 0v16H1.5C0 16 -.5 14.6.6 13.6 5.6 9.5 8.6 5.8 10 0z'/%3E%3C/svg%3E") no-repeat;
+}
+.msg.out.last .bubble::before {
+  right: -7px;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16'%3E%3Cpath d='M0 0v16h8.5c1.5 0 2-1.4.9-2.4C4.4 9.5 1.4 5.8 0 0z'/%3E%3C/svg%3E") no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16'%3E%3Cpath d='M0 0v16h8.5c1.5 0 2-1.4.9-2.4C4.4 9.5 1.4 5.8 0 0z'/%3E%3C/svg%3E") no-repeat;
+}
+.msg.selecting .bubble { user-select: none; -webkit-user-select: none; pointer-events: none; }
+
+.text { font-size: 14.5px; line-height: 1.42; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; }
+.text a { color: var(--link); text-decoration: none; }
+.text a:hover { text-decoration: underline; }
+.text code { font-family: var(--mono); font-size: 13px; background: var(--code-bg); padding: 1px 5px; border-radius: 5px; }
+.code {
+  font-family: var(--mono); font-size: 12.8px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--code-bg); border-left: 3px solid var(--quote-bar); border-radius: 6px; padding: 7px 10px; margin: 3px 0;
+}
+.meta {
+  float: right; position: relative; top: 7px; margin: -4px -2px 0 12px; height: 18px;
+  display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--meta-in);
+  white-space: nowrap; user-select: none; -webkit-user-select: none;
+}
+.msg.out .meta { color: var(--meta-out); }
+.meta .tick { color: var(--tick); }
+.meta .tick.pending { color: var(--meta-out); opacity: .75; }
+.meta.block { float: none; position: static; display: flex; justify-content: flex-end; margin: 2px -2px -2px 0; }
+.meta .ttl {
+  display: inline-flex; align-items: center; gap: 2px; padding: 0 6px; height: 16px; border-radius: 8px;
+  font-weight: 600; font-size: 11px; background: var(--accent-soft); color: var(--accent); margin-right: 3px;
+}
+.meta .err { color: var(--danger); font-weight: 600; }
+.clear { clear: both; }
+
+.quote {
+  display: block; margin: 2px 0 5px; padding: 4px 9px 5px; border-left: 3px solid var(--quote-bar);
+  border-radius: 5px; background: var(--quote-bg-in); font-size: 13px; line-height: 1.3; max-width: 100%;
+}
+.msg.out .quote { background: var(--quote-bg-out); }
+.quote-author { color: var(--accent); font-weight: 600; }
+.quote-text { color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.more-link { display: inline-block; margin-top: 4px; font-size: 13px; font-weight: 600; color: var(--accent); cursor: pointer; }
+.more-link:hover { text-decoration: underline; }
+
+.file { display: flex; align-items: center; gap: 12px; padding: 4px 2px 2px 0; min-width: 240px; }
+.file.clickable { cursor: pointer; }
+.file-icon {
+  width: 48px; height: 48px; border-radius: 50%; flex-shrink: 0; display: grid; place-items: center;
+  background: var(--file-icon-bg); color: #fff; position: relative; font-size: 11px; font-weight: 700;
+}
+.file.clickable:hover .file-icon { filter: brightness(1.08); }
+.file-info { min-width: 0; flex: 1; }
+.file-name { font-weight: 600; font-size: 14.5px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
+.file-sub { margin-top: 2px; font-size: 13px; color: var(--meta-in); }
+.msg.out .file-sub { color: var(--meta-out); }
+.progress { margin-top: 6px; height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--accent) 18%, transparent); overflow: hidden; }
+.progress > i { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width .3s; }
+.thumb {
+  display: block; margin: -2px -6px 6px -7px; border-radius: 12px; overflow: hidden; cursor: pointer;
+  background: color-mix(in srgb, var(--muted) 15%, transparent);
+}
+.thumb img { display: block; width: 100%; max-height: 340px; object-fit: cover; }
+
+.hover-tools {
+  align-self: center; display: flex; gap: 2px; opacity: 0; transition: opacity .12s; pointer-events: none;
+}
+.msg:hover .hover-tools { opacity: 1; pointer-events: auto; }
+.tool {
+  width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
+  background: color-mix(in srgb, var(--panel) 88%, transparent); color: var(--muted); box-shadow: 0 1px 3px rgba(0, 0, 0, .12);
+}
+.tool:hover { color: var(--accent); }
+
+.empty-chat { align-self: center; margin: auto 0; text-align: center; padding: 18px 24px; border-radius: 18px; background: var(--day-bg); color: var(--day-text); max-width: 320px; }
+.empty-chat b { display: block; font-size: 15px; margin-bottom: 4px; }
+.empty-chat span { font-size: 13px; opacity: .9; }
+
+.jump {
+  position: absolute; right: 22px; bottom: 16px; z-index: 3; width: 46px; height: 46px; border-radius: 50%;
+  background: var(--panel); color: var(--muted); display: grid; place-items: center;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, .16); transform: scale(.6); opacity: 0; pointer-events: none;
+  transition: transform .18s var(--ease), opacity .18s;
+}
+.jump.show { transform: none; opacity: 1; pointer-events: auto; }
+.jump:hover { color: var(--accent); }
+
+/* ============================ Composer ============================ */
+.composer { position: relative; z-index: 3; flex-shrink: 0; padding: 8px 22px 16px; }
+.composer-inner { max-width: 860px; margin: 0 auto; }
+.composer-card { background: var(--panel); border-radius: 18px; box-shadow: 0 1px 2px rgba(0, 0, 0, .1), 0 2px 10px rgba(0, 0, 0, .04); overflow: hidden; }
+.banner {
+  display: flex; align-items: center; gap: 12px; padding: 8px 8px 6px 14px; border-bottom: 1px solid var(--line);
+}
+.banner .bar { width: 3px; align-self: stretch; border-radius: 2px; background: var(--accent); }
+.banner-body { flex: 1; min-width: 0; font-size: 13px; line-height: 1.3; }
+.banner-title { color: var(--accent); font-weight: 600; }
+.banner-text { color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.banner > svg { color: var(--accent); }
+.compose-row { display: flex; align-items: flex-end; gap: 2px; padding: 5px 6px; }
+.compose-row .icon-btn { width: 42px; height: 42px; }
+.compose-row .icon-btn:hover { background: var(--side-hover); }
+#composer {
+  flex: 1; min-width: 0; border: 0; outline: 0; resize: none; background: none; color: var(--text);
+  font-size: 14.5px; line-height: 1.42; padding: 10px 6px; max-height: 180px; min-height: 42px;
+  user-select: text; -webkit-user-select: text;
+}
+#composer::placeholder { color: var(--muted); }
+.send {
+  width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; color: var(--accent);
+  transition: transform .15s var(--ease), background .15s, color .15s;
+}
+.send.ready { background: var(--accent); color: var(--on-accent); }
+.send.ready:hover { background: var(--accent-hover); transform: scale(1.05); }
+.send:disabled { color: var(--muted); opacity: .6; cursor: default; }
+
+/* ============================ Onboarding ============================ */
+.onboard { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center; padding: 24px; }
+.onboard-card {
+  width: min(440px, 100%); text-align: center; background: var(--panel); border-radius: 24px; padding: 34px 32px 30px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .12);
+}
+.onboard-card img { width: 84px; height: 84px; border-radius: 22px; margin: 0 auto 18px; display: block; box-shadow: 0 6px 18px rgba(0, 0, 0, .18); }
+.onboard-card h1 { font-size: 22px; margin-bottom: 8px; }
+.onboard-card p { color: var(--muted); font-size: 14px; line-height: 1.55; margin-bottom: 22px; }
+.big-btn {
+  height: 46px; padding: 0 26px; border-radius: 23px; background: var(--accent); color: var(--on-accent);
+  font-weight: 600; font-size: 15px; display: inline-flex; align-items: center; gap: 10px;
+}
+.big-btn:hover { background: var(--accent-hover); }
+
+/* ============================ DnD ============================ */
+.dnd { position: absolute; inset: 0; z-index: 30; padding: 18px; background: color-mix(in srgb, var(--wall-2) 70%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: none; }
+.dnd.show { display: flex; }
+.dnd-card {
+  flex: 1; border: 2.5px dashed var(--accent); border-radius: 22px; background: color-mix(in srgb, var(--panel) 86%, transparent);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; text-align: center; color: var(--text);
+}
+.dnd-circle { width: 76px; height: 76px; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; margin-bottom: 6px; }
+.dnd-card h2 { font-size: 21px; }
+.dnd-card p { color: var(--muted); font-size: 14px; }
+.chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; max-width: 520px; margin-top: 4px; }
+.chip { padding: 4px 10px; border-radius: 12px; background: var(--input-bg); font-size: 12.5px; max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ============================ Menus / dialogs / toast ============================ */
+.menu {
+  position: fixed; z-index: 60; min-width: 200px; padding: 6px; border-radius: 12px;
+  background: var(--menu-bg); box-shadow: var(--menu-shadow); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  transform-origin: top left; animation: pop .14s var(--ease);
+}
+@keyframes pop { from { opacity: 0; transform: scale(.94); } to { opacity: 1; transform: none; } }
+.menu-item {
+  width: 100%; display: flex; align-items: center; gap: 14px; padding: 8px 14px 8px 10px; border-radius: 8px;
+  font-size: 14px; text-align: left; color: var(--text); white-space: nowrap;
+}
+.menu-item svg { color: var(--muted); }
+.menu-item:hover { background: var(--menu-hover); }
+.menu-item.danger, .menu-item.danger svg { color: var(--danger); }
+.menu-sep { height: 1px; background: var(--line); margin: 5px 8px; }
+
+.modal-scrim { position: fixed; inset: 0; z-index: 70; background: var(--scrim); display: grid; place-items: center; padding: 24px; animation: fade .16s; }
+@keyframes fade { from { opacity: 0; } }
+.modal {
+  width: min(420px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column;
+  background: var(--panel); border-radius: 16px; box-shadow: 0 20px 60px rgba(0, 0, 0, .3); animation: pop .18s var(--ease);
+}
+.modal.wide { width: min(560px, 100%); }
+.modal-head { display: flex; align-items: center; gap: 10px; padding: 18px 14px 6px 22px; }
+.modal-head h2 { flex: 1; font-size: 17px; font-weight: 600; }
+.modal-body { padding: 6px 22px 8px; overflow-y: auto; color: var(--text-2); font-size: 14px; line-height: 1.5; user-select: text; -webkit-user-select: text; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 4px; padding: 10px 14px 14px; }
+.field {
+  width: 100%; height: 44px; border-radius: 10px; border: 1.5px solid var(--line); background: var(--input-bg);
+  padding: 0 14px; font-size: 14.5px; outline: 0; color: var(--text); margin-top: 6px;
+}
+.field:focus { border-color: var(--accent); background: var(--input-focus); }
+.checkline { display: flex; align-items: center; gap: 10px; margin-top: 14px; cursor: pointer; color: var(--text); }
+.checkline input { width: 18px; height: 18px; accent-color: var(--accent); }
+.qr-wrap { display: grid; place-items: center; margin: 8px 0 14px; }
+.qr-wrap canvas { background: #fff; border-radius: 14px; padding: 12px; box-shadow: 0 2px 10px rgba(0, 0, 0, .08); image-rendering: pixelated; }
+.steps { margin: 4px 0 10px 18px; }
+.steps li { margin: 3px 0; }
+.link-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.link-box {
+  flex: 1; min-width: 0; height: 38px; padding: 0 12px; border-radius: 9px; background: var(--input-bg);
+  font-family: var(--mono); font-size: 12px; display: flex; align-items: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.fullmsg { white-space: pre-wrap; font-family: var(--mono); font-size: 13px; background: var(--input-bg); border-radius: 10px; padding: 12px 14px; max-height: 55vh; overflow: auto; color: var(--text); }
+.files-list { display: flex; flex-direction: column; gap: 2px; margin: 0 -10px; }
+.files-row { display: flex; align-items: center; gap: 12px; padding: 8px 10px; border-radius: 10px; cursor: pointer; }
+.files-row:hover { background: var(--side-hover); }
+.files-row .file-icon { width: 42px; height: 42px; }
+.files-row .meta2 { font-size: 12.5px; color: var(--muted); }
+
+.toast {
+  position: fixed; left: 50%; bottom: 96px; z-index: 80; transform: translate(-50%, 12px); opacity: 0; pointer-events: none;
+  padding: 10px 18px; border-radius: 20px; background: rgba(20, 30, 26, .9); color: #fff; font-size: 13.5px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .25); transition: opacity .2s, transform .2s var(--ease); max-width: 70vw; text-align: center;
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+@media (max-width: 900px) { :root { --sidebar-w: 290px; } .bubble { max-width: 84%; } }
+@media (max-width: 720px) { :root { --sidebar-w: 84px; } .search, .row-main, .conn-strip span { display: none; } .chat-row { justify-content: center; } .fab { right: 15px; width: 50px; height: 50px; } }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="sidebar">
+    <div class="side-top">
+      <button class="icon-btn" id="menu-btn" title="Menu" aria-label="Menu"></button>
+      <label class="search"><span id="search-icon"></span><input id="search" placeholder="Search chats" autocomplete="off" spellcheck="false"></label>
+    </div>
+    <div class="conn-strip" id="conn-strip" hidden><i class="spinner"></i><span id="conn-text">Waiting for phone…</span></div>
+    <div class="chat-list scroll" id="chat-list"></div>
+    <button class="fab" id="new-chat" title="New chat" aria-label="New chat"></button>
+  </aside>
+
+  <main class="chat" id="chat">
+    <header class="chat-head" id="chat-head">
+      <div class="avatar sm" id="head-avatar"></div>
+      <div class="head-info">
+        <div class="head-title" id="head-title">Portal Drop</div>
+        <div class="head-sub" id="head-sub">—</div>
+      </div>
+      <div class="head-actions">
+        <button class="icon-btn" id="select-btn" title="Select messages"></button>
+        <button class="icon-btn" id="chat-more" title="More"></button>
+      </div>
+    </header>
+    <header class="sel-head" id="sel-head" hidden>
+      <button class="icon-btn" id="sel-cancel" title="Cancel (Esc)"></button>
+      <div class="sel-count" id="sel-count">0 selected</div>
+      <button class="pill-btn" id="sel-all">Select all</button>
+      <button class="pill-btn danger solid" id="sel-delete" disabled>Delete</button>
+    </header>
+
+    <div class="timeline-wrap">
+      <div class="wallpaper"></div>
+      <div class="timeline scroll" id="timeline"><div class="timeline-inner" id="timeline-inner"></div></div>
+      <button class="jump" id="jump" title="Jump to latest"></button>
+    </div>
+
+    <footer class="composer" id="composer-area">
+      <div class="composer-inner">
+        <div class="composer-card">
+          <div class="banner" id="reply-banner" hidden>
+            <span id="reply-icon"></span>
+            <div class="banner-body"><div class="banner-title" id="reply-title">Reply</div><div class="banner-text" id="reply-text"></div></div>
+            <button class="icon-btn sm" id="reply-cancel" title="Cancel reply"></button>
+          </div>
+          <div class="banner" id="temp-banner" hidden>
+            <span id="temp-icon"></span>
+            <div class="banner-body"><div class="banner-title">Temporary message</div><div class="banner-text">Deletes itself from both devices 10 minutes after sending</div></div>
+            <button class="icon-btn sm" id="temp-cancel" title="Turn off"></button>
+          </div>
+          <div class="compose-row">
+            <button class="icon-btn" id="attach" title="Attach files"></button>
+            <textarea id="composer" rows="1" placeholder="Write a message…" spellcheck="true"></textarea>
+            <button class="icon-btn" id="temp-btn" title="Send next message as temporary (10 min)"></button>
+            <button class="send" id="send" title="Send (Enter)" disabled></button>
+          </div>
+        </div>
+      </div>
+    </footer>
+
+    <div class="onboard" id="onboard" hidden>
+      <div class="onboard-card">
+        <img id="onboard-logo" alt="">
+        <h1>Connect your phone</h1>
+        <p>Pair your Android phone once and send messages and files between your devices instantly over your Wi‑Fi — no cloud, no cables.</p>
+        <button class="big-btn" id="onboard-pair"><span id="onboard-icon"></span>Pair Android device</button>
+      </div>
+    </div>
+
+    <div class="dnd" id="dnd">
+      <div class="dnd-card">
+        <div class="dnd-circle" id="dnd-icon"></div>
+        <h2>Drop files to send</h2>
+        <p id="dnd-sub">Files will be sent to this chat</p>
+        <div class="chips" id="dnd-chips"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<nav class="drawer" id="drawer">
+  <div class="drawer-head">
+    <img class="drawer-logo" id="drawer-logo" alt="">
+    <div class="drawer-name" id="drawer-name">Portal Drop</div>
+    <div class="drawer-status"><i class="dot" id="drawer-dot"></i><span id="drawer-status">Checking…</span></div>
+  </div>
+  <div class="drawer-items scroll" id="drawer-items"></div>
+  <div class="drawer-foot">Portal Drop 0.3 · Local network only</div>
+</nav>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+/* ========================================================================
+   Host bridge (wry on Windows → window.ipc, WebKitGTK on Linux → messageHandlers)
+   ======================================================================== */
+const DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001";
+const TEMP_TTL = 600;
+const HOST = window.__PORTAL_HOST || (window.ipc ? "windows" : (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.portal ? "linux" : "demo"));
+const post = window.ipc && window.ipc.postMessage ? (m) => window.ipc.postMessage(m)
+  : (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.portal) ? (m) => window.webkit.messageHandlers.portal.postMessage(m)
+  : null;
+let reqSeq = 1;
+const pending = new Map();
+function ipc(action, payload = {}) {
+  if (!post) return Demo.handle(action, payload);
+  return new Promise((resolve, reject) => {
+    const req_id = reqSeq++;
+    pending.set(req_id, { resolve, reject });
+    post(JSON.stringify({ req_id, action, payload }));
+  });
+}
+window.__portalReply = (msg) => {
+  const p = pending.get(msg.req_id);
+  if (!p) return;
+  pending.delete(msg.req_id);
+  msg.ok ? p.resolve(msg.data) : p.reject(new Error(msg.error || "Action failed"));
+};
+
+/* ========================================================================
+   Icons
+   ======================================================================== */
+const ICONS = {
+  menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/>',
+  edit: '<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
+  clip: '<path d="M20.5 11.5l-8.2 8.2a5.3 5.3 0 0 1-7.5-7.5l8.6-8.6a3.5 3.5 0 0 1 5 5l-8.5 8.5a1.8 1.8 0 0 1-2.5-2.5l7.8-7.8"/>',
+  send: '<path d="M3.4 11.2 19.6 4.1c.9-.4 1.8.5 1.4 1.4l-7.1 16.2c-.4.9-1.7.8-1.9-.1l-1.6-6.3-6.3-1.6c-.9-.2-1-1.5-.1-1.9z" fill="currentColor" stroke="none"/>',
+  timer: '<circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5v4l2.6 1.6M9.5 2.8h5"/>',
+  reply: '<path d="M10 8 5 12.5l5 4.5"/><path d="M5.5 12.5H14a5 5 0 0 1 5 5V19"/>',
+  more: '<circle cx="12" cy="5.5" r="1.4" fill="currentColor"/><circle cx="12" cy="12" r="1.4" fill="currentColor"/><circle cx="12" cy="18.5" r="1.4" fill="currentColor"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
+  check: '<path d="M5 12.5l4.2 4.2L19 7"/>',
+  checks: '<path d="M2.5 12.8l4 4L15 8.2M11.5 16l.8.8L21 8.2"/>',
+  clock: '<circle cx="12" cy="12" r="8"/><path d="M12 8v4l2.5 1.5"/>',
+  trash: '<path d="M4.5 7h15M9.5 7V4.8h5V7M6.5 7l.9 12.2a1.5 1.5 0 0 0 1.5 1.3h6.2a1.5 1.5 0 0 0 1.5-1.3L17.5 7M10 11v6M14 11v6"/>',
+  copy: '<rect x="8.5" y="8.5" width="11" height="11" rx="2.3"/><path d="M15.5 8.5V6.3a1.8 1.8 0 0 0-1.8-1.8H6.3a1.8 1.8 0 0 0-1.8 1.8v7.4a1.8 1.8 0 0 0 1.8 1.8h2.2"/>',
+  file: '<path d="M14 3.5H7.5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z"/><path d="M14 3.5V8h4.5"/>',
+  download: '<path d="M12 4.5v11M7 11l5 5 5-5M5 19.5h14"/>',
+  upload: '<path d="M12 19V8M7 12.5l5-5 5 5M5 4.5h14"/>',
+  folder: '<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
+  open: '<path d="M14 4.5h5.5V10M19.5 4.5 11 13M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/>',
+  qr: '<rect x="4" y="4" width="6" height="6" rx="1.2"/><rect x="14" y="4" width="6" height="6" rx="1.2"/><rect x="4" y="14" width="6" height="6" rx="1.2"/><path d="M14 14h2.5v2.5H14zM17.5 17.5H20V20h-2.5zM14 19h1.5M19 14h1"/>',
+  phone: '<rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M11 17.8h2"/>',
+  pause: '<rect x="7" y="5.5" width="3.4" height="13" rx="1"/><rect x="13.6" y="5.5" width="3.4" height="13" rx="1"/>',
+  play: '<path d="M8 5.5v13l10.5-6.5z"/>',
+  history: '<path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9"/><path d="M4.5 4.5V9H9M12 8.5v4l2.8 1.7"/>',
+  broom: '<path d="M14.5 4 10 13M6.5 12.5l7 3-1.7 4.5H5.4L4 15z"/>',
+  unlink: '<path d="M9.5 14.5l5-5M8 11 5.8 13.2a3.5 3.5 0 0 0 5 5L13 16M16 13l2.2-2.2a3.5 3.5 0 0 0-5-5L11 8M4 4l16 16"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 3v1.8M12 19.2V21M3 12h1.8M19.2 12H21M5.6 5.6l1.3 1.3M17.1 17.1l1.3 1.3M5.6 18.4l1.3-1.3M17.1 6.9l1.3-1.3"/>',
+  moon: '<path d="M19.5 14.5A8 8 0 0 1 9.5 4.5a8 8 0 1 0 10 10z"/>',
+  monitor: '<rect x="3.5" y="4.5" width="17" height="11.5" rx="2"/><path d="M9 20h6M12 16v4"/>',
+  select: '<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8.5 12.2l2.5 2.5 4.6-5"/>',
+  down: '<path d="M6 9.5l6 6 6-6"/>',
+  chat: '<path d="M5 18.5V7.5a2.5 2.5 0 0 1 2.5-2.5h9A2.5 2.5 0 0 1 19 7.5v6a2.5 2.5 0 0 1-2.5 2.5H8.5z"/>',
+  rename: '<path d="M4 20h4L18.5 9.5a2.5 2.5 0 0 0-3.5-3.5L4.5 16.5z"/><path d="M13 20h7"/>',
+  image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="M20.5 16l-5-5-8.5 8.5"/>',
+  video: '<rect x="3" y="6" width="13" height="12" rx="2.5"/><path d="M16 10.5l5-3v9l-5-3z"/>',
+  music: '<path d="M9 17.5V6l10-2v11.5"/><circle cx="6.5" cy="17.5" r="2.5"/><circle cx="16.5" cy="15.5" r="2.5"/>',
+  archive: '<rect x="3.5" y="4" width="17" height="4.5" rx="1.2"/><path d="M5 8.5V18a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5M10 12.5h4"/>',
+  android: '<path d="M7 10h10v7.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 7 17.5zM7 9a5 5 0 0 1 10 0zM9.5 19v2.2M14.5 19v2.2M4.5 11v4.5M19.5 11v4.5M8.5 4.2 9.6 6M15.5 4.2 14.4 6"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+};
+function icon(name, size = 22, stroke = 1.8) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
+}
+const LOGO = "data:image/svg+xml," + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><radialGradient id="b" cx="50%" cy="46%" r="65%"><stop offset="0" stop-color="#193025"/><stop offset="1" stop-color="#0F1B15"/></radialGradient><linearGradient id="s" x1=".15" y1=".15" x2=".85" y2=".85"><stop offset="0" stop-color="#B0F7D6"/><stop offset=".5" stop-color="#5FD8A6"/><stop offset="1" stop-color="#2D9B72"/></linearGradient><linearGradient id="l" x1=".2" y1=".1" x2=".9" y2=".9"><stop offset="0" stop-color="#BAF9DC"/><stop offset=".55" stop-color="#4FD09E"/><stop offset="1" stop-color="#28946B"/></linearGradient><linearGradient id="f" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2E8664"/><stop offset="1" stop-color="#1B563F"/></linearGradient></defs><rect width="128" height="128" rx="28" fill="url(#b)"/><circle cx="41.5" cy="35" r="4.6" fill="#9CEBC7"/><path d="M57 78C57 65 67 63 73 59L86 72C79 81 66 84 57 78Z" fill="url(#f)"/><path d="M47 43 58 54C55 57.5 54 62 54 67V97C43.5 96.5 36.5 89 36.5 78V62C36.5 54 40 48.5 47 43Z" fill="url(#s)"/><path d="M51 39C58 31 73 29 83 39 94 50 93.5 64 87.5 70L74 56.5C76 52 74.5 47 71 44.5 67.5 42 62.5 43.5 59.5 47.5Z" fill="url(#l)"/></svg>`);
+
+/* ========================================================================
+   Helpers
+   ======================================================================== */
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const fmtTime = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+function fmtSize(n) {
+  n = Number(n || 0);
+  if (n < 1024) return `${n} B`;
+  const u = ["KB", "MB", "GB", "TB"]; let v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${u[i]}`;
+}
+const sameDay = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+function dayLabel(ms) {
+  const d = new Date(ms), now = new Date(), y = new Date(now); y.setDate(now.getDate() - 1);
+  if (sameDay(d, now)) return "Today";
+  if (sameDay(d, y)) return "Yesterday";
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" });
+}
+function listTime(ms) {
+  if (!ms) return "";
+  const d = new Date(ms), now = new Date();
+  if (sameDay(d, now)) return fmtTime(ms);
+  const diff = (now - d) / 86400000;
+  if (diff < 6.5) return d.toLocaleDateString("en-GB", { weekday: "short" });
+  return d.toLocaleDateString("en-GB", { day: "2-digit", month: "2-digit", year: d.getFullYear() === now.getFullYear() ? undefined : "2-digit" });
+}
+function remaining(exp) {
+  const s = Math.floor((exp - Date.now()) / 1000);
+  if (s <= 0) return "now";
+  if (s < 60) return `${s}s`;
+  return `${Math.ceil(s / 60)}m`;
+}
+const AVATAR_COLORS = [["#6fe0b0", "#1f9d68"], ["#7cc8ff", "#2b86d6"], ["#ffb27a", "#e2703a"], ["#c49cff", "#7c55d9"], ["#ff95b4", "#d9467a"], ["#7ee0e0", "#1f9aa6"], ["#ffd36e", "#d39a14"]];
+function avatarFor(target, id, title) {
+  let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  const [a1, a2] = AVATAR_COLORS[h % AVATAR_COLORS.length];
+  target.style.setProperty("--a1", a1); target.style.setProperty("--a2", a2);
+  const words = String(title || "").trim().split(/\s+/).filter((w) => /\p{L}/u.test(w[0] || ""));
+  if (words.length) target.textContent = (words[0][0] + (words[1] ? words[1][0] : "")).toUpperCase();
+  else target.innerHTML = icon("chat", 24, 2);
+}
+function fileKind(name) {
+  const ext = (String(name || "").split(".").pop() || "").toLowerCase();
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "avif", "svg"].includes(ext)) return "image";
+  if (["mp4", "mkv", "mov", "webm", "avi", "m4v", "3gp"].includes(ext)) return "video";
+  if (["mp3", "m4a", "flac", "wav", "ogg", "opus", "aac"].includes(ext)) return "music";
+  if (["zip", "rar", "7z", "tar", "gz", "xz", "zst", "apk", "deb", "rpm"].includes(ext)) return "archive";
+  return "file";
+}
+const isImageName = (n) => ["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"].includes((String(n || "").split(".").pop() || "").toLowerCase());
+function fileUrl(path) {
+  if (!path) return null;
+  if (HOST === "linux") return "file://" + String(path).split("/").map(encodeURIComponent).join("/");
+  if (HOST === "windows" && window.__PORTAL_FILE_PROTO) return window.__PORTAL_FILE_PROTO + encodeURIComponent(path);
+  return null;
+}
+function renderRich(text) {
+  const parts = String(text || "").split(/```[^\n]*\n?([\s\S]*?)```/g);
+  let out = "";
+  parts.forEach((part, i) => {
+    if (i % 2) { out += `<div class="code">${esc(part.replace(/\n$/, ""))}</div>`; return; }
+    if (!part) return;
+    let h = esc(part)
+      .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
+      .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?]|$)/g, "$1<i>$2</i>")
+      .replace(/\b(https?:\/\/[^\s<]+[^\s<.,:;!?)\]'"])/g, '<a href="$1" data-url="$1">$1</a>');
+    out += h;
+  });
+  return out;
+}
+let toastTimer = 0;
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+/* ========================================================================
+   State
+   ======================================================================== */
+const state = {
+  chatId: DEFAULT_CHAT, chats: [], previews: {}, rows: [], older: [], before: null, olderBefore: null,
+  status: {}, serviceActive: true, progress: new Map(), replyTo: {}, drafts: {}, tempArmed: false,
+  selecting: false, selected: new Set(), refreshing: false, pendingRefresh: false, chatSig: "",
+  stickBottom: true, forceBottom: true, filter: "", loaded: false, pairOpen: null,
+  prefs: Object.assign({ theme: "light" }, window.__PORTAL_PREFS || {}),
+};
+
+/* ========================================================================
+   Theme
+   ======================================================================== */
+const darkQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+function effectiveTheme() {
+  const t = state.prefs.theme;
+  if (t === "dark" || t === "light") return t;
+  return darkQuery && darkQuery.matches ? "dark" : "light";
+}
+function applyTheme(notifyHost = false) {
+  const t = effectiveTheme();
+  document.documentElement.dataset.theme = t;
+  if (notifyHost && post) ipc("set_theme", { theme: t, pref: state.prefs.theme }).catch(() => {});
+}
+if (darkQuery && darkQuery.addEventListener) darkQuery.addEventListener("change", () => { if (state.prefs.theme === "system") applyTheme(true); });
+function setThemePref(pref) {
+  state.prefs.theme = pref;
+  applyTheme(true);
+  ipc("set_prefs", { prefs: state.prefs }).catch(() => {});
+  renderDrawer();
+}
+const urlTheme = new URLSearchParams(location.search).get("theme");
+if (urlTheme) state.prefs.theme = urlTheme;
+applyTheme(false);
+
+/* ========================================================================
+   Static chrome
+   ======================================================================== */
+$("menu-btn").innerHTML = icon("menu");
+$("search-icon").innerHTML = icon("search", 18);
+$("new-chat").innerHTML = icon("edit", 24, 2);
+$("select-btn").innerHTML = icon("select");
+$("chat-more").innerHTML = icon("more");
+$("sel-cancel").innerHTML = icon("close");
+$("jump").innerHTML = icon("down", 24, 2);
+$("reply-icon").innerHTML = icon("reply", 22, 2);
+$("temp-icon").innerHTML = icon("timer", 22, 2);
+$("reply-cancel").innerHTML = icon("close", 18);
+$("temp-cancel").innerHTML = icon("close", 18);
+$("attach").innerHTML = icon("clip", 23);
+$("temp-btn").innerHTML = icon("timer", 23);
+$("send").innerHTML = icon("send", 22);
+$("dnd-icon").innerHTML = icon("upload", 34, 2);
+$("onboard-icon").innerHTML = icon("qr", 20, 2);
+$("onboard-logo").src = LOGO;
+$("drawer-logo").src = LOGO;
+
+/* ========================================================================
+   Peer / status
+   ======================================================================== */
+function peerLabel() {
+  const s = state.status || {};
+  const os = String(s.peer_os || "android").toLowerCase();
+  const osName = os === "android" ? "Android" : os === "windows" ? "Windows" : os === "linux" ? "Linux" : (s.peer_os || "Phone");
+  return { name: s.peer_name && s.peer_name.toLowerCase() !== osName.toLowerCase() ? s.peer_name : osName, os: osName };
+}
+function connectionInfo() {
+  const s = state.status || {};
+  if (!state.serviceActive) return { text: "Background service paused", cls: "warn", online: false };
+  if (!s.paired) return { text: "No device paired", cls: "", online: false };
+  const p = peerLabel();
+  if (s.connected) return { text: `${p.name} · online`, cls: "on", online: true };
+  return { text: `${p.name} · waiting for connection`, cls: "warn", online: false };
+}
+function renderStatus() {
+  const info = connectionInfo();
+  const s = state.status || {};
+  const sub = $("head-sub");
+  sub.textContent = info.text; sub.className = "head-sub" + (info.online ? " on" : "");
+  const strip = $("conn-strip");
+  const showStrip = !info.online && (s.paired || !state.serviceActive);
+  strip.hidden = !showStrip;
+  if (showStrip) $("conn-text").textContent = !state.serviceActive ? "Background service paused" : `Waiting for ${peerLabel().name}…`;
+  strip.querySelector(".spinner").style.display = state.serviceActive ? "" : "none";
+  $("onboard").hidden = !state.loaded || !!s.paired;
+  $("drawer-dot").className = "dot " + info.cls;
+  $("drawer-status").textContent = info.text;
+  $("drawer-name").textContent = s.local_name ? `${s.local_name}` : "Portal Drop";
+}
+
+/* ========================================================================
+   Chat list
+   ======================================================================== */
+function previewHtml(chat) {
+  const p = state.previews[chat.id];
+  if (!p) return `<span>No messages yet</span>`;
+  const mine = p.direction === "sent";
+  const who = mine ? "<b>You: </b>" : "";
+  let body;
+  if (p.kind === "file") body = `${icon(fileKind(p.name) === "image" ? "image" : "clip", 14, 2)}${esc(p.name || "File")}`;
+  else body = esc((p.text || "Message").replace(/\s+/g, " "));
+  return who + body;
+}
+function renderChats() {
+  const list = $("chat-list");
+  const q = state.filter.trim().toLowerCase();
+  const chats = state.chats
+    .map((c) => ({ c, ts: (state.previews[c.id] && state.previews[c.id].ts) || c.updated_at || c.created_at || 0 }))
+    .filter(({ c }) => !q || c.title.toLowerCase().includes(q))
+    .sort((a, b) => b.ts - a.ts);
+  const sig = JSON.stringify([chats.map(({ c, ts }) => [c.id, c.title, ts, state.previews[c.id]]), state.chatId, q, Math.floor(Date.now() / 60000)]);
+  if (sig === state.chatSig) return;
+  state.chatSig = sig;
+  list.innerHTML = "";
+  if (!chats.length) { list.appendChild(el("div", "list-empty", q ? "No chats match your search" : "No chats yet")); return; }
+  for (const { c, ts } of chats) {
+    const row = el("div", "chat-row" + (c.id === state.chatId ? " active" : ""));
+    const av = el("div", "avatar"); avatarFor(av, c.id, c.title);
+    const main = el("div", "row-main",
+      `<div class="row-line"><div class="row-title">${esc(c.title)}</div><div class="row-time">${esc(listTime(ts))}</div></div>
+       <div class="row-sub">${previewHtml(c)}</div>`);
+    row.append(av, main);
+    row.title = c.title;
+    row.onclick = () => openChat(c.id);
+    row.oncontextmenu = (e) => { e.preventDefault(); chatMenu(e.clientX, e.clientY, c); };
+    list.appendChild(row);
+  }
+}
+$("search").addEventListener("input", (e) => { state.filter = e.target.value; renderChats(); });
+
+/* ========================================================================
+   Timeline rendering (keyed reconciliation → no flicker, stable scroll)
+   ======================================================================== */
+const tl = $("timeline"), inner = $("timeline-inner");
+function visibleRows() { const m = new Map(); for (const r of [...state.older, ...state.rows]) m.set(r.id, r); return [...m.values()]; }
+function rowById(id) { return visibleRows().find((r) => r.id === id); }
+const distBottom = () => tl.scrollHeight - tl.clientHeight - tl.scrollTop;
+
+function captureScroll() {
+  const atBottom = distBottom() < 60;
+  let anchor = null;
+  if (!atBottom) {
+    for (const child of inner.children) {
+      if (!child.dataset.key || child.classList.contains("day")) continue;
+      if (child.offsetTop + child.offsetHeight > tl.scrollTop + 4) { anchor = { key: child.dataset.key, off: child.offsetTop - tl.scrollTop }; break; }
+    }
+  }
+  return { atBottom, anchor, height: tl.scrollHeight, top: tl.scrollTop };
+}
+function restoreScroll(snap, mode) {
+  if (mode === "prepend") { tl.scrollTop = tl.scrollHeight - snap.height + snap.top; return; }
+  if (state.forceBottom || snap.atBottom) { tl.scrollTop = tl.scrollHeight; state.forceBottom = false; state.stickBottom = true; return; }
+  if (snap.anchor) {
+    const target = inner.querySelector(`[data-key="${CSS.escape(snap.anchor.key)}"]`);
+    if (target) { tl.scrollTop = target.offsetTop - snap.anchor.off; return; }
+  }
+  tl.scrollTop = snap.top;
+}
+
+function metaHtml(r, block) {
+  const out = r.direction === "sent";
+  let h = "";
+  if (r.expires_at) h += `<span class="ttl" title="Temporary message">${icon("timer", 11, 2.4)}${esc(remaining(r.expires_at))}</span>`;
+  h += `<span>${esc(fmtTime(r.ts))}</span>`;
+  if (out) h += r.delivered ? `<span class="tick" title="Delivered">${icon("checks", 16, 2)}</span>` : `<span class="tick pending" title="Waiting for phone">${icon("clock", 13, 2)}</span>`;
+  else if (r.kind === "file" && !r.delivered) h += `<span>· receiving</span>`;
+  return `<span class="meta${block ? " block" : ""}">${h}</span>`;
+}
+
+function buildMessage(r, ctx) {
+  const out = r.direction === "sent";
+  const sel = state.selecting && state.selected.has(r.id);
+  const wrap = el("div", `msg ${out ? "out" : "in"}${ctx.first ? " first" : ""}${ctx.last ? " last" : ""}${state.selecting ? " selecting" : ""}${sel ? " selected" : ""}`);
+  const bubble = el("div", "bubble");
+  let html = "";
+  if (r.reply_to) {
+    const ref = rowById(r.reply_to);
+    const author = ref ? (ref.direction === "sent" ? "You" : peerLabel().name) : "Reply";
+    const snippet = ref ? (ref.text || ref.name || "Message").split("\n")[0] : "Original message";
+    html += `<div class="quote" data-jump="${esc(r.reply_to)}"><div class="quote-author">${esc(author)}</div><div class="quote-text">${esc(snippet)}</div></div>`;
+  }
+  if (r.kind === "text") {
+    html += `<div class="text">${renderRich(r.text || "")}`;
+    const endsWithCode = /```\s*$/.test(r.text || "");
+    if (!endsWithCode && !r.text_truncated) html += metaHtml(r, false);
+    html += `</div>`;
+    if (r.text_truncated) html += `<span class="more-link" data-full="${esc(r.id)}">Show full message</span>`;
+    if (endsWithCode || r.text_truncated) html += metaHtml(r, true);
+  } else {
+    const prog = state.progress.get(r.id);
+    const url = r.path && isImageName(r.name) ? fileUrl(r.path) : null;
+    if (url) html += `<div class="thumb" data-open="1"><img src="${esc(url)}" alt="" loading="lazy" onerror="this.parentNode.remove()"></div>`;
+    const kind = fileKind(r.name);
+    const ic = !r.delivered ? (out ? "upload" : "download") : kind;
+    const pct = prog && prog.total ? Math.min(100, Math.round((prog.transferred * 100) / prog.total)) : null;
+    let sub = fmtSize(r.size);
+    if (prog && !r.delivered) sub = `${fmtSize(prog.transferred)} of ${fmtSize(prog.total)} · ${pct}%`;
+    else if (!r.delivered) sub += out ? " · waiting for phone" : " · receiving";
+    html += `<div class="file${r.path ? " clickable" : ""}" ${r.path ? 'data-open="1"' : ""}>
+      <div class="file-icon">${icon(ic, 22, 2)}</div>
+      <div class="file-info"><div class="file-name" title="${esc(r.name || "File")}">${esc(r.name || "File")}</div>
+      <div class="file-sub">${esc(sub)}</div>${prog && !r.delivered ? `<div class="progress"><i style="width:${pct || 0}%"></i></div>` : ""}</div></div>`;
+    html += metaHtml(r, true);
+  }
+  bubble.innerHTML = html;
+  bubble.oncontextmenu = (e) => { if (state.selecting) return; e.preventDefault(); messageMenu(e.clientX, e.clientY, r); };
+  bubble.addEventListener("click", (e) => {
+    const t = e.target.closest("[data-url],[data-full],[data-open],[data-jump]");
+    if (!t) return;
+    if (t.dataset.url) { e.preventDefault(); ipc("open_url", { url: t.dataset.url }).catch((err) => toast(err.message)); }
+    else if (t.dataset.full) viewFull(t.dataset.full);
+    else if (t.dataset.open && r.path) openFile(r.path);
+    else if (t.dataset.jump) jumpTo(t.dataset.jump);
+  });
+  bubble.addEventListener("dblclick", (e) => { if (!state.selecting && !e.target.closest(".text")) setReply(r); });
+
+  const tools = el("div", "hover-tools");
+  if (!state.selecting) {
+    const rb = el("button", "tool", icon("reply", 17, 2)); rb.title = "Reply"; rb.onclick = () => setReply(r);
+    const mb = el("button", "tool", icon("more", 17, 2)); mb.title = "More";
+    mb.onclick = (e) => { const b = mb.getBoundingClientRect(); messageMenu(b.left, b.bottom + 4, r); e.stopPropagation(); };
+    tools.append(rb, mb);
+  }
+  if (state.selecting) {
+    const ck = el("div", "check", icon("check", 14, 3));
+    wrap.append(ck);
+    wrap.onclick = () => toggleSelect(r.id);
+    if (out) wrap.append(el("div", "spacer"), bubble); else wrap.append(bubble, el("div", "spacer"));
+  } else if (out) {
+    wrap.append(el("div", "spacer"), tools, bubble);
+  } else {
+    wrap.append(bubble, tools, el("div", "spacer"));
+  }
+  return wrap;
+}
+
+function renderMessages(mode) {
+  const rows = visibleRows();
+  $("select-btn").disabled = !rows.length;
+  const snap = captureScroll();
+  const items = [];
+  const cursor = state.older.length ? state.olderBefore : state.before;
+  if (cursor != null) items.push({ key: "older", sig: "older", build: () => { const b = el("button", "pill-btn solid load-older", "Load earlier messages"); b.onclick = loadOlder; return b; } });
+  if (!rows.length) {
+    items.push({ key: "empty", sig: "empty" + state.chatId, build: () => el("div", "empty-chat", `<b>No messages here yet</b><span>Send a message, attach a file, or drop files anywhere in this window.</span>`) });
+  }
+  const bucket = Math.floor(Date.now() / 15000);
+  let lastDay = "";
+  rows.forEach((r, i) => {
+    const d = dayLabel(r.ts);
+    if (d !== lastDay) { const label = d; items.push({ key: "day:" + label, sig: label, build: () => el("div", "day", esc(label)) }); lastDay = d; }
+    const prev = rows[i - 1], next = rows[i + 1];
+    const gap = (a, b) => !a || !b || a.direction !== b.direction || Math.abs(b.ts - a.ts) > 5 * 60000 || dayLabel(a.ts) !== dayLabel(b.ts);
+    const ctx = { first: gap(prev, r), last: gap(r, next) };
+    const prog = state.progress.get(r.id);
+    const ref = r.reply_to ? rowById(r.reply_to) : null;
+    const sig = JSON.stringify([r, ctx, prog && [prog.transferred, prog.total], state.selecting, state.selected.has(r.id), r.expires_at ? bucket : 0, ref ? [ref.text, ref.name, ref.direction] : 0, peerLabel().name]);
+    items.push({ key: r.id, sig, build: () => buildMessage(r, ctx) });
+  });
+  // reconcile
+  const existing = new Map();
+  for (const c of inner.children) existing.set(c.dataset.key, c);
+  items.forEach((it, i) => {
+    let node = existing.get(it.key);
+    if (!node || node.dataset.sig !== it.sig) {
+      const fresh = it.build(); fresh.dataset.key = it.key; fresh.dataset.sig = it.sig;
+      if (node) node.replaceWith(fresh);
+      node = fresh;
+    }
+    const cur = inner.children[i];
+    if (cur !== node) inner.insertBefore(node, cur || null);
+  });
+  while (inner.children.length > items.length) inner.lastElementChild.remove();
+  restoreScroll(snap, mode);
+  updateJump();
+}
+function updateJump() { $("jump").classList.toggle("show", distBottom() > 240); }
+tl.addEventListener("scroll", () => { state.stickBottom = distBottom() < 60; updateJump(); }, { passive: true });
+new ResizeObserver(() => { if (state.stickBottom) tl.scrollTop = tl.scrollHeight; }).observe(inner);
+$("jump").onclick = () => { tl.scrollTo({ top: tl.scrollHeight, behavior: "smooth" }); };
+function jumpTo(id) {
+  const t = inner.querySelector(`[data-key="${CSS.escape(id)}"]`);
+  if (!t) return toast("Original message is further back in history");
+  t.scrollIntoView({ block: "center", behavior: "smooth" });
+  const b = t.querySelector(".bubble"); if (b) { b.animate([{ filter: "brightness(.85)" }, { filter: "none" }], { duration: 900 }); }
+}
+
+/* ========================================================================
+   Selection
+   ======================================================================== */
+function renderSelection() {
+  $("chat-head").hidden = state.selecting;
+  $("sel-head").hidden = !state.selecting;
+  if (!state.selecting) return;
+  const ids = new Set(visibleRows().map((r) => r.id));
+  for (const id of [...state.selected]) if (!ids.has(id)) state.selected.delete(id);
+  const n = state.selected.size;
+  $("sel-count").textContent = n ? `${n} selected` : "Select messages";
+  $("sel-all").textContent = n && n === ids.size ? "Clear" : "Select all";
+  $("sel-delete").disabled = !n;
+  $("sel-delete").textContent = n ? `Delete ${n}` : "Delete";
+}
+function enterSelection(id) { state.selecting = true; state.selected = new Set(id ? [id] : []); closeMenus(); renderSelection(); renderMessages(); }
+function exitSelection() { if (!state.selecting) return; state.selecting = false; state.selected.clear(); renderSelection(); renderMessages(); }
+function toggleSelect(id) { state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id); renderSelection(); renderMessages(); }
+$("select-btn").onclick = () => enterSelection();
+$("sel-cancel").onclick = exitSelection;
+$("sel-all").onclick = () => {
+  const ids = visibleRows().map((r) => r.id);
+  state.selected = state.selected.size === ids.length ? new Set() : new Set(ids);
+  renderSelection(); renderMessages();
+};
+$("sel-delete").onclick = () => confirmDelete([...state.selected]);
+
+function confirmDelete(ids) {
+  const rows = ids.map(rowById).filter(Boolean);
+  if (!rows.length) return;
+  const files = rows.filter((r) => r.kind === "file").length, texts = rows.length - files;
+  const onDisk = rows.filter((r) => r.kind === "file" && r.path).length;
+  const what = [texts && `${texts} message${texts > 1 ? "s" : ""}`, files && `${files} file${files > 1 ? "s" : ""}`].filter(Boolean).join(" and ");
+  const body = el("div", null, `<p>${esc(what)} will be removed from this computer's chat history.</p>`);
+  let chk = null;
+  if (onDisk) {
+    const lab = el("label", "checkline", `<input type="checkbox"><span>Also delete ${onDisk} downloaded file${onDisk > 1 ? "s" : ""} from disk</span>`);
+    chk = lab.querySelector("input"); body.appendChild(lab);
+  }
+  modal({
+    title: rows.length > 1 ? `Delete ${rows.length} items?` : "Delete message?",
+    body,
+    actions: [
+      { label: "Cancel" },
+      { label: "Delete", cls: "danger", onClick: () => ipc("delete_messages", { ids, deleteFiles: !!(chk && chk.checked) })
+        .then(() => { state.older = state.older.filter((r) => !ids.includes(r.id)); exitSelection(); refresh(); })
+        .catch((e) => toast(e.message)) },
+    ],
+  });
+}
+
+/* ========================================================================
+   Menus
+   ======================================================================== */
+let openMenu = null;
+function closeMenus() { if (openMenu) { openMenu.remove(); openMenu = null; } }
+function showMenu(x, y, items) {
+  closeMenus();
+  const m = el("div", "menu");
+  for (const it of items) {
+    if (it === "-") { m.appendChild(el("div", "menu-sep")); continue; }
+    const b = el("button", "menu-item" + (it.danger ? " danger" : ""), `${icon(it.icon, 19)}<span>${esc(it.label)}</span>`);
+    b.onclick = () => { closeMenus(); it.run(); };
+    m.appendChild(b);
+  }
+  document.body.appendChild(m);
+  const r = m.getBoundingClientRect();
+  const left = Math.min(x, window.innerWidth - r.width - 8), top = y + r.height > window.innerHeight - 8 ? Math.max(8, y - r.height) : y;
+  m.style.left = `${Math.max(8, left)}px`; m.style.top = `${top}px`;
+  openMenu = m;
+}
+document.addEventListener("mousedown", (e) => { if (openMenu && !openMenu.contains(e.target)) closeMenus(); });
+window.addEventListener("blur", closeMenus);
+window.addEventListener("resize", closeMenus);
+
+function messageMenu(x, y, r) {
+  const items = [{ icon: "reply", label: "Reply", run: () => setReply(r) }];
+  if (r.kind === "text") items.push({ icon: "copy", label: "Copy text", run: () => copyText(r) });
+  if (r.path) {
+    items.push({ icon: "open", label: "Open file", run: () => openFile(r.path) });
+    items.push({ icon: "folder", label: "Show in folder", run: () => ipc("show_in_folder", { path: r.path }).catch(() => ipc("open_receive_folder")) });
+  }
+  if (r.text_truncated) items.push({ icon: "file", label: "Show full message", run: () => viewFull(r.id) });
+  items.push({ icon: "select", label: "Select", run: () => enterSelection(r.id) });
+  items.push("-");
+  items.push({ icon: "trash", label: "Delete", danger: true, run: () => confirmDelete([r.id]) });
+  showMenu(x, y, items);
+}
+function chatMenu(x, y, chat) {
+  const items = [{ icon: "rename", label: "Rename chat", run: () => renameChat(chat) }];
+  if (state.chats.length > 1) items.push("-", { icon: "trash", label: "Delete chat", danger: true, run: () => deleteChat(chat) });
+  showMenu(x, y, items);
+}
+$("chat-more").onclick = () => {
+  const b = $("chat-more").getBoundingClientRect();
+  const chat = state.chats.find((c) => c.id === state.chatId);
+  const items = [];
+  if (chat) items.push({ icon: "rename", label: "Rename chat", run: () => renameChat(chat) });
+  items.push({ icon: "select", label: "Select messages", run: () => enterSelection() });
+  items.push({ icon: "history", label: "Received files", run: showReceived });
+  items.push({ icon: "folder", label: "Open download folder", run: () => ipc("open_receive_folder").catch((e) => toast(e.message)) });
+  if (chat && state.chats.length > 1) items.push("-", { icon: "trash", label: "Delete chat", danger: true, run: () => deleteChat(chat) });
+  showMenu(b.right - 230, b.bottom + 6, items);
+};
+
+/* ========================================================================
+   Drawer
+   ======================================================================== */
+function renderDrawer() {
+  const box = $("drawer-items");
+  box.innerHTML = "";
+  const add = (ic, label, run, danger) => {
+    const b = el("button", "drawer-item" + (danger ? " danger" : ""), `${icon(ic, 21)}<span>${esc(label)}</span>`);
+    b.onclick = () => { closeDrawer(); run(); };
+    box.appendChild(b);
+  };
+  add("qr", state.status.paired ? "Pair a new phone" : "Pair Android device", showPair);
+  add("edit", "New chat", newChat);
+  add("history", "Received files", showReceived);
+  add("folder", "Open download folder", () => ipc("open_receive_folder").catch((e) => toast(e.message)));
+  add(state.serviceActive ? "pause" : "play", state.serviceActive ? "Pause background service" : "Resume background service",
+    () => ipc(state.serviceActive ? "pause_service" : "resume_service").then(refresh).catch((e) => toast(e.message)));
+  box.appendChild(el("div", "drawer-sep"));
+  box.appendChild(el("div", "drawer-label", "Appearance"));
+  const sw = el("div", "theme-switch");
+  for (const [k, ic, lab] of [["light", "sun", "Light"], ["dark", "moon", "Dark"], ["system", "monitor", "System"]]) {
+    const b = el("button", "theme-opt" + (state.prefs.theme === k ? " on" : ""), `${icon(ic, 18)}${lab}`);
+    b.onclick = () => setThemePref(k);
+    sw.appendChild(b);
+  }
+  box.appendChild(sw);
+  box.appendChild(el("div", "drawer-sep"));
+  add("broom", "Clear received-files list", confirmClearHistory);
+  if (state.status.paired) add("unlink", "Unpair phone", confirmUnpair, true);
+}
+function openDrawer() { renderDrawer(); $("drawer").classList.add("show"); $("scrim").classList.add("show"); }
+function closeDrawer() { $("drawer").classList.remove("show"); $("scrim").classList.remove("show"); }
+$("menu-btn").onclick = openDrawer;
+$("scrim").onclick = closeDrawer;
+
+/* ========================================================================
+   Modals
+   ======================================================================== */
+let openModalEl = null;
+function closeModal() { if (openModalEl) { openModalEl.remove(); openModalEl = null; state.pairOpen = null; } }
+function modal({ title, body, actions = [], wide = false, onClose }) {
+  closeModal();
+  const scrim = el("div", "modal-scrim");
+  const box = el("div", "modal" + (wide ? " wide" : ""));
+  const head = el("div", "modal-head", `<h2>${esc(title)}</h2>`);
+  const x = el("button", "icon-btn sm", icon("close", 18)); x.onclick = () => { closeModal(); onClose && onClose(); };
+  head.appendChild(x);
+  const bodyBox = el("div", "modal-body scroll");
+  if (typeof body === "string") bodyBox.innerHTML = body; else bodyBox.appendChild(body);
+  box.append(head, bodyBox);
+  if (actions.length) {
+    const act = el("div", "modal-actions");
+    for (const a of actions) {
+      const b = el("button", "pill-btn" + (a.cls ? " " + a.cls : ""), esc(a.label));
+      b.onclick = () => { if (a.keepOpen) { a.onClick && a.onClick(); return; } closeModal(); a.onClick && a.onClick(); };
+      act.appendChild(b);
+    }
+    box.appendChild(act);
+  }
+  scrim.appendChild(box);
+  scrim.addEventListener("mousedown", (e) => { if (e.target === scrim) { closeModal(); onClose && onClose(); } });
+  document.body.appendChild(scrim);
+  openModalEl = scrim;
+  return box;
+}
+function promptText({ title, label, value = "", okLabel = "Save", onSubmit }) {
+  const body = el("div", null, `<div>${esc(label)}</div>`);
+  const input = el("input", "field"); input.value = value; input.maxLength = 120; body.appendChild(input);
+  const submit = () => { const v = input.value.trim(); if (!v) return; closeModal(); onSubmit(v); };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  const box = modal({ title, body, actions: [{ label: "Cancel" }, { label: okLabel, cls: "solid", keepOpen: true, onClick: submit }] });
+  setTimeout(() => { input.focus(); input.select(); }, 30);
+  return box;
+}
+
+/* ========================================================================
+   Actions
+   ======================================================================== */
+function openChat(id) {
+  if (id === state.chatId) return;
+  state.drafts[state.chatId] = $("composer").value;
+  state.chatId = id;
+  state.selecting = false; state.selected.clear(); renderSelection();
+  state.older = []; state.olderBefore = null; state.rows = []; state.before = null;
+  state.forceBottom = true; state.stickBottom = true;
+  inner.innerHTML = "";
+  $("composer").value = state.drafts[id] || ""; resizeComposer();
+  setReply(state.replyTo[id] || null, false);
+  renderHead(); renderChats(); renderMessages();
+  refresh();
+  $("composer").focus();
+}
+function renderHead() {
+  const chat = state.chats.find((c) => c.id === state.chatId);
+  $("head-title").textContent = chat ? chat.title : "Portal Drop";
+  avatarFor($("head-avatar"), state.chatId, chat ? chat.title : "");
+}
+function newChat() {
+  ipc("new_chat").then((c) => { state.chats.push(c); openChat(c.id); refresh(); }).catch((e) => toast(e.message));
+}
+function renameChat(chat) {
+  promptText({ title: "Rename chat", label: "Chat name", value: chat.title, onSubmit: (title) =>
+    ipc("rename_chat", { id: chat.id, title }).then(refresh).catch((e) => toast(e.message)) });
+}
+function deleteChat(chat) {
+  modal({
+    title: "Delete chat?",
+    body: `<p>“${esc(chat.title)}” and all of its messages will be deleted from <b>both devices</b>. Files already saved to disk are kept.</p>`,
+    actions: [{ label: "Cancel" }, { label: "Delete chat", cls: "danger", onClick: () => ipc("delete_chat", { id: chat.id }).then(() => {
+      if (state.chatId === chat.id) { state.older = []; state.olderBefore = null; state.forceBottom = true; inner.innerHTML = ""; }
+      refresh();
+    }).catch((e) => toast(e.message)) }],
+  });
+}
+function copyText(r) {
+  const done = (t) => { navigator.clipboard ? navigator.clipboard.writeText(t).then(() => toast("Copied"), () => fallbackCopy(t)) : fallbackCopy(t); };
+  if (!r.text_truncated) return done(r.text || "");
+  ipc("message_text", { id: r.id }).then((res) => done(res.text)).catch((e) => toast(e.message));
+}
+function fallbackCopy(t) {
+  const ta = el("textarea"); ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0"; document.body.appendChild(ta);
+  ta.select(); try { document.execCommand("copy"); toast("Copied"); } catch (_) { toast("Could not copy"); } ta.remove();
+}
+function openFile(path) { ipc("open_file", { path }).catch((e) => toast(e.message)); }
+function viewFull(id) {
+  ipc("message_text", { id }).then((res) => {
+    const pre = el("div", "fullmsg scroll"); pre.textContent = res.text;
+    modal({ title: "Message", body: pre, wide: true, actions: [{ label: "Copy", keepOpen: true, onClick: () => copyText({ text: res.text }) }, { label: "Close", cls: "solid" }] });
+  }).catch((e) => toast(e.message));
+}
+function showReceived() {
+  ipc("received_files").then((res) => {
+    const list = el("div", "files-list");
+    if (!res.items || !res.items.length) list.appendChild(el("div", "list-empty", "No received files yet"));
+    for (const it of res.items || []) {
+      const row = el("div", "files-row", `<div class="file-icon">${icon(fileKind(it.name), 20, 2)}</div>
+        <div class="file-info"><div class="file-name">${esc(it.name || "File")}</div><div class="meta2">${esc(fmtSize(it.size))} · ${esc(dayLabel(it.ts))}, ${esc(fmtTime(it.ts))}</div></div>`);
+      if (it.path) row.onclick = () => openFile(it.path); else row.style.opacity = ".55";
+      list.appendChild(row);
+    }
+    modal({ title: "Received files", body: list, wide: true, actions: [{ label: "Open folder", onClick: () => ipc("open_receive_folder") }, { label: "Close", cls: "solid" }] });
+  }).catch((e) => toast(e.message));
+}
+function confirmClearHistory() {
+  modal({ title: "Clear received-files list?", body: "<p>Only the list is cleared. Saved files stay in your download folder.</p>",
+    actions: [{ label: "Cancel" }, { label: "Clear", cls: "danger", onClick: () => ipc("clear_history").then(() => toast("List cleared")).catch((e) => toast(e.message)) }] });
+}
+function confirmUnpair() {
+  modal({ title: "Unpair phone?", body: `<p>${esc(peerLabel().name)} will be disconnected and must be paired again with a new QR code.</p>`,
+    actions: [{ label: "Cancel" }, { label: "Unpair", cls: "danger", onClick: () => ipc("unpair").then(refresh).catch((e) => toast(e.message)) }] });
+}
+function drawQr(canvas, text) {
+  const lines = String(text || "").split("\n").filter((l) => l.length);
+  if (!lines.length) return false;
+  const w = Math.max(...lines.map((l) => [...l].length));
+  const grid = [];
+  for (const l of lines) {
+    const chars = [...l]; const top = [], bot = [];
+    for (let i = 0; i < w; i++) {
+      const c = chars[i] || " ";
+      top.push(c === "█" || c === "▀"); bot.push(c === "█" || c === "▄");
+    }
+    grid.push(top, bot);
+  }
+  const light = grid[0][0];
+  const size = grid.length, scale = Math.max(3, Math.floor(232 / Math.max(w, size)));
+  canvas.width = w * scale; canvas.height = size * scale;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.fillStyle = "#0b1a13";
+  grid.forEach((row, y) => row.forEach((v, x) => { if (v !== light) ctx.fillRect(x * scale, y * scale, scale, scale); }));
+  return true;
+}
+function showPair() {
+  ipc("pair").then((data) => {
+    const body = el("div");
+    const wrap = el("div", "qr-wrap"); const canvas = el("canvas"); wrap.appendChild(canvas); body.appendChild(wrap);
+    if (!drawQr(canvas, data.qr)) wrap.remove();
+    body.appendChild(el("ol", "steps", "<li>Open <b>Portal Drop</b> on your Android phone.</li><li>Tap <b>Scan QR code</b> and point it at this screen.</li><li>Keep both devices on the same Wi‑Fi.</li>"));
+    const linkRow = el("div", "link-row", `<div class="link-box" title="${esc(data.link)}">${esc(data.link)}</div>`);
+    const cp = el("button", "pill-btn", "Copy link"); cp.onclick = () => copyText({ text: data.link });
+    linkRow.appendChild(cp); body.appendChild(linkRow);
+    body.appendChild(el("div", "meta2", `<p style="margin-top:10px;font-size:12.5px;color:var(--muted)">This code works once and expires in 10 minutes.</p>`));
+    modal({ title: "Pair your phone", body, actions: [{ label: "Done", cls: "solid" }] });
+    state.pairOpen = { wasPaired: !!state.status.paired };
+  }).catch((e) => toast(e.message));
+}
+
+/* ========================================================================
+   Reply / temp / composer
+   ======================================================================== */
+function setReply(r, focus = true) {
+  state.replyTo[state.chatId] = r || null;
+  $("reply-banner").hidden = !r;
+  if (r) {
+    $("reply-title").textContent = `Reply to ${r.direction === "sent" ? "yourself" : peerLabel().name}`;
+    $("reply-text").textContent = (r.text || r.name || "Message").split("\n")[0];
+    if (focus) $("composer").focus();
+  }
+}
+function setTemp(on) {
+  state.tempArmed = !!on;
+  $("temp-banner").hidden = !on;
+  $("temp-btn").classList.toggle("active", !!on);
+}
+$("reply-cancel").onclick = () => setReply(null);
+$("temp-cancel").onclick = () => setTemp(false);
+$("temp-btn").onclick = () => { setTemp(!state.tempArmed); $("composer").focus(); };
+function resizeComposer() {
+  const c = $("composer");
+  c.style.height = "auto"; c.style.height = Math.min(c.scrollHeight, 180) + "px";
+  const ready = !!c.value.trim();
+  $("send").disabled = !ready; $("send").classList.toggle("ready", ready);
+}
+function consumeMeta() {
+  const meta = { chatId: state.chatId };
+  const r = state.replyTo[state.chatId]; if (r) meta.replyTo = r.id;
+  if (state.tempArmed) { meta.ttl = TEMP_TTL; setTemp(false); }
+  setReply(null, false);
+  return meta;
+}
+async function sendText() {
+  const c = $("composer"); const text = c.value;
+  if (!text.trim()) return;
+  const wasTemp = state.tempArmed, prevReply = state.replyTo[state.chatId];
+  const meta = consumeMeta();
+  c.value = ""; resizeComposer(); state.forceBottom = true;
+  try { await ipc("send_text", { ...meta, text }); refresh(); }
+  catch (e) { if (!c.value) { c.value = text; resizeComposer(); } if (wasTemp) setTemp(true); if (prevReply) setReply(prevReply); toast(e.message); }
+}
+$("composer").addEventListener("input", resizeComposer);
+$("composer").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendText(); }
+  else if (e.key === "Escape" && state.replyTo[state.chatId]) { setReply(null); }
+  else if (e.key === "ArrowUp" && !$("composer").value) {
+    const mine = visibleRows().filter((r) => r.direction === "sent" && r.kind === "text").pop();
+    if (mine) setReply(mine);
+  }
+});
+$("send").onclick = sendText;
+$("attach").onclick = async () => {
+  const wasTemp = state.tempArmed;
+  const meta = consumeMeta();
+  state.forceBottom = true;
+  try { const res = await ipc("pick_files", meta); if (res && res.cancelled) { if (wasTemp) setTemp(true); } else refresh(); }
+  catch (e) { if (wasTemp) setTemp(true); toast(e.message); }
+};
+$("new-chat").onclick = newChat;
+$("onboard-pair").onclick = showPair;
+
+/* ========================================================================
+   Drag & drop (paths come from the native host)
+   ======================================================================== */
+window.__portalDragEnter = ({ names = [] } = {}) => {
+  const chat = state.chats.find((c) => c.id === state.chatId);
+  $("dnd-sub").textContent = `${names.length ? `${names.length} file${names.length > 1 ? "s" : ""}` : "Files"} will be sent to ${chat ? chat.title : "this chat"}`;
+  $("dnd-chips").innerHTML = names.slice(0, 8).map((n) => `<span class="chip">${esc(n)}</span>`).join("") + (names.length > 8 ? `<span class="chip">+${names.length - 8} more</span>` : "");
+  $("dnd").classList.add("show");
+};
+window.__portalDragLeave = () => $("dnd").classList.remove("show");
+window.__portalDropFiles = async ({ paths = [] } = {}) => {
+  $("dnd").classList.remove("show");
+  if (!paths.length || !state.status.paired) return;
+  const meta = consumeMeta(); state.forceBottom = true;
+  try { const res = await ipc("send_files", { ...meta, paths }); if (res && res.skipped) toast(`Skipped ${res.skipped} folder${res.skipped > 1 ? "s" : ""}`); refresh(); }
+  catch (e) { toast(e.message); }
+};
+// Block the browser's own file-drop navigation; the native host delivers real paths.
+["dragover", "drop"].forEach((t) => window.addEventListener(t, (e) => { if (e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files")) e.preventDefault(); }));
+
+/* ========================================================================
+   Refresh loop
+   ======================================================================== */
+async function refresh() {
+  if (state.refreshing) { state.pendingRefresh = true; return; }
+  state.refreshing = true; state.pendingRefresh = false;
+  try {
+    const wasPaired = !!state.status.paired;
+    const snap = await ipc("snapshot", { chatId: state.chatId });
+    state.serviceActive = snap.serviceActive !== false;
+    state.status = snap.status || {};
+    state.chats = snap.chats || [];
+    state.previews = {}; for (const p of snap.previews || []) state.previews[p.chat_id] = p;
+    if (snap.chatId && snap.chatId !== state.chatId) {
+      state.chatId = snap.chatId; state.older = []; state.olderBefore = null; state.forceBottom = true;
+      state.selecting = false; state.selected.clear(); renderSelection(); inner.innerHTML = "";
+    }
+    state.rows = [...((snap.history && snap.history.items) || [])].reverse();
+    state.before = snap.history ? snap.history.next_before ?? null : null;
+    state.progress = new Map((snap.progress || []).map((p) => [p.id, p]));
+    state.loaded = true;
+    renderStatus(); renderHead(); renderChats(); renderSelection(); renderMessages();
+    if (state.pairOpen && !state.pairOpen.wasPaired && state.status.paired) { closeModal(); toast(`Paired with ${peerLabel().name}`); }
+    else if (!wasPaired && state.status.paired && state.pairOpen) { closeModal(); }
+    if ($("drawer").classList.contains("show")) renderDrawer();
+  } catch (e) {
+    $("head-sub").textContent = "Portal Drop service is not responding";
+  } finally {
+    state.refreshing = false;
+    if (state.pendingRefresh) refresh();
+  }
+}
+async function loadOlder() {
+  const before = state.older.length ? state.olderBefore : state.before;
+  if (before == null) return;
+  try {
+    const page = await ipc("load_older", { chatId: state.chatId, before });
+    state.older = [...(page.items || []).reverse(), ...state.older];
+    state.olderBefore = page.next_before ?? null;
+    state.stickBottom = false;
+    renderMessages("prepend");
+  } catch (e) { toast(e.message); }
+}
+window.__portalWake = () => refresh();
+window.__portalOpenChat = ({ chatId, replyTo } = {}) => {
+  if (chatId) openChat(chatId);
+  if (replyTo) setTimeout(() => { const r = rowById(replyTo); if (r) setReply(r); }, 400);
+};
+window.__portalSetPrefs = (p) => { Object.assign(state.prefs, p || {}); applyTheme(false); };
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (openMenu) return closeMenus();
+    if (openModalEl) return closeModal();
+    if ($("drawer").classList.contains("show")) return closeDrawer();
+    if (state.selecting) return exitSelection();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") { e.preventDefault(); $("search").focus(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
+  if (!openModalEl && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1 && !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) $("composer").focus();
+});
+document.addEventListener("contextmenu", (e) => { if (!e.target.closest("input, textarea, .text, .modal-body")) e.preventDefault(); });
+
+/* ========================================================================
+   Demo data (only when opened in a normal browser, for design previews)
+   ======================================================================== */
+const Demo = {
+  now: Date.now(),
+  data: null,
+  init() {
+    const t = (min) => this.now - min * 60000;
+    const c1 = DEFAULT_CHAT, c2 = "c2", c3 = "c3", c4 = "c4";
+    this.data = {
+      status: { paired: true, connected: true, peer_os: "android", peer_name: "Pixel 8 Pro", local_name: "Legion 5 Pro", local_os: "linux" },
+      chats: [{ id: c1, title: "Daily drops", created_at: t(5000), updated_at: t(2) }, { id: c2, title: "Work docs", created_at: t(4000), updated_at: t(90) },
+        { id: c3, title: "Photos & videos", created_at: t(3000), updated_at: t(1500) }, { id: c4, title: "2026-11-20", created_at: t(6000), updated_at: t(4500) }],
+      rows: [
+        { id: "m1", kind: "text", ts: t(1500), direction: "received", delivered: true, text: "Morning! Can you send me the slides from yesterday?" },
+        { id: "m2", kind: "text", ts: t(1497), direction: "sent", delivered: true, text: "Sure, one sec 👍" },
+        { id: "m3", kind: "file", ts: t(1495), direction: "sent", delivered: true, name: "Quarterly-Review-Final.pdf", size: 4.8e6 },
+        { id: "m4", kind: "text", ts: t(44), direction: "received", delivered: true, text: "Got it, thanks! Also here's the wifi password for the office: `forest-otter-42`" },
+        { id: "m5", kind: "file", ts: t(42), direction: "received", delivered: true, name: "IMG_20261123_101522.jpg", size: 3.2e6 },
+        { id: "m6", kind: "file", ts: t(41), direction: "received", delivered: true, name: "Nightcore - Hiding In The Blue.mp4", size: 81.3e6, path: "/home/me/Downloads/Portal Drop/Nightcore.mp4" },
+        { id: "m7", kind: "text", ts: t(12), direction: "sent", delivered: true, reply_to: "m4", text: "Perfect. Check out the release notes: https://github.com/portal-drop/releases" },
+        { id: "m8", kind: "text", ts: t(11), direction: "sent", delivered: true, text: "Build command:\n```\ncargo build --locked --release\n```" },
+        { id: "m9", kind: "text", ts: t(3), direction: "received", delivered: true, text: "This one disappears in 10 minutes 🤫", expires_at: this.now + 7 * 60000 },
+        { id: "m10", kind: "file", ts: t(1), direction: "sent", delivered: false, name: "project-backup-2026.zip", size: 248e6 },
+      ],
+      previews: [{ chat_id: c1, ts: t(1), direction: "sent", kind: "file", name: "project-backup-2026.zip" }, { chat_id: c2, ts: t(90), direction: "received", kind: "text", text: "Signed contract attached, please review before Friday" },
+        { chat_id: c3, ts: t(1500), direction: "received", kind: "file", name: "beach-sunset.jpg" }, { chat_id: c4, ts: t(4500), direction: "sent", kind: "text", text: "ok" }],
+      progress: [{ id: "m10", transferred: 96e6, total: 248e6 }],
+    };
+  },
+  handle(action, p) {
+    if (!this.data) this.init();
+    const d = this.data;
+    const ok = (v) => Promise.resolve(v);
+    switch (action) {
+      case "snapshot": return ok({ serviceActive: true, status: d.status, chats: d.chats, chatId: p.chatId || DEFAULT_CHAT,
+        history: { items: (p.chatId === DEFAULT_CHAT || !p.chatId) ? [...d.rows].reverse() : [], next_before: null }, progress: d.progress, previews: d.previews });
+      case "send_text": d.rows.push({ id: "x" + Date.now(), kind: "text", ts: Date.now(), direction: "sent", delivered: false, text: p.text, reply_to: p.replyTo, expires_at: p.ttl ? Date.now() + p.ttl * 1000 : undefined }); return ok({ ok: true });
+      case "new_chat": { const c = { id: "n" + Date.now(), title: new Date().toISOString().slice(0, 10), created_at: Date.now(), updated_at: Date.now() }; d.chats.push(c); return ok(c); }
+      case "pair": return ok({ qr: "", link: "portaldrop://pair?h=192.168.0.10&p=53621&c=demo" });
+      case "received_files": return ok({ items: d.rows.filter((r) => r.kind === "file" && r.direction === "received").map((r) => ({ ...r, path: r.path || "/tmp/x" })) });
+      case "delete_messages": d.rows = d.rows.filter((r) => !p.ids.includes(r.id)); return ok({ ok: true });
+      case "message_text": return ok({ text: (d.rows.find((r) => r.id === p.id) || {}).text || "" });
+      default: return ok({ ok: true, cancelled: true });
+    }
+  },
+};
+
+/* boot */
+resizeComposer();
+renderDrawer();
+refresh();
+setInterval(refresh, 5000);
+setInterval(() => { if (visibleRows().some((r) => r.expires_at)) renderMessages(); }, 15000);
+if (HOST !== "demo") applyTheme(true);
+</script>
+</body>
+</html>

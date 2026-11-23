@@ -1,0 +1,14 @@
+[Unit]
+Description=Portal Drop desktop transfer service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/portal-drop serve
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

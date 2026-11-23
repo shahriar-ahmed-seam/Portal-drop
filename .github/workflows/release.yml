@@ -1,0 +1,198 @@
+name: Build and release Portal Drop
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+      - name: Build Rust release binary
+        run: cargo build --locked --release --manifest-path linux/Cargo.toml
+      - name: Check desktop launcher syntax
+        run: |
+          sh -n linux/install.sh
+          python3 -m py_compile linux/desktop/portal-drop-desktop
+      - name: Run protocol smoke tests
+        env:
+          PORTAL_DROP_NO_SOUND: "1"
+        run: python3 tests/protocol_smoke.py linux/target/release/portal-drop
+      - name: Package Linux archive
+        run: |
+          mkdir -p dist/portal-drop-linux/linux/desktop/icons dist/portal-drop-linux/linux/systemd dist/portal-drop-linux/assets/sounds dist/portal-drop-linux/desktop-ui
+          cp linux/target/release/portal-drop dist/portal-drop-linux/portal-drop
+          cp linux/install.sh dist/portal-drop-linux/linux/install.sh
+          cp linux/desktop/portal-drop-desktop dist/portal-drop-linux/linux/desktop/
+          cp linux/desktop/app.portaldrop.desktop dist/portal-drop-linux/linux/desktop/
+          cp linux/desktop/portal-drop.svg dist/portal-drop-linux/linux/desktop/
+          cp linux/desktop/icons/*.png dist/portal-drop-linux/linux/desktop/icons/
+          cp linux/systemd/portal-drop.service dist/portal-drop-linux/linux/systemd/
+          cp assets/sounds/*.wav dist/portal-drop-linux/assets/sounds/
+          cp desktop-ui/index.html dist/portal-drop-linux/desktop-ui/index.html
+          cat > dist/portal-drop-linux/install.sh <<'INSTALLER'
+          #!/bin/sh
+          set -eu
+          dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+          PORTAL_DROP_RELEASE="$dir/portal-drop" exec "$dir/linux/install.sh"
+          INSTALLER
+          chmod +x dist/portal-drop-linux/install.sh dist/portal-drop-linux/linux/install.sh dist/portal-drop-linux/linux/desktop/portal-drop-desktop
+          tar -C dist -czf portal-drop-linux-x64.tar.gz portal-drop-linux
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: portal-drop-linux-x64
+          path: portal-drop-linux-x64.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+      - name: Build Portal Drop daemon and CLI
+        run: cargo build --locked --release --manifest-path linux/Cargo.toml
+      - name: Run protocol smoke tests
+        env:
+          PORTAL_DROP_NO_SOUND: "1"
+        run: python tests/protocol_smoke.py linux/target/release/portal-drop.exe
+      - name: Build Portal Drop desktop GUI
+        run: cargo build --locked --release --manifest-path windows/Cargo.toml
+      - name: Package Windows archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/portal-drop-windows/sounds | Out-Null
+          Copy-Item linux/target/release/portal-drop.exe dist/portal-drop-windows/
+          Copy-Item windows/target/release/portal-drop-desktop.exe dist/portal-drop-windows/
+          Copy-Item windows/assets/portal-drop.ico dist/portal-drop-windows/
+          Copy-Item assets/sounds/*.wav dist/portal-drop-windows/sounds/
+          Copy-Item windows/install.ps1 dist/portal-drop-windows/
+          Copy-Item windows/uninstall.ps1 dist/portal-drop-windows/
+          Compress-Archive -Path dist/portal-drop-windows/* -DestinationPath portal-drop-windows-x64.zip -Force
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: portal-drop-windows-x64
+          path: portal-drop-windows-x64.zip
+          if-no-files-found: error
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Select debug build for development
+        id: debug
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        run: echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - name: Check Android signing configuration
+        id: signing
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          PORTAL_KEYSTORE_BASE64: ${{ secrets.PORTAL_KEYSTORE_BASE64 }}
+          PORTAL_KEYSTORE_PASSWORD: ${{ secrets.PORTAL_KEYSTORE_PASSWORD }}
+          PORTAL_KEY_ALIAS: ${{ secrets.PORTAL_KEY_ALIAS }}
+          PORTAL_KEY_PASSWORD: ${{ secrets.PORTAL_KEY_PASSWORD }}
+        run: |
+          if [ -n "${PORTAL_KEYSTORE_BASE64:-}" ] &&
+             [ -n "${PORTAL_KEYSTORE_PASSWORD:-}" ] &&
+             [ -n "${PORTAL_KEY_ALIAS:-}" ] &&
+             [ -n "${PORTAL_KEY_PASSWORD:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Android signing is unconfigured or incomplete. This release will include desktop packages only."
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: steps.debug.outputs.enabled == 'true' || steps.signing.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        if: steps.debug.outputs.enabled == 'true' || steps.signing.outputs.enabled == 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        if: steps.debug.outputs.enabled == 'true' || steps.signing.outputs.enabled == 'true'
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0
+      - name: Build Android debug APK
+        if: steps.debug.outputs.enabled == 'true'
+        run: |
+          ./android/gradlew --no-daemon -p android assembleDebug
+          cp android/app/build/outputs/apk/debug/app-debug.apk portal-drop-android-debug.apk
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: steps.debug.outputs.enabled == 'true'
+        with:
+          name: portal-drop-android-debug
+          path: portal-drop-android-debug.apk
+          if-no-files-found: error
+      - name: Build signed Android release APK
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          PORTAL_KEYSTORE_BASE64: ${{ secrets.PORTAL_KEYSTORE_BASE64 }}
+          PORTAL_KEYSTORE_PASSWORD: ${{ secrets.PORTAL_KEYSTORE_PASSWORD }}
+          PORTAL_KEY_ALIAS: ${{ secrets.PORTAL_KEY_ALIAS }}
+          PORTAL_KEY_PASSWORD: ${{ secrets.PORTAL_KEY_PASSWORD }}
+        run: |
+          umask 077
+          keystore=$(mktemp --suffix=.jks "$RUNNER_TEMP/portal-drop-signing.XXXXXX")
+          trap 'rm -f -- "$keystore"' EXIT
+          printf '%s' "$PORTAL_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          unset PORTAL_KEYSTORE_BASE64
+          PORTAL_KEYSTORE_PATH="$keystore" ./android/gradlew --no-daemon -p android assembleRelease
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
+          cp "$apk" portal-drop-android.apk
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: steps.signing.outputs.enabled == 'true'
+        with:
+          name: portal-drop-android
+          path: portal-drop-android.apk
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [build-linux, build-windows, build-android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          path: artifacts
+      - name: Select release assets
+        id: assets
+        run: |
+          {
+            echo 'files<<ASSETS'
+            echo artifacts/portal-drop-linux-x64/portal-drop-linux-x64.tar.gz
+            echo artifacts/portal-drop-windows-x64/portal-drop-windows-x64.zip
+            if [ -f artifacts/portal-drop-android/portal-drop-android.apk ]; then
+              echo artifacts/portal-drop-android/portal-drop-android.apk
+            fi
+            echo ASSETS
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.assets.outputs.files }}

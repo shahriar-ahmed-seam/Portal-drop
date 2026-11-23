@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="portal_background">#FFFFFF</color>
+    <color name="portal_surface">#FFFFFF</color>
+    <color name="portal_text">#0F1A15</color>
+    <color name="portal_muted">#53665D</color>
+    <color name="portal_border">#E3E9E6</color>
+    <color name="portal_accent">#229E66</color>
+    <color name="portal_accent_text">#11764A</color>
+    <color name="portal_on_accent">#FFFFFF</color>
+    <color name="portal_mint">#E2F7D6</color>
+    <color name="portal_error">#B32D3C</color>
+    <color name="portal_reply">#EAF4EB</color>
+    <color name="portal_input">#F1F4F3</color>
+    <color name="portal_bubble_in">#FFFFFF</color>
+    <color name="portal_meta_sent">#37764B</color>
+    <color name="portal_day_bg">#C1294F39</color>
+    <color name="portal_day_text">#FFFFFF</color>
+    <color name="portal_wall_light">#DFEAB9</color>
+    <color name="portal_wall_base">#B6DCC0</color>
+    <color name="portal_wall_tail">#D4E8C6</color>
+    <color name="portal_wall_pattern">#171E5A32</color>
+    <color name="portal_room_active">#177749</color>
+    <color name="portal_selected">#DDF2E5</color>
+    <color name="ic_launcher_background">#101B15</color>
+</resources>

@@ -1,0 +1,26 @@
+/linux/target/
+/windows/target/
+/android/.gradle/
+/android/.kotlin/
+/android/**/build/
+/android/local.properties
+/android/.idea/
+/dist/
+*.iml
+__pycache__/
+
+# Local credentials, signing keys, and app data
+.env
+.env.*
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+portal-drop.sqlite3*
+
+# Generated Android packages
+*.apk
+*.aab
