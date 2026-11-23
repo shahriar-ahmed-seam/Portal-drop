@@ -34,7 +34,7 @@
   </tr>
 </table>
 
-Linux and Windows share the same web-rendered desktop interface with Light, Dark, and System themes.
+Linux and Windows share the same web-rendered desktop interface with a collapsible chat sidebar (`Ctrl+B`) and Light, Dark, and System themes.
 
 ---
 
@@ -59,10 +59,10 @@ Prebuilt packages for Linux (`.deb`, `.tar.gz`), Windows (`.exe`, `.zip`), and A
 
 **Debian package (recommended)**
 
-Download `portal-drop_0.3.0_amd64.deb` from the latest release and install it with `apt`:
+Download `portal-drop_0.3.1_amd64.deb` from the latest release and install it with `apt`:
 
 ```sh
-sudo apt install ./portal-drop_0.3.0_amd64.deb
+sudo apt install ./portal-drop_0.3.1_amd64.deb
 systemctl --user enable --now portal-drop.service
 ```
 
@@ -85,7 +85,7 @@ Launch **Portal Drop** from your application menu or run `portal-drop-desktop`.
 
 **Installer (recommended)**
 
-Download and run `portal-drop-0.3.0-windows-x64-setup.exe` from the latest release. The installer installs Portal Drop per user under `%LOCALAPPDATA%\Portal Drop`, registers login autostart, and creates a Start Menu entry. Requires the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (preinstalled on Windows 11 and most Windows 10 systems).
+Download and run `portal-drop-0.3.1-windows-x64-setup.exe` from the latest release. The installer installs Portal Drop per user under `%LOCALAPPDATA%\Portal Drop`, registers login autostart, and creates a Start Menu entry. Requires the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (preinstalled on Windows 11 and most Windows 10 systems).
 
 **Portable archive**
 
@@ -113,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File windows/install.ps1
 
 Requires Android 10 (API 29) or later.
 
-Download and install the signed `portal-drop-0.3.0-android.apk` from the latest release. Future releases signed with the same release certificate update in place while preserving chat history and pairing.
+Download and install the signed `portal-drop-0.3.1-android.apk` from the latest release. Future releases signed with the same release certificate update in place while preserving chat history and pairing.
 
 **Build from source**
 

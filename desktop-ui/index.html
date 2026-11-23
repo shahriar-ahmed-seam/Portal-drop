@@ -13,7 +13,7 @@
   --font: "Segoe UI Variable Text", "Segoe UI", "Inter", Roboto, "Noto Sans", "Ubuntu Sans", system-ui, sans-serif;
   --mono: "JetBrains Mono", "Cascadia Code", Consolas, "Ubuntu Sans Mono", "DejaVu Sans Mono", monospace;
   --radius-bubble: 16px;
-  --sidebar-w: 340px;
+  --sidebar-w: 312px;
   --ease: cubic-bezier(.2, .8, .2, 1);
 }
 
@@ -137,13 +137,22 @@ svg { display: block; flex-shrink: 0; }
 .scroll::-webkit-scrollbar-thumb { background: transparent; border-radius: 6px; }
 .scroll:hover::-webkit-scrollbar-thumb { background: var(--scroll-thumb); }
 
-.app { display: grid; grid-template-columns: var(--sidebar-w) 1fr; height: 100vh; }
+.app { display: flex; height: 100vh; overflow: hidden; }
 
 /* ============================ Sidebar ============================ */
 .sidebar {
-  position: relative; display: flex; flex-direction: column; min-height: 0;
-  background: var(--side-bg); border-right: 1px solid var(--line);
+  position: relative; width: var(--sidebar-w); flex: 0 0 var(--sidebar-w); min-height: 0;
+  background: var(--side-bg); border-right: 1px solid var(--line); overflow: hidden;
+  transition: width .22s var(--ease), flex-basis .22s var(--ease), border-color .22s var(--ease);
 }
+.sidebar-inner {
+  position: relative; width: var(--sidebar-w); min-width: var(--sidebar-w); height: 100%;
+  display: flex; flex-direction: column; min-height: 0;
+  transition: opacity .16s ease, transform .22s var(--ease);
+}
+.app.collapsed .sidebar { width: 0; flex-basis: 0; border-right-color: transparent; pointer-events: none; }
+.app.collapsed .sidebar-inner { opacity: 0; transform: translateX(-16px); }
+.app.no-anim .sidebar, .app.no-anim .sidebar-inner { transition: none !important; }
 .side-top { display: flex; align-items: center; gap: 10px; padding: 10px 12px 8px; }
 .icon-btn {
   width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center;
@@ -239,15 +248,17 @@ svg { display: block; flex-shrink: 0; }
 .drawer-foot { padding: 12px 20px 16px; font-size: 12px; color: var(--muted); }
 
 /* ============================ Chat pane ============================ */
-.chat { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--wall-2); }
+.chat { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--wall-2); }
 .chat-head, .sel-head {
-  position: relative; z-index: 3; height: 58px; flex-shrink: 0; display: flex; align-items: center; gap: 12px;
-  padding: 0 10px 0 18px; background: var(--panel); border-bottom: 1px solid var(--panel-border);
+  position: relative; z-index: 3; height: 58px; flex-shrink: 0; display: flex; align-items: center; gap: 10px;
+  padding: 0 10px; background: var(--panel); border-bottom: 1px solid var(--panel-border);
 }
+.head-left { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 .head-info { flex: 1; min-width: 0; }
 .head-title { font-size: 15.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .head-sub { margin-top: 1px; font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .head-sub.on { color: var(--accent); }
+.head-sub.warn { color: var(--warn); }
 .head-actions { display: flex; align-items: center; gap: 2px; }
 .sel-head { gap: 8px; padding-left: 10px; }
 .sel-count { flex: 1; font-size: 15.5px; font-weight: 600; }
@@ -519,24 +530,30 @@ svg { display: block; flex-shrink: 0; }
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
-@media (max-width: 900px) { :root { --sidebar-w: 290px; } .bubble { max-width: 84%; } }
-@media (max-width: 720px) { :root { --sidebar-w: 84px; } .search, .row-main, .conn-strip span { display: none; } .chat-row { justify-content: center; } .fab { right: 15px; width: 50px; height: 50px; } }
+@media (max-width: 960px) { :root { --sidebar-w: 276px; } .bubble { max-width: 84%; } }
+@media (max-width: 720px) { :root { --sidebar-w: 248px; } .bubble { max-width: 88%; } }
 </style>
 </head>
 <body>
-<div class="app" id="app">
-  <aside class="sidebar">
-    <div class="side-top">
-      <button class="icon-btn" id="menu-btn" title="Menu" aria-label="Menu"></button>
-      <label class="search"><span id="search-icon"></span><input id="search" placeholder="Search chats" autocomplete="off" spellcheck="false"></label>
+<div class="app no-anim" id="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-inner">
+      <div class="side-top">
+        <button class="icon-btn" id="menu-btn" title="Menu" aria-label="Menu"></button>
+        <label class="search"><span id="search-icon"></span><input id="search" placeholder="Search chats" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <div class="conn-strip" id="conn-strip" hidden><i class="spinner"></i><span id="conn-text">Waiting for phone…</span></div>
+      <div class="chat-list scroll" id="chat-list"></div>
+      <button class="fab" id="new-chat" title="New chat" aria-label="New chat"></button>
     </div>
-    <div class="conn-strip" id="conn-strip" hidden><i class="spinner"></i><span id="conn-text">Waiting for phone…</span></div>
-    <div class="chat-list scroll" id="chat-list"></div>
-    <button class="fab" id="new-chat" title="New chat" aria-label="New chat"></button>
   </aside>
 
   <main class="chat" id="chat">
     <header class="chat-head" id="chat-head">
+      <div class="head-left">
+        <button class="icon-btn" id="head-menu-btn" title="Menu" aria-label="Menu" hidden></button>
+        <button class="icon-btn" id="sidebar-toggle" title="Hide chats (Ctrl+B)" aria-label="Toggle chat list"></button>
+      </div>
       <div class="avatar sm" id="head-avatar"></div>
       <div class="head-info">
         <div class="head-title" id="head-title">Portal Drop</div>
@@ -611,7 +628,7 @@ svg { display: block; flex-shrink: 0; }
     <div class="drawer-status"><i class="dot" id="drawer-dot"></i><span id="drawer-status">Checking…</span></div>
   </div>
   <div class="drawer-items scroll" id="drawer-items"></div>
-  <div class="drawer-foot">Portal Drop 0.3 · Local network only</div>
+  <div class="drawer-foot">Portal Drop 0.3.1 · Local network only</div>
 </nav>
 <div class="toast" id="toast"></div>
 
@@ -648,6 +665,7 @@ window.__portalReply = (msg) => {
    ======================================================================== */
 const ICONS = {
   menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
+  sidebar: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M9.5 4.5v15"/>',
   search: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/>',
   edit: '<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
   clip: '<path d="M20.5 11.5l-8.2 8.2a5.3 5.3 0 0 1-7.5-7.5l8.6-8.6a3.5 3.5 0 0 1 5 5l-8.5 8.5a1.8 1.8 0 0 1-2.5-2.5l7.8-7.8"/>',
@@ -780,11 +798,11 @@ const state = {
   status: {}, serviceActive: true, progress: new Map(), replyTo: {}, drafts: {}, tempArmed: false,
   selecting: false, selected: new Set(), refreshing: false, pendingRefresh: false, chatSig: "",
   stickBottom: true, forceBottom: true, filter: "", loaded: false, pairOpen: null,
-  prefs: Object.assign({ theme: "light" }, window.__PORTAL_PREFS || {}),
+  prefs: Object.assign({ theme: "light", sidebarCollapsed: false }, window.__PORTAL_PREFS || {}),
 };
 
 /* ========================================================================
-   Theme
+   Theme & Sidebar state
    ======================================================================== */
 const darkQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
 function effectiveTheme() {
@@ -804,14 +822,37 @@ function setThemePref(pref) {
   ipc("set_prefs", { prefs: state.prefs }).catch(() => {});
   renderDrawer();
 }
-const urlTheme = new URLSearchParams(location.search).get("theme");
-if (urlTheme) state.prefs.theme = urlTheme;
+function applySidebar() {
+  const collapsed = !!state.prefs.sidebarCollapsed;
+  $("app").classList.toggle("collapsed", collapsed);
+  $("head-menu-btn").hidden = !collapsed;
+  const toggle = $("sidebar-toggle");
+  toggle.title = collapsed ? "Show chats (Ctrl+B)" : "Hide chats (Ctrl+B)";
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.classList.toggle("active", !collapsed);
+}
+function setSidebarCollapsed(collapsed) {
+  state.prefs.sidebarCollapsed = !!collapsed;
+  applySidebar();
+  ipc("set_prefs", { prefs: state.prefs }).catch(() => {});
+  if ($("drawer").classList.contains("show")) renderDrawer();
+}
+function toggleSidebar() { setSidebarCollapsed(!state.prefs.sidebarCollapsed); }
+const urlParams = new URLSearchParams(location.search);
+if (urlParams.get("theme")) state.prefs.theme = urlParams.get("theme");
+if (urlParams.has("collapsed")) state.prefs.sidebarCollapsed = urlParams.get("collapsed") === "1";
 applyTheme(false);
 
 /* ========================================================================
    Static chrome
    ======================================================================== */
 $("menu-btn").innerHTML = icon("menu");
+$("head-menu-btn").innerHTML = icon("menu");
+$("sidebar-toggle").innerHTML = icon("sidebar", 20);
+applySidebar();
+requestAnimationFrame(() => $("app").classList.remove("no-anim"));
+$("sidebar-toggle").onclick = toggleSidebar;
+$("head-menu-btn").onclick = openDrawer;
 $("search-icon").innerHTML = icon("search", 18);
 $("new-chat").innerHTML = icon("edit", 24, 2);
 $("select-btn").innerHTML = icon("select");
@@ -851,7 +892,7 @@ function renderStatus() {
   const info = connectionInfo();
   const s = state.status || {};
   const sub = $("head-sub");
-  sub.textContent = info.text; sub.className = "head-sub" + (info.online ? " on" : "");
+  sub.textContent = info.text; sub.className = "head-sub" + (info.cls ? " " + info.cls : "");
   const strip = $("conn-strip");
   const showStrip = !info.online && (s.paired || !state.serviceActive);
   strip.hidden = !showStrip;
@@ -1178,6 +1219,7 @@ function renderDrawer() {
   };
   add("qr", state.status.paired ? "Pair a new phone" : "Pair Android device", showPair);
   add("edit", "New chat", newChat);
+  add("sidebar", state.prefs.sidebarCollapsed ? "Show chat list" : "Hide chat list", toggleSidebar);
   add("history", "Received files", showReceived);
   add("folder", "Open download folder", () => ipc("open_receive_folder").catch((e) => toast(e.message)));
   add(state.serviceActive ? "pause" : "play", state.serviceActive ? "Pause background service" : "Resume background service",
@@ -1482,7 +1524,7 @@ window.__portalOpenChat = ({ chatId, replyTo } = {}) => {
   if (chatId) openChat(chatId);
   if (replyTo) setTimeout(() => { const r = rowById(replyTo); if (r) setReply(r); }, 400);
 };
-window.__portalSetPrefs = (p) => { Object.assign(state.prefs, p || {}); applyTheme(false); };
+window.__portalSetPrefs = (p) => { Object.assign(state.prefs, p || {}); applyTheme(false); applySidebar(); };
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
@@ -1491,7 +1533,13 @@ document.addEventListener("keydown", (e) => {
     if ($("drawer").classList.contains("show")) return closeDrawer();
     if (state.selecting) return exitSelection();
   }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") { e.preventDefault(); $("search").focus(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") { e.preventDefault(); toggleSidebar(); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    if (state.prefs.sidebarCollapsed) setSidebarCollapsed(false);
+    $("search").focus();
+    return;
+  }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
   if (!openModalEl && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1 && !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) $("composer").focus();
 });
