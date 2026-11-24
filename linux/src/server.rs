@@ -2,8 +2,8 @@ use crate::{
     files::{BUFFER_SIZE, Complete, Files, preview_file, preview_text},
     model::{
         Chat, DeviceInfo, Item, Kind, Offset, PROTOCOL_VERSION, PairRequest, Receipt,
-        format_peer_label, load_notification_settings, local_name, local_os, now_ms, random_secret,
-        valid_id,
+        TransferCommand, TransferDirection, TransferResponse, TransferState, format_peer_label,
+        load_notification_settings, local_name, local_os, now_ms, random_secret, valid_id,
     },
     sound::{self, SoundKind},
     store::{Incoming, Peer, Progress, Store, private_directory},
@@ -121,6 +121,8 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
     let tls = RustlsConfig::from_pem(identity.cert, identity.key).await?;
     let listener = TcpListener::bind(listen)?;
     let address = listener.local_addr()?;
+    #[cfg(target_os = "linux")]
+    crate::watchdog::start(address);
 
     let (events_tx, _) = broadcast::channel::<&'static str>(64);
     let wake_path = files.data_dir().join("wake.json");
@@ -138,27 +140,44 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
         local_name: local_name(),
     };
 
-    // Background expiry reaper & SQLite change fallback watcher.
+    // Watch durable queue changes independently of local wake notifications.
     let reaper_app = app_state.clone();
     tokio::spawn(async move {
-        let mut last_data_version = reaper_app.store.data_version().unwrap_or(0);
+        let mut last_revision = reaper_app.store.wake_revision().ok();
         let mut tick_count: u64 = 0;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
             tick_count = tick_count.wrapping_add(1);
-            if tick_count.is_multiple_of(5)
-                && let Ok(purged) = reaper_app.store.purge_expired(&reaper_app.files)
-                && purged > 0
-            {
+            let reap = tick_count.is_multiple_of(5);
+            let watch = reaper_app.connected_clients.load(Ordering::Relaxed) > 0
+                || reaper_app.events_tx.receiver_count() > 0;
+            if !reap && !watch {
+                continue;
+            }
+            let store = reaper_app.store.clone();
+            let files = reaper_app.files.clone();
+            let Ok((purged, revision)) = tokio::task::spawn_blocking(move || {
+                let purged = reap && store.purge_expired(&files).is_ok_and(|count| count > 0);
+                let revision = if watch {
+                    store.wake_revision().ok()
+                } else {
+                    None
+                };
+                (purged, revision)
+            })
+            .await
+            else {
+                continue;
+            };
+            if purged {
                 let _ = reaper_app.events_tx.send("expire");
             }
-            if (reaper_app.connected_clients.load(Ordering::Relaxed) > 0
-                || reaper_app.events_tx.receiver_count() > 0)
-                && let Ok(current) = reaper_app.store.data_version()
-                && current != last_data_version
+            if let Some(current) = revision
+                && last_revision
+                    .replace(current)
+                    .is_some_and(|last| current != last)
             {
-                last_data_version = current;
                 let _ = reaper_app.events_tx.send("sync");
             }
         }
@@ -170,6 +189,10 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
         .route("/v1/events", get(events))
         .route("/v1/chats", get(chats))
         .route("/v1/chats/{id}", put(write_chat))
+        .route(
+            "/v1/transfers/{direction}/{id}",
+            get(transfer_info).post(control_transfer),
+        )
         .route("/v1/outbox", get(outbox))
         .route("/v1/outbox/{id}/ack", post(ack))
         .route("/v1/outbox/{id}/file", get(download))
@@ -404,7 +427,7 @@ fn device_headers(app: &App) -> HeaderMap {
     if let Ok(value) = HeaderValue::from_str(&app.local_name) {
         headers.insert(HEADER_NAME.clone(), value);
     }
-    headers.insert(HEADER_VERSION.clone(), HeaderValue::from_static("3"));
+    headers.insert(HEADER_VERSION.clone(), HeaderValue::from(PROTOCOL_VERSION));
     headers
 }
 
@@ -463,6 +486,23 @@ const HASH_ERROR: ApiError = ApiError::Client(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid payload or checksum; restart transfer",
 );
+
+const PAUSED_TRANSFER: ApiError = ApiError::Client(StatusCode::LOCKED, "transfer paused");
+const CANCELED_TRANSFER: ApiError = ApiError::Client(StatusCode::GONE, "transfer canceled");
+const FAILED_TRANSFER: ApiError = ApiError::Client(
+    StatusCode::FAILED_DEPENDENCY,
+    "transfer failed; retry when ready",
+);
+
+fn check_transfer_state(state: TransferState) -> ApiResult<()> {
+    match state {
+        TransferState::Queued => Ok(()),
+        TransferState::Paused => Err(PAUSED_TRANSFER),
+        TransferState::Canceled => Err(CANCELED_TRANSFER),
+        TransferState::Failed => Err(FAILED_TRANSFER),
+        TransferState::Delivered => Err(MISSING_ITEM),
+    }
+}
 
 struct Authorized(Peer);
 
@@ -665,12 +705,62 @@ async fn outbox(
         .into_response())
 }
 
+fn transfer_address(direction: &str, id: &str) -> ApiResult<TransferDirection> {
+    if !valid_id(id) {
+        return Err(MISSING_ITEM);
+    }
+    TransferDirection::parse(direction).ok_or(MISSING_ITEM)
+}
+
+async fn transfer_info(
+    State(app): State<App>,
+    Authorized(peer): Authorized,
+    Path((direction, id)): Path<(String, String)>,
+) -> ApiResult<Json<TransferResponse>> {
+    let direction = transfer_address(&direction, &id)?;
+    let transfer = app
+        .store
+        .transfer(&peer, direction, &id)?
+        .ok_or(MISSING_ITEM)?;
+    Ok(Json(TransferResponse {
+        state: transfer.state,
+    }))
+}
+
+async fn control_transfer(
+    State(app): State<App>,
+    Authorized(peer): Authorized,
+    Path((direction, id)): Path<(String, String)>,
+    Json(command): Json<TransferCommand>,
+) -> ApiResult<Json<TransferResponse>> {
+    let direction = transfer_address(&direction, &id)?;
+    let store = app.store.clone();
+    let transfer = tokio::task::spawn_blocking(move || {
+        store.control_transfer(&peer, direction, &id, command.action)
+    })
+    .await??
+    .ok_or(MISSING_ITEM)?;
+    if transfer.state == TransferState::Canceled {
+        app.files.discard_transfer(&peer, direction, &transfer.item);
+    }
+    let _ = app.events_tx.send("transfer");
+    Ok(Json(TransferResponse {
+        state: transfer.state,
+    }))
+}
+
 async fn ack(
     State(app): State<App>,
     Authorized(peer): Authorized,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    if !valid_id(&id) || !app.store.acknowledge(&peer, &id)? {
+    if !valid_id(&id) {
+        return Err(MISSING_ITEM);
+    }
+    if !app.store.acknowledge(&peer, &id)? {
+        if let Some(transfer) = app.store.transfer(&peer, TransferDirection::Sent, &id)? {
+            check_transfer_state(transfer.state)?;
+        }
         return Err(MISSING_ITEM);
     }
     app.store.clear_progress(&id, "sent")?;
@@ -693,22 +783,39 @@ async fn download(
     if !valid_id(&id) {
         return Err(MISSING_ITEM);
     }
-    let (item, delivered) = app.store.outgoing(&peer, &id)?.ok_or(MISSING_ITEM)?;
-    let (size, _) = item.payload().filter(|_| !delivered).ok_or(MISSING_ITEM)?;
+    let direction = TransferDirection::Sent;
+    let transfer = app
+        .store
+        .transfer(&peer, direction, &id)?
+        .ok_or(MISSING_ITEM)?;
+    check_transfer_state(transfer.state)?;
+    let item = transfer.item;
+    let (size, _) = item.payload().ok_or(MISSING_ITEM)?;
     let remaining = size.checked_sub(offset).ok_or(OFFSET_ERROR)?;
-    let mut file = File::open(app.files.outgoing_payload(&item))
-        .await
-        .map_err(|_| MISSING_ITEM)?;
-    if file.metadata().await?.len() != size {
-        return Err(MISSING_ITEM);
-    }
-    file.seek(SeekFrom::Start(offset)).await?;
-    let mut progress = ProgressWatch::new(app.store, app.events_tx, &item, "sent", offset, size);
-    let stream = ReaderStream::with_capacity(file.take(remaining), BUFFER_SIZE).map(move |chunk| {
-        if let Ok(data) = &chunk {
-            progress.advance(data.len() as u64);
+
+    let mut file = match File::open(app.files.outgoing_payload(&item)).await {
+        Ok(file) if file.metadata().await?.len() == size => file,
+        _ => {
+            app.store.fail_transfer(&peer, direction, &id)?;
+            let _ = app.events_tx.send("transfer");
+            return Err(FAILED_TRANSFER);
         }
-        chunk
+    };
+    file.seek(SeekFrom::Start(offset)).await?;
+    let gate = TransferGate::new(app.store.clone(), peer, direction, id);
+    let progress = ProgressWatch::new(app.store, app.events_tx, &item, "sent", offset, size);
+    let reader = ReaderStream::with_capacity(file.take(remaining), BUFFER_SIZE);
+    let stream = stream::unfold(Some((reader, progress, gate)), |state| async move {
+        let (mut reader, mut progress, mut gate) = state?;
+        if gate.check(false).await.is_err() {
+            let error = std::io::Error::new(ErrorKind::Interrupted, "transfer stopped");
+            return Some((Err(error), None));
+        }
+        let chunk = reader.next().await?;
+        if let Ok(bytes) = &chunk {
+            progress.advance(bytes.len() as u64);
+        }
+        Some((chunk, Some((reader, progress, gate))))
     });
     let body = Body::from_stream(stream);
     Ok((
@@ -724,6 +831,7 @@ async fn download(
 async fn offer(
     State(app): State<App>,
     Authorized(peer): Authorized,
+    headers: HeaderMap,
     Json(mut item): Json<Item>,
 ) -> ApiResult<Json<Receipt>> {
     if item.validate().is_err() {
@@ -757,10 +865,17 @@ async fn offer(
             }));
         }
 
+        if let Some(transfer) = app
+            .store
+            .transfer(&peer, TransferDirection::Received, &item.id)?
+        {
+            check_transfer_state(transfer.state)?;
+        }
         let partial = app.files.partial(&peer, &item);
         return match tokio::fs::metadata(&partial).await {
             Ok(metadata) if metadata.len() == size => {
-                let received = complete(&app, &peer, &incoming).await?;
+                let received =
+                    complete(&app, &peer, &incoming, protocol_version(&headers) >= 4).await?;
                 Ok(Json(Receipt {
                     received,
                     offset: if received { size } else { 0 },
@@ -820,6 +935,12 @@ async fn upload(
     if incoming.received {
         return Ok(StatusCode::NO_CONTENT);
     }
+    let direction = TransferDirection::Received;
+    let transfer = app
+        .store
+        .transfer(&peer, direction, &id)?
+        .ok_or(MISSING_ITEM)?;
+    check_transfer_state(transfer.state)?;
     let remaining = size.checked_sub(offset).ok_or(OFFSET_ERROR)?;
     let length = headers
         .get(CONTENT_LENGTH)
@@ -852,15 +973,20 @@ async fn upload(
         size,
     );
     let mut writer = BufWriter::with_capacity(BUFFER_SIZE, file);
-    let transferred = append_upload(&mut writer, body, length, &mut progress).await;
+    let mut gate = TransferGate::new(app.store.clone(), peer, direction, id);
+    let transferred = append_upload(&mut writer, body, length, &mut progress, &mut gate).await;
     writer.flush().await?;
     let file = writer.into_inner();
     file.sync_all().await?;
     progress.save();
-    transferred?;
     drop(file);
+    if matches!(transferred, Err(ApiError::Client(StatusCode::GONE, _))) {
+        app.files.discard_transfer(&peer, direction, &incoming.item);
+    }
+    transferred?;
+    gate.check(true).await?;
 
-    if complete(&app, &peer, &incoming).await? {
+    if complete(&app, &peer, &incoming, protocol_version(&headers) >= 4).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(HASH_ERROR)
@@ -886,7 +1012,12 @@ async fn open_private_append(path: &FsPath) -> std::io::Result<File> {
         .await
 }
 
-async fn complete(app: &App, peer: &Peer, incoming: &Incoming) -> ApiResult<bool> {
+async fn complete(
+    app: &App,
+    peer: &Peer,
+    incoming: &Incoming,
+    manage_failures: bool,
+) -> ApiResult<bool> {
     let item = &incoming.item;
     let result = app.files.finish(&app.store, peer, incoming).await?;
     let _ = app.store.clear_progress(&item.id, "received");
@@ -908,8 +1039,23 @@ async fn complete(app: &App, peer: &Peer, incoming: &Incoming) -> ApiResult<bool
             notify_message(app, item, &text);
             Ok(true)
         }
-        Complete::InvalidPayload => Ok(false),
-        Complete::Revoked => Err(AUTH_ERROR),
+        Complete::InvalidPayload => {
+            if manage_failures {
+                app.store
+                    .fail_transfer(peer, TransferDirection::Received, &item.id)?;
+                let _ = app.events_tx.send("transfer");
+            }
+            Ok(false)
+        }
+        Complete::Revoked => {
+            if let Some(transfer) =
+                app.store
+                    .transfer(peer, TransferDirection::Received, &item.id)?
+            {
+                check_transfer_state(transfer.state)?;
+            }
+            Err(AUTH_ERROR)
+        }
     }
 }
 
@@ -918,23 +1064,29 @@ async fn append_upload(
     body: Body,
     bytes: u64,
     progress: &mut ProgressWatch,
+    gate: &mut TransferGate,
 ) -> ApiResult<()> {
     let mut remaining = bytes;
     let mut stream = body.into_data_stream();
     let mut last_flush = Instant::now();
+    let mut last_data = last_flush;
     loop {
+        gate.check(false).await?;
         let next = match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
             Ok(item) => item,
             Err(_) => {
                 file.flush().await?;
                 last_flush = Instant::now();
-                tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, stream.next())
-                    .await
-                    .map_err(|_| {
-                        ApiError::Client(StatusCode::REQUEST_TIMEOUT, "upload paused too long")
-                    })?
+                if last_data.elapsed() >= UPLOAD_IDLE_TIMEOUT {
+                    return Err(ApiError::Client(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "upload paused too long",
+                    ));
+                }
+                continue;
             }
         };
+        last_data = Instant::now();
         let Some(chunk) = next else { break };
         let chunk =
             chunk.map_err(|_| ApiError::Client(StatusCode::BAD_REQUEST, "upload interrupted"))?;
@@ -958,6 +1110,41 @@ async fn append_upload(
         ));
     }
     Ok(())
+}
+
+struct TransferGate {
+    store: Store,
+    peer: Peer,
+    direction: TransferDirection,
+    id: String,
+    last_check: Instant,
+}
+
+impl TransferGate {
+    fn new(store: Store, peer: Peer, direction: TransferDirection, id: String) -> Self {
+        Self {
+            store,
+            peer,
+            direction,
+            id,
+            last_check: Instant::now(),
+        }
+    }
+
+    async fn check(&mut self, force: bool) -> ApiResult<()> {
+        if !force && self.last_check.elapsed() < Duration::from_millis(180) {
+            return Ok(());
+        }
+        let store = self.store.clone();
+        let peer = self.peer;
+        let direction = self.direction;
+        let id = self.id.clone();
+        let transfer = tokio::task::spawn_blocking(move || store.transfer(&peer, direction, &id))
+            .await??
+            .ok_or(MISSING_ITEM)?;
+        self.last_check = Instant::now();
+        check_transfer_state(transfer.state)
+    }
 }
 
 struct ProgressWatch {
@@ -991,6 +1178,7 @@ impl ProgressWatch {
                 total,
                 started_at: now,
                 updated_at: now,
+                transfer_state: None,
             },
             last_write: Instant::now(),
         };

@@ -1,14 +1,20 @@
 mod files;
+mod folders;
 mod model;
 mod server;
 mod sound;
 mod store;
+#[cfg(target_os = "linux")]
+mod watchdog;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use files::{Files, preview_file, preview_text};
 use fs2::FileExt;
-use model::{Chat, Item, Kind, MAX_TTL_SEC, MIN_TTL_SEC, PORT, TEMP_TTL_SEC, valid_id};
+use model::{
+    Chat, Item, Kind, MAX_TTL_SEC, MIN_TTL_SEC, PORT, TEMP_TTL_SEC, TransferAction,
+    TransferDirection, TransferResponse, TransferState, valid_id,
+};
 use qrcode::{QrCode, render::unicode};
 use serde::Serialize;
 use std::{
@@ -33,6 +39,13 @@ struct Args {
     receive_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MediaTab {
+    PhotosVideos,
+    Files,
+    Links,
 }
 
 #[derive(Subcommand)]
@@ -90,6 +103,25 @@ enum Command {
         ttl: Option<u64>,
         path: PathBuf,
     },
+    /// Queue all ordinary files in a folder with their relative paths
+    SendFolder {
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long)]
+        reply_to: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(MIN_TTL_SEC..=MAX_TTL_SEC))]
+        ttl: Option<u64>,
+        path: PathBuf,
+    },
+    /// Queue a base64-encoded clipboard image supplied on standard input
+    SendImage {
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long)]
+        reply_to: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(MIN_TTL_SEC..=MAX_TTL_SEC))]
+        ttl: Option<u64>,
+    },
     /// List saved chats
     Chats {
         #[arg(long)]
@@ -115,6 +147,25 @@ enum Command {
         #[arg(long)]
         files: bool,
     },
+    /// Search message bodies and filenames across chats, returning JSON
+    Search {
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(allow_hyphen_values = true)]
+        query: String,
+    },
+    /// List shared media, files, or linked messages as a page of JSON
+    SharedMedia {
+        tab: MediaTab,
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long)]
+        before: Option<i64>,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+    },
+    /// Return the local path for an available photo or video
+    MediaPath { id: String },
     /// Show new local timeline entries after the given sequence
     Events {
         #[arg(long)]
@@ -135,6 +186,12 @@ enum Command {
     Progress {
         #[arg(long)]
         json: bool,
+    },
+    /// Change a pending file or long-message transfer
+    TransferControl {
+        direction: TransferDirection,
+        id: String,
+        action: TransferAction,
     },
     /// Print the exact UTF-8 message body without an added newline
     MessageText { id: String },
@@ -282,6 +339,52 @@ fn main() -> Result<()> {
             queue(&store, &files, &peer, item, chat, reply_to, effective_ttl)?;
             server::wake_daemon(&data);
         }
+        Command::SendFolder {
+            chat,
+            reply_to,
+            ttl,
+            path,
+        } => {
+            let peer = store
+                .active_peer()?
+                .context("pair with Android before sending")?;
+            let children = folders::children(&path)?;
+            let mut staged = Vec::with_capacity(children.len());
+            let result = (|| {
+                for (source, relative_path) in children {
+                    let mut item = files.stage_outgoing(&source)?;
+                    item.name = relative_path
+                        .rsplit_once('/')
+                        .map(|(_, name)| name.to_owned());
+                    item.relative_path = Some(relative_path);
+                    item.chat_id = chat.clone();
+                    item.reply_to = reply_to.clone();
+                    item.ttl_sec = ttl;
+                    staged.push(item);
+                }
+                store.queue_batch(&peer, &staged)
+            })();
+            if let Err(error) = result {
+                for item in &staged {
+                    files.remove_outgoing(item);
+                }
+                return Err(error);
+            }
+            server::wake_daemon(&data);
+            print_json(&serde_json::json!({ "sent": staged.len() }))?;
+        }
+        Command::SendImage {
+            chat,
+            reply_to,
+            ttl,
+        } => {
+            let peer = store
+                .active_peer()?
+                .context("pair with Android before sending")?;
+            let item = files.stage_clipboard_image(io::stdin().lock())?;
+            queue(&store, &files, &peer, item, chat, reply_to, ttl)?;
+            server::wake_daemon(&data);
+        }
         Command::Chats { json } => {
             let chats = store.chats(false)?;
             if json {
@@ -338,6 +441,94 @@ fn main() -> Result<()> {
                     print_message(&message_view(&files, row));
                 }
             }
+        }
+        Command::Search { limit, query } => {
+            let query = query.trim().to_ascii_lowercase();
+            ensure!(
+                !query.is_empty() && query.len() <= 1024,
+                "enter a search of up to 1,024 bytes"
+            );
+            let mut before = i64::MAX;
+            let mut found = Vec::new();
+            while found.len() < limit as usize {
+                let candidates = store.search_candidates(&query, before)?;
+                if candidates.is_empty() {
+                    break;
+                }
+                for entry in candidates {
+                    before = entry.seq;
+                    if entry.item.text_size.is_some()
+                        && !text_file_contains(&text_path(&files, &entry), query.as_bytes())
+                    {
+                        continue;
+                    }
+                    found.push(message_view(&files, entry));
+                    if found.len() == limit as usize {
+                        break;
+                    }
+                }
+            }
+            print_json(&found)?;
+        }
+        Command::SharedMedia {
+            tab,
+            chat,
+            before,
+            limit,
+        } => {
+            let mut cursor = before.unwrap_or(i64::MAX);
+            let mut items = Vec::new();
+            // Bound disk scans for messages stored separately from the database.
+            let mut next_before = None;
+            for _ in 0..8 {
+                let candidates = store.media_candidates(
+                    chat.as_deref(),
+                    cursor,
+                    matches!(tab, MediaTab::Links),
+                )?;
+                if candidates.is_empty() {
+                    next_before = None;
+                    break;
+                }
+                for entry in candidates {
+                    cursor = entry.seq;
+                    let media = entry.item.name.as_deref().and_then(media_type).is_some();
+                    let include = match tab {
+                        MediaTab::PhotosVideos => media,
+                        MediaTab::Files => !media,
+                        MediaTab::Links => {
+                            entry.item.text_size.is_none() || {
+                                let path = text_path(&files, &entry);
+                                text_file_contains(&path, b"https://")
+                                    || text_file_contains(&path, b"http://")
+                            }
+                        }
+                    };
+                    if include {
+                        items.push(message_view(&files, entry));
+                    }
+                    if items.len() == limit as usize {
+                        break;
+                    }
+                }
+                next_before = Some(cursor);
+                if items.len() == limit as usize {
+                    break;
+                }
+            }
+            print_json(&HistoryPage { items, next_before })?;
+        }
+        Command::MediaPath { id } => {
+            ensure!(valid_id(&id), "invalid message ID");
+            let entry = store
+                .message(&id)?
+                .context("message is no longer available")?;
+            let mime = media_type(entry.item.name.as_deref().unwrap_or_default())
+                .context("unsupported preview format")?;
+            let path = message_view(&files, entry)
+                .path
+                .context("media is unavailable")?;
+            print_json(&serde_json::json!({ "path": path, "mime": mime }))?;
         }
         Command::Events { json, after, limit } => {
             let _ = store.purge_expired(&files);
@@ -419,6 +610,24 @@ fn main() -> Result<()> {
                 history: HistoryPage { items, next_before },
                 progress,
                 previews,
+            })?;
+        }
+        Command::TransferControl {
+            direction,
+            id,
+            action,
+        } => {
+            ensure!(valid_id(&id), "invalid transfer ID");
+            let peer = store.active_peer()?.context("pair with Android first")?;
+            let transfer = store
+                .control_transfer(&peer, direction, &id, action)?
+                .context("transfer not found")?;
+            if transfer.state == TransferState::Canceled {
+                files.discard_transfer(&peer, direction, &transfer.item);
+            }
+            server::wake_daemon(&data);
+            print_json(&TransferResponse {
+                state: transfer.state,
             })?;
         }
         Command::Progress { json } => {
@@ -641,6 +850,8 @@ struct MessageView {
     direction: String,
     delivered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    transfer_state: Option<TransferState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     text_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -672,6 +883,7 @@ fn message_view(files: &Files, entry: HistoryEntry) -> MessageView {
     let path = entry
         .saved_name
         .as_deref()
+        .filter(|_| entry.delivered)
         .map(|name| files.received_file(name))
         .filter(|path| path.is_file());
     let chat_id = entry.item.chat_id().to_owned();
@@ -684,6 +896,7 @@ fn message_view(files: &Files, entry: HistoryEntry) -> MessageView {
         reply_to: entry.item.reply_to,
         direction: entry.direction,
         delivered: entry.delivered,
+        transfer_state: entry.transfer_state,
         text,
         text_truncated,
         name: entry.item.name,
@@ -700,6 +913,45 @@ fn text_path(files: &Files, entry: &HistoryEntry) -> PathBuf {
     } else {
         files.sent_text(&entry.item.id)
     }
+}
+
+fn media_type(name: &str) -> Option<&'static str> {
+    let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "heic" | "heif" => "image/heif",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "3gp" => "video/3gpp",
+        _ => return None,
+    })
+}
+
+fn text_file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut buffer = [0; 8192];
+    let mut window = Vec::with_capacity(buffer.len() + needle.len());
+    while let Ok(count @ 1..) = file.read(&mut buffer) {
+        window.extend_from_slice(&buffer[..count]);
+        window.make_ascii_lowercase();
+        if window.windows(needle.len()).any(|part| part == needle) {
+            return true;
+        }
+        let keep = (needle.len() - 1).min(window.len());
+        window.drain(..window.len() - keep);
+    }
+    false
 }
 
 fn print_message(message: &MessageView) {

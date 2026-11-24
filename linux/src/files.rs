@@ -1,8 +1,9 @@
 use crate::{
-    model::{Item, Kind, MAX_FILE_SIZE, MAX_INLINE_TEXT, MAX_NAME, now_ms},
+    model::{Item, Kind, MAX_FILE_SIZE, MAX_INLINE_TEXT, MAX_NAME, TransferDirection, now_ms},
     store::{Incoming, Peer, Store, private_directory},
 };
 use anyhow::{Context, Result, bail, ensure};
+use base64::{engine::general_purpose::STANDARD, read::DecoderReader};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
@@ -12,6 +13,7 @@ use std::{
 use uuid::Uuid;
 
 pub const BUFFER_SIZE: usize = 256 * 1024;
+const MAX_CLIPBOARD_IMAGE: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Files {
@@ -101,6 +103,46 @@ impl Files {
         Ok(Item::outgoing_file(id, name, size, hash))
     }
 
+    pub fn stage_clipboard_image(&self, input: impl Read) -> Result<Item> {
+        let mut decoded = DecoderReader::new(input, &STANDARD).take(MAX_CLIPBOARD_IMAGE + 1);
+        let mut header = [0; 12];
+        decoded
+            .read_exact(&mut header)
+            .context("invalid clipboard image")?;
+        let extension = if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "png"
+        } else if header.starts_with(b"\xff\xd8\xff") {
+            "jpg"
+        } else if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+            "gif"
+        } else if header.starts_with(b"RIFF") && &header[8..] == b"WEBP" {
+            "webp"
+        } else {
+            bail!("unsupported clipboard image format");
+        };
+        let id = Uuid::new_v4().to_string();
+        let path = self.outgoing(&id);
+        let result = (|| {
+            let (size, hash) =
+                self.stage_payload(&mut header.as_slice().chain(decoded), &path, false)?;
+            ensure!(
+                size <= MAX_CLIPBOARD_IMAGE,
+                "clipboard image exceeds 16 MiB"
+            );
+            let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+            Ok(Item::outgoing_file(
+                id,
+                format!("Clipboard_{stamp}.{extension}"),
+                size,
+                hash,
+            ))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(path);
+        }
+        result
+    }
+
     fn stage_payload(
         &self,
         input: &mut impl Read,
@@ -140,6 +182,16 @@ impl Files {
                 staged
             }
             Kind::Text => self.sent_text(&item.id),
+        }
+    }
+
+    pub fn discard_transfer(&self, peer: &Peer, direction: TransferDirection, item: &Item) {
+        match direction {
+            TransferDirection::Sent if item.kind == Kind::File => self.remove_outgoing(item),
+            TransferDirection::Sent => {}
+            TransferDirection::Received => {
+                let _ = fs::remove_file(self.partial(peer, item));
+            }
         }
     }
 
@@ -192,6 +244,16 @@ impl Files {
     }
 
     pub fn initial_name(&self, store: &Store, item: &Item) -> Result<String> {
+        if let Some(relative_path) = &item.relative_path {
+            let (directory, name) = relative_path
+                .rsplit_once('/')
+                .context("missing folder path")?;
+            let folder = self
+                .receive_dir()
+                .join(crate::folders::DIRECTORY)
+                .join(directory);
+            return self.available_name(store, &folder, name, &item.id, None);
+        }
         let base = safe_name(item.name.as_deref().context("missing filename")?);
         let cat = category(&base);
         let active = self.receive_dir();
@@ -233,8 +295,12 @@ impl Files {
                     Ok(existing) if !same_file(&metadata, &existing) => {
                         let previous = Path::new(previous);
                         let folder = previous.parent().context("missing receive folder")?;
-                        let base =
-                            safe_name(incoming.item.name.as_deref().context("missing filename")?);
+                        let name = incoming.item.name.as_deref().context("missing filename")?;
+                        let base = if incoming.item.relative_path.is_some() {
+                            name.to_owned()
+                        } else {
+                            safe_name(name)
+                        };
                         self.available_name(
                             store,
                             folder,
@@ -257,7 +323,11 @@ impl Files {
             None => self.received_text(peer, &incoming.item.id),
         };
         let directory = target.parent().context("missing receive path")?;
-        private_directory(directory)?;
+        if let Some(relative_path) = &incoming.item.relative_path {
+            crate::folders::prepare_parent(&target, relative_path)?;
+        } else {
+            private_directory(directory)?;
+        }
         if final_name.is_some() {
             ensure!(
                 fs::symlink_metadata(directory)?.file_type().is_dir(),

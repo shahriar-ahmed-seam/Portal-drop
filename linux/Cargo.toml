@@ -1,6 +1,6 @@
 [package]
 name = "portal-drop"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -8,6 +8,7 @@ rust-version = "1.88"
 anyhow = "1"
 axum = "0.8"
 axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
+base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"

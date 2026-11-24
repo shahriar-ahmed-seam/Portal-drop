@@ -56,7 +56,7 @@ import java.io.IOException
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
-    private enum class Page { CHAT, CHATS, RECEIVED }
+    private enum class Page { CHAT, CHATS, RECEIVED, MEDIA }
 
     private data class Draft(val text: String, val reply: ChatItem?)
 
@@ -84,22 +84,26 @@ class MainActivity : ComponentActivity() {
     private var tempInnerHalo: View? = null
     private var tempIconView: ImageView? = null
     private var tempBanner: LinearLayout? = null
+    private var tempDetail: TextView? = null
     private var emptyState: TextView? = null
     private var receivedClear: TextView? = null
     private var messages: ChatTimelineAdapter? = null
     private var timelineList: ChatViewport? = null
     private var rooms: RoomAdapter? = null
+    private var sharedMedia: SharedMediaView? = null
     private var replyArea: LinearLayout? = null
     private var attachmentReview: AlertDialog? = null
 
     private var page = Page.CHAT
     private var chatId = DEFAULT_CHAT_ID
     private var shownPeer: Boolean? = null
+    private var shownFingerprint: String? = null
+    private var addingComputer = false
     private var loadedFrom: Long? = null
     private var earlierThan: Long? = null
     private var chatSearch = ""
     private val drafts = mutableMapOf<String, Draft>()
-    private var tempArmed = false
+    private var tempTtl: Long? = null
     private var selecting = false
     private val selectedSeqs = linkedSetOf<Long>()
     private var pairing = false
@@ -109,11 +113,16 @@ class MainActivity : ComponentActivity() {
     private var saveLocationResetBtn: View? = null
     private val worker = Executors.newSingleThreadExecutor()
     private val fileWorker = Executors.newSingleThreadExecutor()
+    private val searchWorker = Executors.newSingleThreadExecutor()
+    private val mediaWorker = Executors.newSingleThreadExecutor()
+    private val updateWorker = Executors.newSingleThreadExecutor()
+    private var checkingForUpdates = false
+    private var mediaPreviews: MediaPreviews? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val expiryTick = object : Runnable {
         override fun run() {
-            if (store.purgeExpired().isNotEmpty() || page == Page.CHAT) {
+            if (store.purgeExpired().isNotEmpty() || page == Page.CHAT || page == Page.MEDIA) {
                 refresh()
             }
             mainHandler.postDelayed(this, 15_000L)
@@ -122,11 +131,18 @@ class MainActivity : ComponentActivity() {
 
     private val back = object : OnBackPressedCallback(false) {
         override fun handleOnBackPressed() {
+            if (addingComputer) {
+                if (!pairing) {
+                    addingComputer = false
+                    refresh()
+                }
+                return
+            }
             if (selecting) {
                 exitSelection()
                 return
             }
-            switchPage(if (page == Page.RECEIVED) Page.CHAT else Page.CHATS)
+            switchPage(if (page == Page.CHAT) Page.CHATS else Page.CHAT)
         }
     }
 
@@ -160,6 +176,10 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             notifyUser("Could not save access to this folder. Try picking a folder inside internal storage or your SD card.")
         }
+    }
+
+    private val pickFolderToSend = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
+        tree?.let(::reviewFolder)
     }
 
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -215,6 +235,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        searchWorker.shutdownNow()
+        mediaWorker.shutdownNow()
+        updateWorker.shutdownNow()
+        mediaPreviews?.close()
         worker.shutdown()
         fileWorker.shutdown()
         super.onDestroy()
@@ -299,16 +323,21 @@ class MainActivity : ComponentActivity() {
 
     private fun refresh(prepending: Boolean = false) {
         val peer = store.peer()
-        val paired = peer != null
-        if (shownPeer != paired) {
+        val paired = peer != null && !addingComputer
+        if (shownPeer != paired || shownFingerprint != peer?.fingerprint) {
+            val changedDesktop = shownFingerprint != peer?.fingerprint
             shownPeer = paired
-            if (!paired) {
+            shownFingerprint = peer?.fingerprint
+            if (!paired || changedDesktop) {
                 page = Page.CHAT
                 drafts.clear()
-                tempArmed = false
+                tempTtl = null
                 selecting = false
                 selectedSeqs.clear()
-            } else {
+                loadedFrom = null
+                earlierThan = null
+            }
+            if (paired) {
                 chatId = store.activeChatId()
             }
             showPage()
@@ -319,11 +348,11 @@ class MainActivity : ComponentActivity() {
         }
         normalToolbar.visibility = if (selecting) View.GONE else View.VISIBLE
         selectionToolbar.visibility = if (selecting) View.VISIBLE else View.GONE
-        menu.visibility = if (paired) View.VISIBLE else View.GONE
+        menu.contentDescription = if (paired) "Chat options" else "App options"
         headerBack.visibility = if (paired && page != Page.CHATS) View.VISIBLE else View.GONE
         headerMark.visibility = if (paired && page != Page.CHATS) View.GONE else View.VISIBLE
         headerAvatar.visibility = if (paired && page == Page.CHAT) View.VISIBLE else View.GONE
-        back.isEnabled = selecting || (paired && page != Page.CHATS)
+        back.isEnabled = addingComputer || selecting || (paired && page != Page.CHATS)
         val connection = when {
             !paired -> null
             !store.backgroundEnabled() -> "Paused"
@@ -361,6 +390,10 @@ class MainActivity : ComponentActivity() {
                 updateTimeline(items, hasEarlier = false)
                 receivedClear?.isEnabled = items.isNotEmpty()
                 receivedClear?.alpha = if (items.isEmpty()) 0.5f else 1f
+            }
+            Page.MEDIA -> {
+                headerTitle.text = "Shared Media"
+                sharedMedia?.refresh()
             }
             Page.CHAT -> {
                 val chats = store.chats()
@@ -422,18 +455,25 @@ class MainActivity : ComponentActivity() {
         tempInnerHalo = null
         tempIconView = null
         tempBanner = null
+        tempDetail = null
         emptyState = null
         receivedClear = null
         messages = null
         timelineList = null
         rooms = null
+        sharedMedia = null
         replyArea = null
         val view = if (shownPeer != true) pairingView() else when (page) {
             Page.CHATS -> chatsView()
             Page.CHAT, Page.RECEIVED -> deviceView()
+            Page.MEDIA -> SharedMediaView(
+                this, ui, store, chatId, previews(), mediaWorker, ::openSharedFile, ::openSharedLink,
+            ).also { sharedMedia = it }
         }
         content.addView(view, FrameLayout.LayoutParams(MATCH, MATCH))
     }
+
+    private fun previews(): MediaPreviews = mediaPreviews ?: MediaPreviews(this, store).also { mediaPreviews = it }
 
     private fun pairingView(): View {
         val scroll = ScrollView(this).apply { isFillViewport = true }
@@ -775,7 +815,9 @@ class MainActivity : ComponentActivity() {
             screen.addView(controls, LinearLayout.LayoutParams(MATCH, WRAP))
         }
         val timeline = FrameLayout(this)
-        val list = ChatViewport(this, tracksLatest = page == Page.CHAT).apply {
+        val list = ChatViewport(this, tracksLatest = page == Page.CHAT,
+            onSwipeReply = if (page == Page.CHAT) ::replyTo else null,
+        ).apply {
             divider = null
             dividerHeight = 0
             isVerticalScrollBarEnabled = false
@@ -787,8 +829,8 @@ class MainActivity : ComponentActivity() {
                 transcriptMode = ListView.TRANSCRIPT_MODE_DISABLED
             }
             messages = ChatTimelineAdapter(
-                this@MainActivity, ui, store, page == Page.RECEIVED,
-                ::loadOlder, ::openFile, ::showFullMessage, ::showMessageMenu, ::toggleSelect,
+                this@MainActivity, ui, store, previews(), page == Page.RECEIVED,
+                ::loadOlder, ::openFile, ::showFullMessage, ::showMessageMenu, ::toggleSelect, ::controlTransfer,
             )
             adapter = messages
         }
@@ -874,12 +916,14 @@ class MainActivity : ComponentActivity() {
             setPadding(ui.dp(12), ui.dp(3), ui.dp(4), ui.dp(3))
             addView(ui.symbol(R.drawable.ic_chat_timer, ui.accent),
                 LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)).apply { marginEnd = ui.dp(8) })
-            addView(ui.label("Temporary message · Auto-deletes in 10 min", 12, ui.accent, bold = true).apply {
+            val detail = ui.label("", 12, ui.accent, bold = true).apply {
                 setSingleLine(true)
                 ellipsize = TextUtils.TruncateAt.END
-            }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            }
+            tempDetail = detail
+            addView(detail, LinearLayout.LayoutParams(0, WRAP, 1f))
             addView(ui.iconAction(R.drawable.ic_chat_close, "Turn off temporary message") {
-                setTempArmed(false)
+                setTempTimer(null)
             }, LinearLayout.LayoutParams(ui.dp(38), ui.dp(38)))
         }
         card.addView(tempBanner, LinearLayout.LayoutParams(MATCH, WRAP))
@@ -901,11 +945,11 @@ class MainActivity : ComponentActivity() {
         tempInnerHalo = halo
         tempIconView = timerImg
         tempButton = FrameLayout(this).apply {
-            contentDescription = "One-time 10-minute temporary message"
+            contentDescription = "Choose a temporary message timer"
             isFocusable = true
             addView(halo, FrameLayout.LayoutParams(ui.dp(38), ui.dp(38), Gravity.CENTER))
             addView(timerImg, FrameLayout.LayoutParams(ui.dp(20), ui.dp(20), Gravity.CENTER))
-            setOnClickListener { setTempArmed(!tempArmed) }
+            setOnClickListener { chooseTempTimer() }
         }
         controls.addView(tempButton, LinearLayout.LayoutParams(ui.dp(42), ui.dp(46)).apply {
             marginEnd = ui.dp(2)
@@ -931,16 +975,31 @@ class MainActivity : ComponentActivity() {
         return composerPanel
     }
 
-    private fun setTempArmed(armed: Boolean) {
-        tempArmed = armed
+    private fun chooseTempTimer() {
+        val choices = listOf(null) + TEMP_TIMERS.keys
+        val labels = choices.map { TEMP_TIMERS[it] ?: "Off" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Temporary message timer")
+            .setSingleChoiceItems(labels, choices.indexOf(tempTtl)) { dialog, index ->
+                setTempTimer(choices[index])
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun setTempTimer(ttl: Long?) {
+        tempTtl = ttl
         updateTempUi()
     }
 
     private fun updateTempUi() {
-        tempBanner?.visibility = if (tempArmed) View.VISIBLE else View.GONE
-        tempInnerHalo?.background = if (tempArmed) ui.tapShape(ui.mint, 19, ui.accent)
+        val armed = tempTtl != null
+        tempDetail?.text = tempTtl?.let { "Temporary message · Expires in ${TEMP_TIMERS.getValue(it)}" }
+        tempBanner?.visibility = if (armed) View.VISIBLE else View.GONE
+        tempInnerHalo?.background = if (armed) ui.tapShape(ui.mint, 19, ui.accent)
         else ui.tapShape(android.graphics.Color.TRANSPARENT, 19)
-        tempIconView?.imageTintList = ColorStateList.valueOf(if (tempArmed) ui.accent else ui.muted)
+        tempIconView?.imageTintList = ColorStateList.valueOf(if (armed) ui.accent else ui.muted)
     }
 
     private fun fillReplyArea() {
@@ -980,8 +1039,9 @@ class MainActivity : ComponentActivity() {
         pairError?.visibility = View.GONE
         hideKeyboard()
         worker.execute {
+            var pairedPeer: Peer? = null
             val error = try {
-                PortalClient.pair(applicationContext, link)
+                pairedPeer = PortalClient.pair(applicationContext, link)
                 null
             } catch (issue: IllegalArgumentException) {
                 issue.message ?: "The pairing invite is invalid."
@@ -995,6 +1055,8 @@ class MainActivity : ComponentActivity() {
                 pairButton?.isEnabled = true
                 pairButton?.text = "Pair & enable background"
                 if (error == null) {
+                    addingComputer = false
+                    pairedPeer?.let { TransferService.selectDesktop(this, it.fingerprint) }
                     refresh()
                     enableBackground()
                 } else showPairError(error)
@@ -1026,10 +1088,10 @@ class MainActivity : ComponentActivity() {
         val destination = chatId
         val sendingTimeline = timelineList
         val reply = drafts[destination]?.reply?.item?.id
-        val ttlSec = if (tempArmed) TEMP_MESSAGE_TTL_SEC else null
+        val ttlSec = tempTtl
         if (queueingText) return
         queueingText = true
-        if (tempArmed) setTempArmed(false)
+        if (ttlSec != null) setTempTimer(null)
         worker.execute {
             val error = try {
                 store.enqueueText(text, destination, reply, ttlSec)
@@ -1051,7 +1113,7 @@ class MainActivity : ComponentActivity() {
                     }
                     refreshAfterSend(destination, sendingTimeline)
                 } else {
-                    if (ttlSec != null) setTempArmed(true)
+                    if (ttlSec != null && chatId == destination && tempTtl == null) setTempTimer(ttlSec)
                     notifyUser(error)
                 }
             }
@@ -1059,6 +1121,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun consumeIntent(request: Intent) {
+        val target = request.getStringExtra(TransferService.EXTRA_DESKTOP)
+        if (target != null && target != store.peer()?.fingerprint) {
+            if (!canSwitchDesktop() || !TransferService.selectDesktop(this, target)) return
+            addingComputer = false
+            refresh()
+        }
         request.getStringExtra(TransferService.EXTRA_CHAT_ID)
             ?.takeIf { id -> store.chats().any { it.id == id } }
             ?.let(::activateChat)
@@ -1119,7 +1187,7 @@ class MainActivity : ComponentActivity() {
         val originalPeer = store.peer()?.fingerprint ?: return
         val title = store.chats().firstOrNull { it.id == destination }?.title ?: "Chat"
         val reply = drafts[destination]?.reply?.item?.id
-        val ttlSec = if (tempArmed) TEMP_MESSAGE_TTL_SEC else null
+        val ttlSec = tempTtl
         stagingFiles = true
         updateFileButton()
         worker.execute {
@@ -1146,7 +1214,7 @@ class MainActivity : ComponentActivity() {
     ) {
         val body = ui.column().apply {
             setPadding(ui.dp(22), ui.dp(10), ui.dp(22), ui.dp(6))
-            val subtitle = if (ttlSec != null) "Send to $title · Auto-deletes in 10 min" else "Send to $title"
+            val subtitle = if (ttlSec != null) "Send to $title · Expires in ${TEMP_TIMERS.getValue(ttlSec)}" else "Send to $title"
             addView(ui.label(subtitle, 14, if (ttlSec != null) ui.accent else ui.muted))
             names.forEach { name ->
                 val file = ui.row()
@@ -1173,40 +1241,108 @@ class MainActivity : ComponentActivity() {
         dialog.show()
     }
 
+    private fun pickFolder() {
+        if (stagingFiles || attachmentReview != null) {
+            notifyUser("Finish the current file selection first.")
+            return
+        }
+        try {
+            pickFolderToSend.launch(null)
+        } catch (_: ActivityNotFoundException) {
+            notifyUser("No folder picker is available on this phone.")
+        }
+    }
+
+    private fun reviewFolder(tree: Uri) {
+        if (tree.scheme != "content" || !DocumentsContract.isTreeUri(tree) ||
+            stagingFiles || attachmentReview != null
+        ) return
+        val peer = store.peer()?.fingerprint ?: return
+        val destination = if (page == Page.CHAT) chatId else store.activeChatId()
+        val title = store.chats().firstOrNull { it.id == destination }?.title ?: "Chat"
+        val reply = drafts[destination]?.reply?.item?.id
+        val ttlSec = tempTtl
+        stagingFiles = true
+        updateFileButton()
+        fileWorker.execute {
+            val folder = runCatching { store.folderName(tree) }
+            onUi {
+                stagingFiles = false
+                updateFileButton()
+                if (isFinishing || store.peer()?.fingerprint != peer) return@onUi
+                val name = folder.getOrElse { error ->
+                    val reason = (error as? IllegalArgumentException)?.message
+                    notifyUser(reason ?: "Could not read the selected folder.")
+                    return@onUi
+                }
+                val body = ui.column().apply {
+                    setPadding(ui.dp(22), ui.dp(10), ui.dp(22), ui.dp(8))
+                    addView(ui.label(name, 17, ui.ink, bold = true))
+                    addWithGap(ui.label("Send to ${title}", 14, ui.muted), 5)
+                    addWithGap(ui.label("Includes files in this folder and its subfolders.", 14, ui.muted), 13)
+                }
+                val dialog = AlertDialog.Builder(this)
+                    .setTitle("Review folder")
+                    .setView(body)
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Send folder") { _, _ ->
+                        importIntoChat(destination, reply, peer, ttlSec, "Preparing folder…") { onQueued ->
+                            val count = store.enqueueFolder(tree, destination, reply, ttlSec)
+                            if (count > 0) onQueued()
+                            BatchEnqueueResult(count, emptyList())
+                        }
+                    }.create()
+                dialog.setOnDismissListener { if (attachmentReview === dialog) attachmentReview = null }
+                attachmentReview = dialog
+                dialog.show()
+            }
+        }
+    }
+
     private fun enqueueAttachments(
         uris: List<Uri>, destination: String, reply: String?, peer: String, ttlSec: Long?,
+    ) {
+        val notice = if (uris.size == 1) "Preparing file…" else "Adding ${uris.size} files…"
+        importIntoChat(destination, reply, peer, ttlSec, notice) { onQueued ->
+            store.enqueueFiles(
+                uris = uris,
+                chatId = destination,
+                replyTo = reply,
+                ttlSec = ttlSec,
+                onFileQueued = onQueued,
+            )
+        }
+    }
+
+    private fun importIntoChat(
+        destination: String, reply: String?, peer: String, ttlSec: Long?, notice: String,
+        enqueue: (() -> Unit) -> BatchEnqueueResult,
     ) {
         if (stagingFiles || store.peer()?.fingerprint != peer) return
         val sendingTimeline = timelineList?.takeIf { page == Page.CHAT && chatId == destination }
         stagingFiles = true
         updateFileButton()
-        if (ttlSec != null && tempArmed) setTempArmed(false)
-        notifyUser(if (uris.size == 1) "Preparing file…" else "Adding ${uris.size} files…")
+        if (ttlSec != null && tempTtl == ttlSec) setTempTimer(null)
+        notifyUser(notice)
         fileWorker.execute {
             var draftCleared = false
             val result = try {
                 if (store.peer()?.fingerprint != peer) throw IOException("The paired computer changed.")
-                store.enqueueFiles(
-                    uris = uris,
-                    chatId = destination,
-                    replyTo = reply,
-                    ttlSec = ttlSec,
-                    onFileQueued = {
-                        TransferService.wake()
-                        onUi {
-                            if (!draftCleared) {
-                                draftCleared = true
-                                val draft = drafts[destination]
-                                if (draft?.reply?.item?.id == reply && draft != null) {
-                                    val currentText = if (destination == chatId) composer?.text?.toString() else null
-                                    drafts[destination] = Draft(currentText ?: draft.text, null)
-                                }
-                                fillReplyArea()
+                enqueue {
+                    TransferService.wake()
+                    onUi {
+                        if (!draftCleared) {
+                            draftCleared = true
+                            val draft = drafts[destination]
+                            if (draft?.reply?.item?.id == reply && draft != null) {
+                                val currentText = if (destination == chatId) composer?.text?.toString() else null
+                                drafts[destination] = Draft(currentText ?: draft.text, null)
                             }
-                            refreshAfterSend(destination, sendingTimeline)
+                            fillReplyArea()
                         }
-                    },
-                )
+                        refreshAfterSend(destination, sendingTimeline)
+                    }
+                }
             } catch (error: Exception) {
                 BatchEnqueueResult(0, listOf("Files" to (error.message ?: "Check access and available storage.")))
             }
@@ -1220,7 +1356,7 @@ class MainActivity : ComponentActivity() {
                     }
                     refreshAfterSend(destination, sendingTimeline)
                 } else {
-                    if (ttlSec != null) setTempArmed(true)
+                    if (ttlSec != null && chatId == destination && tempTtl == null) setTempTimer(ttlSec)
                     val reason = result.failed.firstOrNull()?.second ?: "Check access and available storage."
                     notifyUser("Could not add files: $reason")
                 }
@@ -1240,29 +1376,120 @@ class MainActivity : ComponentActivity() {
         fileButton?.alpha = if (stagingFiles) 0.45f else 1f
     }
 
+    private fun showMessageSearch() {
+        val body = ui.column().apply { setPadding(ui.dp(20), ui.dp(8), ui.dp(20), 0) }
+        val field = ui.entry("Search message text or filenames", InputType.TYPE_CLASS_TEXT).apply {
+            filters = arrayOf(InputFilter.LengthFilter(256))
+        }
+        val results = ui.column()
+        val scroller = ScrollView(this).apply { addView(results) }
+        body.addView(field, LinearLayout.LayoutParams(MATCH, WRAP))
+        body.addView(scroller, LinearLayout.LayoutParams(MATCH, ui.dp(350)))
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Search messages")
+            .setView(body)
+            .setNegativeButton("Close", null)
+            .create()
+        var pending: Runnable? = null
+        var running: java.util.concurrent.Future<*>? = null
+        var generation = 0
+        fun cancelSearch() {
+            generation++
+            pending?.let(mainHandler::removeCallbacks)
+            running?.cancel(true)
+        }
+        field.doAfterTextChanged { edit ->
+            cancelSearch()
+            results.removeAllViews()
+            val query = edit?.toString()?.trim().orEmpty()
+            if (query.isEmpty()) return@doAfterTextChanged
+            val request = generation
+            results.addView(ui.label("Searching…", 14, ui.muted))
+            pending = Runnable {
+                if (isDestroyed || isFinishing || !dialog.isShowing) return@Runnable
+                running = searchWorker.submit {
+                    val matches = runCatching { store.searchMessages(query) }.getOrNull()
+                    val titles = if (matches.isNullOrEmpty()) emptyMap() else {
+                        runCatching { store.chats().associate { it.id to it.title } }.getOrDefault(emptyMap())
+                    }
+                    onUi {
+                        if (!dialog.isShowing || request != generation) return@onUi
+                        results.removeAllViews()
+                        if (matches.isNullOrEmpty()) {
+                            results.addView(ui.label(
+                                if (matches == null) "Could not search messages." else "No matching messages or files",
+                                14, ui.muted,
+                            ))
+                            return@onUi
+                        }
+                        for (row in matches) {
+                            val label = ui.label(previewOf(row), 15, ui.ink, bold = true).apply {
+                                maxLines = 2
+                                ellipsize = TextUtils.TruncateAt.END
+                            }
+                            val target = titles[row.item.chatId] ?: "Chat"
+                            val card = ui.column().apply {
+                                setPadding(ui.dp(8), ui.dp(10), ui.dp(8), ui.dp(10))
+                                background = ui.tapShape(ui.surface, 10)
+                                addView(label)
+                                addView(ui.label(target, 12, ui.muted))
+                                isFocusable = true
+                                setOnClickListener {
+                                    dialog.dismiss()
+                                    when {
+                                        row.item.kind == "text" && canRead(row) -> showFullMessage(row)
+                                        row.downloadUri != null -> openFile(row)
+                                        else -> activateChat(row.item.chatId)
+                                    }
+                                }
+                            }
+                            results.addView(card)
+                            results.addView(ui.rule())
+                        }
+                    }
+                }
+            }.also { mainHandler.postDelayed(it, 250) }
+        }
+        dialog.setOnDismissListener { cancelSearch() }
+        dialog.show()
+    }
+
     private fun showMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
-            if (page == Page.CHAT || page == Page.RECEIVED) {
-                if (messages?.visibleItems().orEmpty().isNotEmpty()) {
-                    menu.add(0, MENU_SELECT, 0, "Select messages")
+            if (store.peer() != null && !addingComputer) {
+                if (page == Page.CHAT || page == Page.RECEIVED) {
+                    if (messages?.visibleItems().orEmpty().isNotEmpty()) {
+                        menu.add(0, MENU_SELECT, 0, "Select messages")
+                    }
                 }
+                if (page == Page.CHAT) {
+                    menu.add(0, MENU_RENAME, 1, "Rename chat")
+                    if (store.chats().size > 1) menu.add(0, MENU_DELETE_CHAT, 2, "Delete chat")
+                    menu.add(0, MENU_MEDIA, 3, "Shared Media")
+                    menu.add(0, MENU_SEND_FOLDER, 3, "Send folder").isEnabled = !stagingFiles
+                    menu.add(0, MENU_RECEIVED, 4, "Received files")
+                }
+                menu.add(0, MENU_NOTIFICATIONS, 4, "Notifications & sounds")
+                menu.add(0, MENU_SEARCH, 4, "Search messages")
+                menu.add(0, MENU_SAVE_LOCATION, 5, "Save location")
+                menu.add(0, MENU_PAUSE, 6, if (store.backgroundEnabled()) "Pause connection" else "Resume connection")
+                menu.add(0, MENU_FORGET, 7, "Forget this computer")
+                menu.add(0, MENU_COMPUTERS, 7, "Paired computers").isEnabled = canSwitchDesktop()
+            } else if (addingComputer) {
+                menu.add(0, MENU_CANCEL_PAIR, 7, "Cancel pairing").isEnabled = !pairing
             }
-            if (page == Page.CHAT) {
-                menu.add(0, MENU_RENAME, 1, "Rename chat")
-                if (store.chats().size > 1) menu.add(0, MENU_DELETE_CHAT, 2, "Delete chat")
-                menu.add(0, MENU_RECEIVED, 3, "Received files")
-            }
-            menu.add(0, MENU_NOTIFICATIONS, 4, "Notifications & sounds")
-            menu.add(0, MENU_SAVE_LOCATION, 5, "Save location")
-            menu.add(0, MENU_PAUSE, 6, if (store.backgroundEnabled()) "Pause connection" else "Resume connection")
-            menu.add(0, MENU_FORGET, 7, "Forget this computer")
+            menu.add(0, MENU_CHECK_UPDATES, 8, "Check for updates").isEnabled = !checkingForUpdates
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_SELECT -> enterSelection()
                     MENU_RENAME -> currentChat()?.let(::renameChat)
                     MENU_DELETE_CHAT -> currentChat()?.let(::confirmDeleteChat)
+                    MENU_MEDIA -> switchPage(Page.MEDIA)
+                    MENU_SEND_FOLDER -> pickFolder()
                     MENU_RECEIVED -> switchPage(Page.RECEIVED)
+                    MENU_SEARCH -> showMessageSearch()
                     MENU_NOTIFICATIONS -> showNotificationSettings()
+                    MENU_CHECK_UPDATES -> checkForUpdates()
                     MENU_SAVE_LOCATION -> showSaveLocationSettings()
                     MENU_PAUSE -> {
                         if (store.backgroundEnabled()) TransferService.pause(this@MainActivity)
@@ -1270,10 +1497,54 @@ class MainActivity : ComponentActivity() {
                         refresh()
                     }
                     MENU_FORGET -> forgetComputer()
+                    MENU_COMPUTERS -> showPairedComputers()
+                    MENU_CANCEL_PAIR -> {
+                        addingComputer = false
+                        refresh()
+                    }
                 }
                 true
             }
             show()
+        }
+    }
+
+    private fun checkForUpdates() {
+        if (checkingForUpdates) return
+        checkingForUpdates = true
+        notifyUser("Checking for updates…")
+        updateWorker.execute {
+            val result = runCatching {
+                val current = if (Build.VERSION.SDK_INT >= 33) {
+                    packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0)).versionName
+                } else {
+                    @Suppress("DEPRECATION")
+                    packageManager.getPackageInfo(packageName, 0).versionName
+                }
+                AppUpdates.newerThan(current.orEmpty())
+            }
+            onUi {
+                checkingForUpdates = false
+                if (isFinishing) return@onUi
+                result.onSuccess { release ->
+                    val dialog = AlertDialog.Builder(this).setNegativeButton("Close", null)
+                    if (release == null) {
+                        dialog.setTitle("No update available")
+                            .setMessage("Your app is up to date.")
+                    } else {
+                        dialog.setTitle("Update available")
+                            .setMessage("Portal Drop ${release.tag} is available on GitHub.")
+                            .setPositiveButton("Open release") { _, _ -> openSharedLink(release.page) }
+                    }
+                    dialog.show()
+                }.onFailure {
+                    AlertDialog.Builder(this)
+                        .setTitle("Could not check for updates")
+                        .setMessage("Check your internet connection and try again.")
+                        .setPositiveButton("Close", null)
+                        .show()
+                }
+            }
         }
     }
 
@@ -1405,6 +1676,32 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
+    private fun canSwitchDesktop(): Boolean = !stagingFiles && !queueingText && attachmentReview == null && !pairing
+
+    private fun showPairedComputers() {
+        val peers = store.rememberedPeers()
+        val active = store.peer()?.fingerprint
+        val labels = peers.map { peer ->
+            val name = peer.name ?: peer.platformLabel()
+            if (peer.fingerprint == active) "$name · Active" else name
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Paired computers")
+            .setItems(labels) { _, index ->
+                if (canSwitchDesktop() && TransferService.selectDesktop(this, peers[index].fingerprint)) {
+                    refresh()
+                }
+            }
+            .setPositiveButton("Add a computer") { _, _ ->
+                if (canSwitchDesktop()) {
+                    addingComputer = true
+                    refresh()
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
     private fun forgetComputer() {
         val platform = store.peer()?.platformLabel() ?: "your computer"
         AlertDialog.Builder(this)
@@ -1412,11 +1709,11 @@ class MainActivity : ComponentActivity() {
             .setMessage("To pair again, unpair on $platform (or run portal-drop unpair) and create a new invite.")
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Forget") { _, _ ->
+                if (!canSwitchDesktop()) return@setPositiveButton
+                val enabled = store.backgroundEnabled()
                 TransferService.pause(this)
                 store.forgetPeer()
-                loadedFrom = null
-                earlierThan = null
-                    refresh()
+                if (enabled && store.peer() != null) enableBackground() else refresh()
             }.show()
     }
 
@@ -1439,11 +1736,14 @@ class MainActivity : ComponentActivity() {
                 menu.add(0, MESSAGE_COPY, 2, "Copy exact text")
                 if (message.item.textSize != null) menu.add(0, MESSAGE_FULL, 3, "View full message")
             }
-            if (message.item.kind == "file" && message.incoming && message.delivered && message.downloadUri != null) {
+            if (message.item.kind == "file" && message.localFileUri() != null) {
                 menu.add(0, MESSAGE_OPEN, 3, "Open with app")
-                menu.add(0, MESSAGE_OPEN_FOLDER, 4, "Open in folder")
+                if (message.incoming) menu.add(0, MESSAGE_OPEN_FOLDER, 4, "Open in folder")
             }
-            menu.add(0, MESSAGE_DELETE, 5, "Delete here")
+            for (action in message.availableTransferActions()) {
+                menu.add(0, MESSAGE_TRANSFER_BASE + action.ordinal, 5, "${action.label} transfer")
+            }
+            menu.add(0, MESSAGE_DELETE, 6, "Delete here")
             setOnMenuItemClickListener { option ->
                 when (option.itemId) {
                     MESSAGE_REPLY -> replyTo(message)
@@ -1453,10 +1753,34 @@ class MainActivity : ComponentActivity() {
                     MESSAGE_OPEN -> openFile(message, forceChooser = true)
                     MESSAGE_OPEN_FOLDER -> openFileFolder(message)
                     MESSAGE_DELETE -> deleteMessage(message)
+                    else -> TransferAction.entries.getOrNull(option.itemId - MESSAGE_TRANSFER_BASE)?.let {
+                        controlTransfer(message, it)
+                    }
                 }
                 true
             }
             show()
+        }
+    }
+
+    private fun controlTransfer(message: ChatItem, action: TransferAction) {
+        if (action == TransferAction.CANCEL) {
+            AlertDialog.Builder(this)
+                .setTitle("Cancel transfer?")
+                .setMessage(message.item.name.orEmpty())
+                .setNegativeButton("Keep transfer", null)
+                .setPositiveButton("Cancel transfer") { _, _ -> applyTransferAction(message, action) }
+                .show()
+        } else applyTransferAction(message, action)
+    }
+
+    private fun applyTransferAction(message: ChatItem, action: TransferAction) {
+        worker.execute {
+            val changed = runCatching { TransferService.control(applicationContext, message, action) }.getOrDefault(false)
+            onUi {
+                refresh()
+                if (!changed) notifyUser("This transfer is no longer available for that action.")
+            }
         }
     }
 
@@ -1725,8 +2049,25 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
+    private fun openSharedFile(row: ChatItem) {
+        if (row.localFileUri() == null) {
+            notifyUser("The original file is unavailable on this phone.")
+        } else openFile(row)
+    }
+
+    private fun openSharedLink(uri: Uri) {
+        if ((uri.scheme != "https" && uri.scheme != "http") || uri.host.isNullOrBlank()) return
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+        } catch (_: ActivityNotFoundException) {
+            notifyUser("No web browser is available.")
+        } catch (_: SecurityException) {
+            notifyUser("This link could not be opened.")
+        }
+    }
+
     private fun openFile(row: ChatItem, forceChooser: Boolean = false) {
-        val uri = row.downloadUri ?: return
+        val uri = row.localFileUri() ?: return
         val providerType = try { contentResolver.getType(uri) } catch (_: RuntimeException) { null }
         val mime = resolveMimeType(row.item.name, providerType)
 
@@ -1791,6 +2132,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
+        val TEMP_TIMERS = linkedMapOf(300L to "5 minutes", TEMP_MESSAGE_TTL_SEC to "10 minutes", 3600L to "1 hour", 86400L to "24 hours")
         const val MENU_SELECT = 1
         const val MENU_RENAME = 2
         const val MENU_DELETE_CHAT = 3
@@ -1799,6 +2141,12 @@ class MainActivity : ComponentActivity() {
         const val MENU_FORGET = 6
         const val MENU_NOTIFICATIONS = 7
         const val MENU_SAVE_LOCATION = 8
+        const val MENU_SEARCH = 9
+        const val MENU_MEDIA = 10
+        const val MENU_CHECK_UPDATES = 11
+        const val MENU_SEND_FOLDER = 12
+        const val MENU_COMPUTERS = 13
+        const val MENU_CANCEL_PAIR = 14
         const val CHAT_MENU_RENAME = 1
         const val CHAT_MENU_DELETE = 2
         const val MESSAGE_REPLY = 1
@@ -1808,6 +2156,7 @@ class MainActivity : ComponentActivity() {
         const val MESSAGE_OPEN = 5
         const val MESSAGE_OPEN_FOLDER = 6
         const val MESSAGE_DELETE = 7
+        const val MESSAGE_TRANSFER_BASE = 20
         const val DIRECT_CLIPBOARD_BYTES = 128 * 1024
         const val FULL_MESSAGE_VIEW_BYTES = 256 * 1024
     }

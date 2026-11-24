@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Portal Drop desktop window — GTK 3 + WebKit2GTK 4.1 host for the shared web UI."""
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,11 +19,25 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, WebKit2
+
+typelibs = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "portal-drop/typelibs"
+if typelibs.is_dir():
+    gi.require_version("GIRepository", "2.0")
+    from gi.repository import GIRepository
+    GIRepository.Repository.prepend_search_path(str(typelibs))
+
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3
+except (ImportError, ValueError):
+    AyatanaAppIndicator3 = None
 
 APP_ID = "app.portaldrop"
 DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001"
 PAGE = 50
+CLIPBOARD_IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+MAX_CLIPBOARD_IMAGE = 16 * 1024 * 1024
 
 
 def resolve_portal_binary():
@@ -172,10 +188,10 @@ def load_prefs():
         raw = prefs_path().read_text(encoding="utf-8")
         data = json.loads(raw)
         if isinstance(data, dict):
-            return {"theme": "light", **data}
+            return {"theme": "light", "minimizeToTray": False, **data}
     except Exception:
         pass
-    return {"theme": "light"}
+    return {"theme": "light", "minimizeToTray": False}
 
 
 def save_prefs(prefs):
@@ -243,7 +259,7 @@ def show_in_file_manager(path_str):
 
 def queue_files_cli(payload, paths):
     chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
-    base_args = ["send-file", "--chat", chat_id]
+    base_args = ["--chat", chat_id]
     if payload.get("replyTo"):
         base_args.extend(["--reply-to", str(payload["replyTo"])])
     if payload.get("ttl"):
@@ -253,17 +269,279 @@ def queue_files_cli(payload, paths):
     errors = []
     for raw in paths:
         p = Path(raw)
-        if not p.is_file():
+        if not p.is_file() and not p.is_dir():
             skipped += 1
             continue
         try:
-            run_cli(*base_args, str(p))
-            sent += 1
+            if p.is_dir():
+                sent += get_json("send-folder", *base_args, "--", str(p))["sent"]
+            else:
+                run_cli("send-file", *base_args, "--", str(p))
+                sent += 1
         except (OSError, subprocess.CalledProcessError) as error:
             errors.append(f"{p.name}: {error_details(error)}")
     if errors and sent == 0:
         raise RuntimeError("\n".join(errors))
     return {"sent": sent, "skipped": skipped, "errors": errors}
+
+
+class PortalTray:
+    watcher_name = "org.kde.StatusNotifierWatcher"
+
+    def __init__(self, window):
+        self.window = window
+        self.available = False
+        self.hidden = False
+        self.closed = False
+        self.busy = False
+        self.cursor = None
+        self.unread = 0
+        self.chat_id = DEFAULT_CHAT
+        self.active = True
+        self.status = {}
+        self.indicator = None
+        self.watcher = None
+        self.watcher_has_host = False
+        self.indicator_connected = False
+        self.badge_dir = None
+        self.displayed_badge = None
+        self.cancellable = Gio.Cancellable()
+
+        self.menu = Gtk.Menu()
+        self.summary = Gtk.MenuItem.new_with_label("Waiting")
+        self.summary.set_sensitive(False)
+        self.menu.append(self.summary)
+        self.add_item("Open Portal Drop", window.get_application().activate)
+        self.clipboard_item = self.add_item("Send clipboard", self.send_clipboard)
+        self.service_item = self.add_item("Pause service", self.toggle_service)
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.add_item("Quit Portal Drop", window.close_for_real)
+        self.menu.show_all()
+
+        self.legacy = Gtk.StatusIcon.new_from_icon_name(APP_ID)
+        self.legacy.set_title("Portal Drop")
+        self.legacy.connect("activate", lambda *_: window.get_application().activate())
+        self.legacy.connect("popup-menu", self.popup)
+        self.legacy.connect("notify::embedded", lambda *_: self.update_availability())
+        self.timer = GLib.timeout_add_seconds(5, self.poll)
+        if AyatanaAppIndicator3 is not None:
+            Gio.DBusProxy.new_for_bus(
+                Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+                self.watcher_name, "/StatusNotifierWatcher", self.watcher_name,
+                self.cancellable, self.watcher_ready, None,
+            )
+        self.update_availability()
+        self.render()
+
+    def add_item(self, label, action):
+        item = Gtk.MenuItem.new_with_label(label)
+        item.connect("activate", lambda *_: action())
+        self.menu.append(item)
+        return item
+
+    def popup(self, icon, button, timestamp):
+        self.menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, timestamp)
+
+    def watcher_ready(self, _source, result, _data):
+        if self.closed:
+            return
+        try:
+            self.watcher = Gio.DBusProxy.new_for_bus_finish(result)
+        except GLib.Error:
+            return
+        self.watcher.connect("notify::g-name-owner", self.check_watcher)
+        self.watcher.connect("g-properties-changed", self.check_watcher)
+        self.check_watcher()
+
+    def check_watcher(self, *_args):
+        if self.closed:
+            return
+        registered = self.watcher.get_cached_property("IsStatusNotifierHostRegistered")
+        self.watcher_has_host = bool(self.watcher.get_name_owner() and registered and registered.get_boolean())
+        if self.watcher_has_host and self.indicator is None:
+            api = AyatanaAppIndicator3
+            self.indicator = api.Indicator.new(APP_ID, APP_ID, api.IndicatorCategory.APPLICATION_STATUS)
+            self.indicator.connect("connection-changed", self.indicator_connection)
+            self.indicator.set_menu(self.menu)
+            self.render()
+        if self.indicator is not None:
+            status = AyatanaAppIndicator3.IndicatorStatus
+            self.indicator.set_status(status.ACTIVE if self.watcher_has_host else status.PASSIVE)
+        self.update_availability()
+
+    def indicator_connection(self, _indicator, connected):
+        self.indicator_connected = connected
+        self.update_availability()
+
+    def update_availability(self):
+        if self.closed:
+            return
+        use_indicator = self.watcher_has_host and self.indicator_connected
+        if self.legacy.get_visible() == use_indicator:
+            self.legacy.set_visible(not use_indicator)
+        available = use_indicator or self.legacy.is_embedded()
+        if available == self.available:
+            return
+        self.available = available
+        if self.hidden and not self.available:
+            self.window.get_application().activate()
+        self.window.js_call("__portalWake", {"reason": "tray"})
+        self.poll()
+
+    def set_snapshot(self, active, status, chat_id):
+        if not self.closed:
+            self.active, self.status, self.chat_id = active, status, chat_id
+            self.render()
+        return False
+
+    def mark_read(self, *_args):
+        if self.window.is_active() and self.unread:
+            self.unread = 0
+            self.render()
+
+    def poll(self):
+        if self.closed:
+            return False
+        if not self.available or self.busy:
+            return True
+        self.busy = True
+        cursor = self.cursor
+
+        def read():
+            active = service_active()
+            status = get_json("status", "--json")
+            if cursor is None:
+                latest = get_json("history", "--json", "--limit", "1")["items"]
+                return active, status, latest[0]["seq"] if latest else 0, 0
+            rows = get_json("events", "--json", "--after", str(cursor), "--limit", "200")
+            return (
+                active, status, rows[-1]["seq"] if rows else cursor,
+                sum(row["direction"] == "received" for row in rows),
+            )
+
+        def finished(job):
+            self.busy = False
+            if not self.closed:
+                try:
+                    self.active, self.status, self.cursor, incoming = job.result()
+                except (OSError, subprocess.CalledProcessError, ValueError):
+                    return False
+                if self.window.is_active():
+                    self.unread = 0
+                else:
+                    self.unread += incoming
+                self.render()
+            return False
+
+        self.window.work.submit(read).add_done_callback(lambda job: GLib.idle_add(finished, job))
+        return True
+
+    def render(self):
+        state = "Paused" if not self.active else "Connected" if self.status.get("connected") else "Waiting"
+        details = f"{state} · {self.unread} unread" if self.unread else state
+        self.summary.set_label(details)
+        self.legacy.set_tooltip_text(f"Portal Drop · {details}")
+        self.service_item.set_label("Pause service" if self.active else "Resume service")
+        self.clipboard_item.set_sensitive(bool(self.status.get("paired")))
+
+        badge = str(self.unread) if 0 < self.unread < 100 else ("99+" if self.unread else "")
+        if badge == self.displayed_badge:
+            if self.indicator is not None:
+                self.indicator.set_label(badge, "99+")
+            return
+        self.displayed_badge = badge
+        self.legacy.set_from_icon_name(APP_ID)
+        if self.indicator is not None:
+            self.indicator.set_icon_full(APP_ID, details)
+            self.indicator.set_label(badge, "99+")
+        if not badge:
+            return
+        try:
+            icon = Gtk.IconTheme.get_default().load_icon(APP_ID, 48, Gtk.IconLookupFlags.FORCE_SIZE).copy()
+            graphic = (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48">'
+                '<rect x="18" y="27" width="30" height="21" rx="9" fill="#00684d" stroke="#ffffff"/>'
+                f'<text x="33" y="42" text-anchor="middle" fill="#fff" font-size="15" '
+                f'font-family="sans-serif" font-weight="bold">{badge}</text></svg>'
+            )
+            overlay = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            overlay.write(graphic.encode("utf-8"))
+            overlay.close()
+            overlay.get_pixbuf().composite(
+                icon, 0, 0, 48, 48, 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255,
+            )
+            self.legacy.set_from_pixbuf(icon)
+            if self.indicator is not None:
+                if self.badge_dir is None:
+                    self.badge_dir = tempfile.TemporaryDirectory(prefix="portal-drop-tray-")
+                path = Path(self.badge_dir.name) / f"unread-{badge}.png"
+                icon.savev(str(path), "png", [], [])
+                self.indicator.set_icon_full(str(path), details)
+        except (GLib.Error, OSError, AttributeError):
+            pass
+
+    def toggle_service(self):
+        action = "stop" if self.active else "start"
+
+        def finished(job):
+            try:
+                job.result()
+            except (OSError, subprocess.CalledProcessError) as error:
+                self.feedback("Could not change Portal Drop service", error_details(error))
+            else:
+                self.active = action == "start"
+                self.render()
+                self.poll()
+                self.window.js_call("__portalWake", {"reason": "service"})
+            return False
+
+        self.window.work.submit(service_ctl, action).add_done_callback(lambda job: GLib.idle_add(finished, job))
+
+    def send_clipboard(self):
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        if clipboard is not None:
+            clipboard.request_text(self.clipboard_text, None)
+
+    def clipboard_text(self, _clipboard, text, _data):
+        if self.closed:
+            return
+        if not text or not text.strip():
+            self.feedback("Send clipboard", "The clipboard has no readable text.")
+            return
+        chat = self.chat_id
+
+        def queue():
+            destination = get_json("snapshot", "--chat", chat, "--limit", "1")["chat_id"]
+            run_cli("send-text", "--chat", destination, "--ttl", "300", "-", data=text)
+
+        def finished(job):
+            try:
+                job.result()
+            except (OSError, subprocess.CalledProcessError) as error:
+                self.feedback("Could not queue clipboard", error_details(error))
+            else:
+                self.feedback("Clipboard queued", "Temporary text will expire after five minutes.")
+            return False
+
+        self.window.work.submit(queue).add_done_callback(lambda job: GLib.idle_add(finished, job))
+
+    def feedback(self, title, body):
+        if self.closed:
+            return
+        notification = Gio.Notification.new(title)
+        notification.set_body(body)
+        notification.set_icon(Gio.ThemedIcon.new(APP_ID))
+        self.window.get_application().send_notification("portal-tray-action", notification)
+
+    def close(self):
+        self.closed = True
+        self.cancellable.cancel()
+        GLib.source_remove(self.timer)
+        self.legacy.set_visible(False)
+        if self.indicator is not None:
+            self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.PASSIVE)
+        if self.badge_dir is not None:
+            self.badge_dir.cleanup()
 
 
 class PortalWindow(Gtk.ApplicationWindow):
@@ -282,6 +560,8 @@ class PortalWindow(Gtk.ApplicationWindow):
         self.chrome_provider = Gtk.CssProvider()
 
         prefs = load_prefs()
+        self.minimize_to_tray = prefs.get("minimizeToTray") is True
+        self.force_close = False
         initial_theme = prefs.get("theme", "light")
         if initial_theme not in ("light", "dark"):
             initial_theme = self._detect_system_theme()
@@ -325,6 +605,7 @@ class PortalWindow(Gtk.ApplicationWindow):
         self.ui_uri = self.ui_file.as_uri()
         self.webview.connect("load-changed", self.on_load_changed)
         self.webview.connect("decide-policy", self.on_decide_policy)
+        self.webview.connect("key-press-event", self.on_clipboard_key)
 
         # Handle file drops before WebKit's handlers, including GTK's portal URI targets.
         self.webview.drag_dest_set(Gtk.DestDefaults(0), [], Gdk.DragAction.COPY)
@@ -348,6 +629,8 @@ class PortalWindow(Gtk.ApplicationWindow):
         self.webview.load_uri(self.ui_uri)
         self.connect("delete-event", self.on_close)
         self.show_all()
+        self.tray = PortalTray(self)
+        self.connect("notify::is-active", self.tray.mark_read)
         self.start_daemon_watcher()
 
     def _detect_system_theme(self):
@@ -381,6 +664,47 @@ class PortalWindow(Gtk.ApplicationWindow):
             for script in pending:
                 self._eval_js_now(script)
 
+    def on_clipboard_key(self, view, event):
+        modifiers = Gtk.accelerator_get_default_mod_mask()
+        if event.state & modifiers != Gdk.ModifierType.CONTROL_MASK or Gdk.keyval_to_lower(event.keyval) != Gdk.KEY_v:
+            return False
+        view.evaluate_javascript("document.activeElement?.id === 'composer' && typeof state !== 'undefined' ? state.chatId : ''", -1,
+                                 None, None, None, self.on_paste_focus, None)
+        return True
+
+    def on_paste_focus(self, view, result, _data):
+        if self.closed:
+            return
+        try:
+            chat_id = view.evaluate_javascript_finish(result).to_string()
+        except GLib.Error:
+            return
+        if not chat_id:
+            view.execute_editing_command("Paste")
+            return
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).request_targets(self.on_paste_targets, chat_id)
+
+    def on_paste_targets(self, clipboard, targets, _count, chat_id):
+        if self.closed:
+            return
+        available = {target.name(): target for target in targets or []}
+        for mime_type in CLIPBOARD_IMAGE_TYPES:
+            if mime_type in available:
+                clipboard.request_contents(available[mime_type], self.on_paste_image, (mime_type, chat_id))
+                return
+        self.webview.execute_editing_command("Paste")
+
+    def on_paste_image(self, _clipboard, selection, context):
+        if self.closed:
+            return
+        mime_type, chat_id = context
+        length = selection.get_length()
+        if length <= 0 or length > MAX_CLIPBOARD_IMAGE:
+            self.js_call("__portalClipboardImage", {"chatId": chat_id, "error": "Clipboard images must be between 1 byte and 16 MiB."})
+            return
+        encoded = base64.b64encode(selection.get_data()).decode("ascii")
+        self.js_call("__portalClipboardImage", {"chatId": chat_id, "mimeType": mime_type, "base64": encoded})
+
     def on_decide_policy(self, _webview, decision, decision_type):
         if decision_type in (
             WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
@@ -400,9 +724,23 @@ class PortalWindow(Gtk.ApplicationWindow):
         return False
 
     def on_close(self, _window, _event):
+        if self.minimize_to_tray and self.tray.available and not self.force_close:
+            self.tray.hidden = True
+            self.hide()
+            return True
         self.closed = True
+        self.tray.close()
         self.work.shutdown(wait=False, cancel_futures=True)
         return False
+
+    def close_for_real(self):
+        self.force_close = True
+        self.close()
+
+    def restore(self):
+        self.tray.hidden = False
+        self.show()
+        self.present()
 
     def _eval_js_now(self, script):
         if self.closed:
@@ -491,12 +829,18 @@ class PortalWindow(Gtk.ApplicationWindow):
                             event = line.strip()
                             if event and event != "ping":
                                 self.js_call("__portalWake", {"reason": event})
+                                if event in ("ready", "inbox", "presence", "pair"):
+                                    GLib.idle_add(self.poll_tray)
                 except OSError:
                     time.sleep(1.2)
                 except Exception:
                     time.sleep(2.0)
 
         threading.Thread(target=watch_loop, name="portal-drop-watch", daemon=True).start()
+
+    def poll_tray(self):
+        self.tray.poll()
+        return False
 
     def on_ipc_message(self, _ucm, js_result):
         try:
@@ -595,8 +939,10 @@ class PortalWindow(Gtk.ApplicationWindow):
             chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
             active = service_active()
             snap = get_json("snapshot", "--chat", chat_id, "--limit", str(PAGE))
+            GLib.idle_add(self.tray.set_snapshot, active, snap["status"], snap["chat_id"])
             return {
                 "serviceActive": active,
+                "trayAvailable": self.tray.available,
                 "status": snap["status"],
                 "chats": snap["chats"],
                 "chatId": snap["chat_id"],
@@ -608,16 +954,31 @@ class PortalWindow(Gtk.ApplicationWindow):
             chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
             before = str(int(payload.get("before", 0)))
             return get_json("history", "--json", "--chat", chat_id, "--before", before, "--limit", str(PAGE))
-        if action == "send_text":
+        if action == "search_messages":
+            return get_json("search", "--", str(payload.get("query") or ""))
+        if action == "shared_media":
+            args = ["shared-media", str(payload.get("tab") or "files")]
+            if payload.get("chatId"):
+                args.extend(["--chat", str(payload["chatId"])])
+            if payload.get("before") is not None:
+                args.extend(["--before", str(int(payload["before"]))])
+            return get_json(*args)
+        if action == "transfer_control":
+            return get_json(
+                "transfer-control", str(payload["direction"]), str(payload["id"]), str(payload["action"])
+            )
+        if action in ("send_text", "send_image"):
             chat_id = str(payload.get("chatId") or DEFAULT_CHAT)
-            text = str(payload.get("text") or "")
-            args = ["send-text", "--chat", chat_id]
+            is_text = action == "send_text"
+            data = str(payload.get("text" if is_text else "base64") or "")
+            args = ["send-text" if is_text else "send-image", "--chat", chat_id]
             if payload.get("replyTo"):
                 args.extend(["--reply-to", str(payload["replyTo"])])
             if payload.get("ttl"):
                 args.extend(["--ttl", str(int(payload["ttl"]))])
-            args.append("-")
-            run_cli(*args, data=text)
+            if is_text:
+                args.append("-")
+            run_cli(*args, data=data)
             return {"ok": True}
         if action == "send_files":
             paths = [str(p) for p in (payload.get("paths") or []) if p]
@@ -681,7 +1042,9 @@ class PortalWindow(Gtk.ApplicationWindow):
             service_ctl("start")
             return {"serviceActive": True}
         if action == "set_prefs":
-            save_prefs(payload.get("prefs") or {})
+            prefs = payload.get("prefs") or {}
+            save_prefs(prefs)
+            self.minimize_to_tray = prefs.get("minimizeToTray") is True
             return {"ok": True}
         if action == "get_settings":
             return get_json("settings")
@@ -807,10 +1170,10 @@ class PortalApplication(Gtk.Application):
             self.activate()
 
     def do_activate(self):
-        window = self.get_active_window()
+        window = self.get_active_window() or next(iter(self.get_windows()), None)
         if window is None:
             window = PortalWindow(self)
-        window.present()
+        window.restore()
 
 
 if __name__ == "__main__":

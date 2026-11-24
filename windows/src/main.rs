@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -18,10 +18,102 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     window::{Icon, WindowBuilder},
 };
-use wry::{DragDropEvent, WebViewBuilder};
+use wry::{DragDropEvent, WebViewBuilder, http};
+
+#[cfg(windows)]
+mod tray;
 
 const UI_HTML: &str = include_str!("../../desktop-ui/index.html");
 const ICON_RGBA: &[u8] = include_bytes!("../assets/icon-64.rgba");
+
+fn serve_media(cli: &Path, request: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
+    use http::{StatusCode, header};
+
+    let failure = |status| {
+        http::Response::builder()
+            .status(status)
+            .body(Vec::new())
+            .unwrap()
+    };
+    let id = request.uri().path().trim_start_matches('/');
+    if request.method() != http::Method::GET || id.len() > 36 {
+        return failure(StatusCode::NOT_FOUND);
+    }
+    let Ok(details) = run_cli(cli, &["media-path".into(), id.into()], None).and_then(|source| {
+        serde_json::from_str::<Value>(&source).map_err(|error| error.to_string())
+    }) else {
+        return failure(StatusCode::NOT_FOUND);
+    };
+    let (Some(path), Some(mime)) = (details["path"].as_str(), details["mime"].as_str()) else {
+        return failure(StatusCode::NOT_FOUND);
+    };
+    let Ok(mut file) = fs::File::open(path) else {
+        return failure(StatusCode::NOT_FOUND);
+    };
+    let Ok(metadata) = file.metadata() else {
+        return failure(StatusCode::NOT_FOUND);
+    };
+    let size = metadata.len();
+    if size == 0 {
+        return failure(StatusCode::NOT_FOUND);
+    }
+    let range = request
+        .headers()
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let mut response = http::Response::builder()
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store");
+    let (start, end) = if let Some(range) = range {
+        let Some((first, last)) = range
+            .strip_prefix("bytes=")
+            .and_then(|range| range.split_once('-'))
+        else {
+            return failure(StatusCode::RANGE_NOT_SATISFIABLE);
+        };
+        let parsed = if first.is_empty() {
+            last.parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(|n| (size.saturating_sub(n), size - 1))
+        } else {
+            first.parse::<u64>().ok().and_then(|start| {
+                let end = if last.is_empty() {
+                    size - 1
+                } else {
+                    last.parse().ok()?
+                };
+                Some((start, end.min(size - 1)))
+            })
+        };
+        let Some((start, end)) = parsed.filter(|(start, end)| start <= end) else {
+            return failure(StatusCode::RANGE_NOT_SATISFIABLE);
+        };
+        let end = end.min(start.saturating_add(2 * 1024 * 1024 - 1));
+        response = response
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
+        (start, end)
+    } else {
+        if size > 16 * 1024 * 1024 {
+            return failure(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        (0, size - 1)
+    };
+    let length = end - start + 1;
+    let mut bytes = Vec::with_capacity(length as usize);
+    if file.seek(SeekFrom::Start(start)).is_err()
+        || file.take(length).read_to_end(&mut bytes).is_err()
+        || bytes.len() != length as usize
+    {
+        return failure(StatusCode::NOT_FOUND);
+    }
+    response
+        .header(header::CONTENT_LENGTH, length)
+        .body(bytes)
+        .unwrap()
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -29,6 +121,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Debug)]
 enum UserEvent {
     Eval(String),
+    #[cfg(windows)]
+    Tray(tray::Action),
+    #[cfg(windows)]
+    TrayStatus(tray::Status),
 }
 
 #[derive(Deserialize)]
@@ -352,6 +448,7 @@ fn dispatch_ipc(
     dir: PathBuf,
     svc: Arc<ServiceHandle>,
     proxy: EventLoopProxy<UserEvent>,
+    tray_available: bool,
 ) {
     thread::spawn(move || {
         let result: Result<Value, String> = match msg.action.as_str() {
@@ -376,6 +473,7 @@ fn dispatch_ipc(
                 .map(|snap| {
                     json!({
                         "serviceActive": active,
+                        "trayAvailable": tray_available,
                         "status": snap["status"],
                         "chats": snap["chats"],
                         "chatId": snap["chat_id"],
@@ -407,13 +505,22 @@ fn dispatch_ipc(
                 )
                 .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
             }
-            "send_text" => {
+            "search_messages" => {
+                let query = msg.payload["query"].as_str().unwrap_or_default().to_owned();
+                run_cli(&cli, &["search".into(), "--".into(), query], None)
+                    .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+            }
+            "send_text" | "send_image" => {
                 let chat_id = msg.payload["chatId"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
-                let text = msg.payload["text"].as_str().unwrap_or_default();
-                let mut args = vec!["send-text".into(), "--chat".into(), chat_id];
+                let is_text = msg.action == "send_text";
+                let data = msg.payload[if is_text { "text" } else { "base64" }]
+                    .as_str()
+                    .unwrap_or_default();
+                let command = if is_text { "send-text" } else { "send-image" };
+                let mut args = vec![command.into(), "--chat".into(), chat_id];
                 if let Some(reply) = msg.payload["replyTo"].as_str() {
                     args.push("--reply-to".into());
                     args.push(reply.to_owned());
@@ -422,8 +529,10 @@ fn dispatch_ipc(
                     args.push("--ttl".into());
                     args.push(ttl.to_string());
                 }
-                args.push("-".into());
-                run_cli(&cli, &args, Some(text)).map(|_| json!({ "ok": true }))
+                if is_text {
+                    args.push("-".into());
+                }
+                run_cli(&cli, &args, Some(data)).map(|_| json!({ "ok": true }))
             }
             "pick_files" => {
                 let chosen = rfd::FileDialog::new()
@@ -507,6 +616,30 @@ fn dispatch_ipc(
                     run_cli(&cli, &args, None).map(|_| json!({ "ok": true }))
                 }
             }
+            "shared_media" => {
+                let mut args = vec![
+                    "shared-media".into(),
+                    msg.payload["tab"].as_str().unwrap_or("files").into(),
+                ];
+                if let Some(chat) = msg.payload["chatId"].as_str() {
+                    args.extend(["--chat".into(), chat.into()]);
+                }
+                if let Some(before) = msg.payload["before"].as_i64() {
+                    args.extend(["--before".into(), before.to_string()]);
+                }
+                run_cli(&cli, &args, None)
+                    .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+            }
+            "transfer_control" => {
+                let args = [
+                    "transfer-control".into(),
+                    msg.payload["direction"].as_str().unwrap_or_default().into(),
+                    msg.payload["id"].as_str().unwrap_or_default().into(),
+                    msg.payload["action"].as_str().unwrap_or_default().into(),
+                ];
+                run_cli(&cli, &args, None)
+                    .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+            }
             "received_files" => {
                 let mut args = vec![
                     "history".into(),
@@ -561,8 +694,12 @@ fn dispatch_ipc(
                 serde_json::to_string(&settings)
                     .map_err(|e| e.to_string())
                     .and_then(|body| {
-                        run_cli(&cli, &["settings".into(), "--stdin-json".into()], Some(&body))
-                            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+                        run_cli(
+                            &cli,
+                            &["settings".into(), "--stdin-json".into()],
+                            Some(&body),
+                        )
+                        .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
                     })
             }
             "test_sound" => {
@@ -611,7 +748,7 @@ fn queue_files(cli: &Path, payload: &Value, paths: Vec<PathBuf>) -> Result<Value
     let chat_id = payload["chatId"].as_str().unwrap_or_default().to_owned();
     let reply = payload["replyTo"].as_str().map(ToOwned::to_owned);
     let ttl = payload["ttl"].as_u64();
-    let mut base_args = vec!["send-file".into(), "--chat".into(), chat_id];
+    let mut base_args = vec!["--chat".into(), chat_id];
     if let Some(r) = reply {
         base_args.push("--reply-to".into());
         base_args.push(r);
@@ -624,14 +761,26 @@ fn queue_files(cli: &Path, payload: &Value, paths: Vec<PathBuf>) -> Result<Value
     let mut skipped = 0usize;
     let mut errors = Vec::new();
     for path in paths {
-        if !path.is_file() {
+        if !path.is_file() && !path.is_dir() {
             skipped += 1;
             continue;
         }
-        let mut args = base_args.clone();
-        args.push(path.to_string_lossy().into_owned());
-        match run_cli(cli, &args, None) {
-            Ok(_) => sent += 1,
+        let folder = path.is_dir();
+        let mut args = vec![if folder { "send-folder" } else { "send-file" }.into()];
+        args.extend(base_args.iter().cloned());
+        args.extend(["--".into(), path.to_string_lossy().into_owned()]);
+        let queued = run_cli(cli, &args, None).and_then(|output| {
+            if !folder {
+                return Ok(1);
+            }
+            let result: Value = serde_json::from_str(&output).map_err(|error| error.to_string())?;
+            result["sent"]
+                .as_u64()
+                .map(|count| count as usize)
+                .ok_or_else(|| "Folder count unavailable".into())
+        });
+        match queued {
+            Ok(count) => sent += count,
             Err(e) => errors.push(format!(
                 "{}: {e}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -656,6 +805,12 @@ fn main() -> wry::Result<()> {
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    #[cfg(windows)]
+    let tray = tray::Tray::new(&proxy).ok();
+    #[cfg(windows)]
+    let tray_available = tray.is_some();
+    #[cfg(not(windows))]
+    let tray_available = false;
 
     let window_icon = Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
     let window = WindowBuilder::new()
@@ -673,14 +828,19 @@ fn main() -> wry::Result<()> {
     let dnd_proxy = proxy.clone();
 
     let initial_prefs = load_prefs(&dir);
+    let media_cli = cli.clone();
     let init_script = format!(
-        "window.__PORTAL_HOST = \"windows\";\nwindow.__PORTAL_PREFS = {};\n",
+        "window.__PORTAL_HOST = \"windows\";\nwindow.__PORTAL_FILE_PROTO = \"http://portal-media.localhost/\";\nwindow.__PORTAL_PREFS = {};\n",
         serde_json::to_string(&initial_prefs).unwrap_or_else(|_| "{\"theme\":\"light\"}".into())
     );
 
     let builder = WebViewBuilder::new()
         .with_initialization_script(&init_script)
         .with_html(UI_HTML)
+        .with_asynchronous_custom_protocol("portal-media".into(), move |_, request, responder| {
+            let cli = media_cli.clone();
+            thread::spawn(move || responder.respond(serve_media(&cli, request)));
+        })
         .with_ipc_handler(move |request| {
             if let Ok(msg) = serde_json::from_str::<IpcMessage>(request.body()) {
                 dispatch_ipc(
@@ -689,6 +849,7 @@ fn main() -> wry::Result<()> {
                     ipc_dir.clone(),
                     ipc_svc.clone(),
                     ipc_proxy.clone(),
+                    tray_available,
                 );
             }
         })
@@ -725,7 +886,11 @@ fn main() -> wry::Result<()> {
         builder.build_gtk(window.gtk_window())?
     };
 
-    spawn_wake_watcher(dir, proxy);
+    #[cfg(windows)]
+    let tray_focused = tray
+        .as_ref()
+        .map(|_| tray::watch(cli.clone(), dir.clone(), service.clone(), proxy.clone()));
+    spawn_wake_watcher(dir.clone(), proxy.clone());
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -733,10 +898,57 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::Eval(script)) => {
                 let _ = webview.evaluate_script(&script);
             }
+            #[cfg(windows)]
+            Event::UserEvent(UserEvent::Tray(action)) => match action {
+                tray::Action::Open => {
+                    window.set_visible(true);
+                    window.set_minimized(false);
+                    window.set_focus();
+                }
+                tray::Action::Clipboard => tray::send_clipboard(cli.clone()),
+                tray::Action::ToggleService => {
+                    let (cli, dir, service, proxy) =
+                        (cli.clone(), dir.clone(), service.clone(), proxy.clone());
+                    thread::spawn(move || {
+                        if service.is_running(&dir) {
+                            service.pause();
+                        } else {
+                            service.start(&cli, &dir);
+                        }
+                        js_call(&proxy, "__portalWake", &json!({ "reason": "tray" }));
+                    });
+                }
+                tray::Action::Quit => *control_flow = ControlFlow::Exit,
+            },
+            #[cfg(windows)]
+            Event::UserEvent(UserEvent::TrayStatus(status)) => {
+                if let Some(tray) = &tray {
+                    tray.render(status);
+                }
+            }
+            #[cfg(windows)]
+            Event::WindowEvent {
+                event: WindowEvent::Focused(focused),
+                ..
+            } => {
+                if let Some(flag) = &tray_focused {
+                    flag.store(focused, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
+            } => {
+                if tray_available && load_prefs(&dir)["minimizeToTray"] == true {
+                    window.set_visible(false);
+                    #[cfg(windows)]
+                    if let Some(flag) = &tray_focused {
+                        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
             _ => {}
         }
     });

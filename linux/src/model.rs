@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub const PORT: u16 = 53621;
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
+pub const FOLDER_PROTOCOL_VERSION: u32 = 5;
 pub const TEMP_TTL_SEC: u64 = 600;
 pub const MIN_TTL_SEC: u64 = 10;
 pub const MAX_TTL_SEC: u64 = 86_400;
@@ -13,6 +14,95 @@ pub const MAX_INLINE_TEXT: usize = 16 * 1024;
 pub const MAX_NAME: usize = 240;
 pub const MAX_FILE_SIZE: u64 = i64::MAX as u64;
 pub const DEFAULT_CHAT: &str = "00000000-0000-0000-0000-000000000001";
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum TransferDirection {
+    Sent,
+    Received,
+}
+
+impl TransferDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Received => "received",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sent" => Some(Self::Sent),
+            "received" => Some(Self::Received),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferState {
+    Queued,
+    Paused,
+    Canceled,
+    Failed,
+    Delivered,
+}
+
+impl TransferState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Paused => "paused",
+            Self::Canceled => "canceled",
+            Self::Failed => "failed",
+            Self::Delivered => "delivered",
+        }
+    }
+
+    pub fn from_database(value: Option<&str>, done: bool) -> Self {
+        if done {
+            return Self::Delivered;
+        }
+        match value {
+            Some("paused") => Self::Paused,
+            Some("canceled") => Self::Canceled,
+            Some("failed") => Self::Failed,
+            _ => Self::Queued,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferAction {
+    Pause,
+    Resume,
+    Cancel,
+    Retry,
+}
+
+impl TransferAction {
+    pub fn apply(self, state: TransferState) -> TransferState {
+        if matches!(state, TransferState::Delivered | TransferState::Canceled) {
+            return state;
+        }
+        match self {
+            Self::Pause => TransferState::Paused,
+            Self::Resume | Self::Retry => TransferState::Queued,
+            Self::Cancel => TransferState::Canceled,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TransferCommand {
+    pub action: TransferAction,
+}
+
+#[derive(Serialize)]
+pub struct TransferResponse {
+    pub state: TransferState,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Item {
@@ -23,6 +113,8 @@ pub struct Item {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,6 +155,7 @@ impl Item {
             ts: now_ms(),
             text: None,
             name: None,
+            relative_path: None,
             size: None,
             sha256: None,
             chat_id: None,
@@ -128,7 +221,10 @@ impl Item {
         match self.kind {
             Kind::Text => {
                 ensure!(
-                    self.name.is_none() && self.size.is_none() && self.sha256.is_none(),
+                    self.name.is_none()
+                        && self.size.is_none()
+                        && self.sha256.is_none()
+                        && self.relative_path.is_none(),
                     "unexpected file metadata"
                 );
                 if let Some(text) = &self.text {
@@ -162,6 +258,9 @@ impl Item {
                     !name.trim().is_empty() && name.len() <= MAX_NAME,
                     "invalid filename"
                 );
+                if let Some(path) = &self.relative_path {
+                    crate::folders::validate(path, name)?;
+                }
                 ensure!(
                     self.size.is_some_and(|size| size <= MAX_FILE_SIZE),
                     "invalid file size"

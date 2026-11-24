@@ -42,12 +42,36 @@ Linux and Windows share the same web-rendered desktop interface with a collapsib
 
 - **Direct LAN messaging**: Send plain text, Markdown formatting, and fenced code blocks with exact-text copy support. Large text payloads stay collapsed inside a single chat entry.
 - **Fast resumable file transfers**: Attach multiple files via the native file chooser, drag and drop files directly onto the desktop window, or share from the Android Sharesheet with an attachment review step. Downloads resume automatically after interruptions, are verified with SHA-256, and are organized under `Downloads/Portal Drop`.
-- **Instant push delivery**: The desktop daemon pushes queue updates to Android over an authenticated Server-Sent Events stream with HTTP/1.1 keep-alive reuse, eliminating polling lag in both directions.
+- **Instant push delivery**: The desktop daemon pushes queue updates to Android over an authenticated Server-Sent Events stream. Chat messages can be sent and received while files transfer, and the chat shows live incoming progress.
 - **Chat management**: Create, rename, and delete synchronized chats, reply inline to messages, page through older history, and batch-delete selected messages or files.
-- **Temporary messages**: Arm the one-time timer in the composer to send a message or file that automatically expires from both devices after 10 minutes.
+- **Temporary messages**: Arm the one-time timer in the composer to send a message or file that expires on both devices.
 - **Background notifications and audio cues**: Receive system notifications with distinct chimes for incoming messages, completed file downloads, and device connections. Android supports direct inline notification replies and opening any received file type (including APK installation when permitted).
 
-Portal Drop pairs one Android device with one desktop computer at a time.
+Each desktop pairs with one Android device. Android can remember multiple desktops and switch between them from **Paired computers**, with one active connection at a time. Chats and transfer history are kept per desktop.
+
+### Settings in v0.3.2
+
+**Notifications & sounds** lets you choose a notification and a sound independently for each event.
+
+| Event | Notification | Sound |
+| --- | --- | --- |
+| Incoming message | Toggle | Toggle |
+| Completed file | Toggle | Toggle |
+| Paired device connects | Toggle | Toggle |
+
+Use **Save location** to choose where new downloads go. Android uses the system folder picker, which can grant access to a folder on internal storage or a mounted microSD card.
+
+### v0.4.0
+
+- On desktop, paste a PNG, JPEG, GIF, or WebP image into the composer and press **Send**. Portal Drop previews the image before sending. Clipboard images can be up to 16 MiB.
+- Use **Search messages** on Android or desktop to search message bodies and filenames across conversations. On desktop, **Ctrl+F** opens message search. The sidebar field still filters chat titles.
+- Use **Shared media** to browse photos and videos, files, and links. Available videos show a preview and duration when the device supports the format.
+- Pause, resume, cancel, or retry an individual file transfer from its chat bubble. Android also offers active transfer controls in the notification. Paused transfers retain their progress.
+- Drop a folder onto the desktop window or select **Send folder** in an Android chat. Completed files keep their subfolder structure under `Folders/` in the save location. Update both devices to use folder transfer. Empty directories and symlinks are skipped.
+- The desktop system tray shows connection status and unread activity, and offers **Send clipboard**, **Pause service**, and **Resume service**. Clipboard text expires after five minutes. Enable **Minimize to tray on close** from the app menu. On Linux, the tray requires desktop support for AppIndicator or the legacy status icon.
+- The timer beside the composer offers 5 minutes, 10 minutes, 1 hour, and 24 hours for the next message or attachment.
+- Swipe left on a message bubble in Android to reply.
+- **Check for updates** queries GitHub Releases only when selected.
 
 ---
 
@@ -59,7 +83,7 @@ Prebuilt packages for Linux (`.deb`, `.tar.gz`), Windows (`.exe`, `.zip`), and A
 
 **Debian package (recommended)**
 
-Download `portal-drop_0.3.2_amd64.deb` from the latest release and install it with `apt`:
+Download the `portal-drop_<version>_amd64.deb` package from Releases and install it with `apt`, for example:
 
 ```sh
 sudo apt install ./portal-drop_0.3.2_amd64.deb
@@ -85,7 +109,7 @@ Launch **Portal Drop** from your application menu or run `portal-drop-desktop`.
 
 **Installer (recommended)**
 
-Download and run `portal-drop-0.3.2-windows-x64-setup.exe` from the latest release. The installer installs Portal Drop per user under `%LOCALAPPDATA%\Portal Drop`, registers login autostart, and creates a Start Menu entry. Requires the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (preinstalled on Windows 11 and most Windows 10 systems).
+Download and run `portal-drop-<version>-windows-x64-setup.exe` from Releases. The installer installs Portal Drop per user under `%LOCALAPPDATA%\Portal Drop`, registers login autostart, and creates a Start Menu entry. Requires the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (preinstalled on Windows 11 and most Windows 10 systems).
 
 **Portable archive**
 
@@ -113,7 +137,7 @@ powershell -ExecutionPolicy Bypass -File windows/install.ps1
 
 Requires Android 10 (API 29) or later.
 
-Download and install the signed `portal-drop-0.3.2-android.apk` from the latest release. Future releases signed with the same release certificate update in place while preserving chat history and pairing.
+Download and install the signed `portal-drop-<version>-android.apk` from Releases. Future releases signed with the same release certificate update in place while preserving chat history and pairing.
 
 **Build from source**
 
@@ -140,6 +164,7 @@ adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 - If the phone cannot reach the desktop, verify your desktop firewall rules, disable router client/AP isolation, and allow local-network traffic in any active VPN.
 - On multi-homed hosts with multiple network interfaces, generate an invite targeting a specific interface with `portal-drop pair --address <LAN-IP>`.
 - Android may pause background sync during extended Doze or after a manual Force Stop; reopening the app resumes the service immediately.
+- On Linux, the systemd user service checks that the TLS listener is responsive and restarts the daemon if it stalls. Inspect it with `systemctl --user status portal-drop.service`.
 
 ---
 

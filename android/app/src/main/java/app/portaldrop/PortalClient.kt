@@ -5,6 +5,8 @@ import android.net.ConnectivityManager
 import android.net.InetAddresses
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.LinkProperties
+import android.util.Log
 import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.File
@@ -30,6 +32,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal class PortalHttpException(val status: Int, message: String) : IOException(message)
+internal class TransferInterruptedException : IOException("The transfer was interrupted.")
 
 internal data class PeerMeta(val os: String?, val name: String?, val protocolVersion: Int)
 
@@ -37,9 +40,6 @@ object PortalClient {
     fun pair(context: Context, link: String): Peer {
         val invite = PairingInvite.parse(link)
         val store = PortalStore.get(context)
-        require(store.peer()?.fingerprint?.let { it == invite.fingerprint } != false) {
-            "Forget the current computer before pairing a different one."
-        }
         val networks = portalNetworks(context, invite.host)
         if (networks.isEmpty()) throw IOException("Connect to Wi-Fi to pair with your computer.")
         var peer = Peer(invite.host, invite.port, invite.fingerprint, store.pairingToken(invite.fingerprint))
@@ -86,6 +86,11 @@ internal fun isPortalNetwork(capabilities: NetworkCapabilities?): Boolean =
                 it.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
     } ?: false
 
+internal fun LinkProperties?.hasLocalRoute(address: InetAddress): Boolean =
+    this?.routes?.any { route ->
+        !route.isDefaultRoute && !route.hasGateway() && route.destination.contains(address)
+    } == true
+
 internal fun portalNetworks(context: Context, host: String): List<Network> {
     val manager = context.getSystemService(ConnectivityManager::class.java)
     val active = manager.activeNetwork
@@ -108,9 +113,7 @@ private fun stillOnLocalSubnet(manager: ConnectivityManager, networks: List<Netw
         return false
     }
     if (address.isLoopbackAddress || address.isMulticastAddress || address.isAnyLocalAddress) return false
-    return networks.any { network -> manager.getLinkProperties(network)?.routes?.any { route ->
-        !route.isDefaultRoute && !route.hasGateway() && route.destination.contains(address)
-    } == true }
+    return networks.any { manager.getLinkProperties(it).hasLocalRoute(address) }
 }
 
 internal fun localRoute(context: Context, network: Network): Boolean =
@@ -160,7 +163,12 @@ internal class PortalSession(
     private val activeConnections: MutableSet<HttpsURLConnection> =
         Collections.newSetFromMap(ConcurrentHashMap())
     private val eventConnection = AtomicReference<HttpsURLConnection?>()
+    private data class TransferKey(val id: String, val incoming: Boolean)
+    private val transferConnections = ConcurrentHashMap<TransferKey, HttpsURLConnection>()
+    private val interruptedTransfers = ConcurrentHashMap.newKeySet<TransferKey>()
     @Volatile private var cancelled = false
+    @Volatile var peerProtocolVersion: Int = 1
+        private set
 
     private val localDeviceName = localAndroidDeviceName()
 
@@ -194,6 +202,16 @@ internal class PortalSession(
         eventConnection.getAndSet(null)?.disconnect()
     }
 
+    fun interruptTransfer(id: String, incoming: Boolean): HttpsURLConnection? {
+        val key = TransferKey(id, incoming)
+        interruptedTransfers.add(key)
+        return transferConnections[key]
+    }
+
+    fun allowTransfer(id: String, incoming: Boolean) {
+        interruptedTransfers.remove(TransferKey(id, incoming))
+    }
+
     fun pair(code: String): PeerMeta {
         val body = JSONObject()
             .put("code", code)
@@ -208,7 +226,15 @@ internal class PortalSession(
     fun outbox(): List<PortalItem> = request("GET", "/v1/outbox", expectedStatus = 200) {
         val values = JSONArray(it.controlBody(MAX_OUTBOX_BYTES))
         buildList {
-            for (index in 0 until values.length()) add(portalItemFromJson(values.getJSONObject(index)))
+            for (index in 0 until values.length()) {
+                try {
+                    add(portalItemFromJson(values.getJSONObject(index)))
+                } catch (error: org.json.JSONException) {
+                    Log.w("PortalDrop", "Skipped invalid item in the transfer queue.", error)
+                } catch (error: IllegalArgumentException) {
+                    Log.w("PortalDrop", "Skipped invalid item in the transfer queue.", error)
+                }
+            }
         }
     }
 
@@ -226,6 +252,22 @@ internal class PortalSession(
     fun acknowledge(id: String) {
         request("POST", "/v1/outbox/$id/ack", expectedStatus = 204) { }
     }
+
+    fun transferStatus(item: PortalItem, incoming: Boolean): TransferState =
+        request("GET", transferPath(item, incoming), expectedStatus = 200, response = ::readTransferState)
+
+    fun controlTransfer(item: PortalItem, incoming: Boolean, action: TransferAction): TransferState =
+        jsonRequest("POST", transferPath(item, incoming), JSONObject().put("action", action.wireName),
+            200, response = ::readTransferState)
+
+    private fun transferPath(item: PortalItem, incoming: Boolean): String {
+        val desktopDirection = if (incoming) "sent" else "received"
+        return "/v1/transfers/$desktopDirection/${item.id}"
+    }
+
+    private fun readTransferState(http: HttpsURLConnection): TransferState =
+        transferState(JSONObject(http.controlBody(4 * 1024)).getString("state"))
+            ?: throw IOException("The computer returned an unknown transfer state.")
 
     fun offer(item: PortalItem): Offer = jsonRequest("POST", "/v1/inbox", item.toJson(), 200) {
         val value = JSONObject(it.controlBody(4 * 1024))
@@ -249,7 +291,8 @@ internal class PortalSession(
         progress: (Long) -> Unit,
     ) {
         val size = checkNotNull(item.binarySize)
-        request("PUT", "/v1/inbox/${item.id}/file", "offset=$offset", 204, output = { http ->
+        request("PUT", "/v1/inbox/${item.id}/file", "offset=$offset", 204,
+            transferKey = TransferKey(item.id, incoming = false), output = { http ->
             http.doOutput = true
             http.setFixedLengthStreamingMode(size - offset)
             http.setRequestProperty("Content-Type", "application/octet-stream")
@@ -266,7 +309,8 @@ internal class PortalSession(
     }
 
     fun download(item: PortalItem, offset: Long, save: (InputStream) -> Unit) {
-        request("GET", "/v1/outbox/${item.id}/file", "offset=$offset", 200) { http ->
+        request("GET", "/v1/outbox/${item.id}/file", "offset=$offset", 200,
+            transferKey = TransferKey(item.id, incoming = true)) { http ->
             val expected = checkNotNull(item.binarySize) - offset
             if (http.contentLengthLong != expected) throw IOException("The computer returned an incorrect file length.")
             http.inputStream.use(save)
@@ -339,16 +383,20 @@ internal class PortalSession(
         query: String? = null,
         expectedStatus: Int,
         authenticated: Boolean = true,
+        transferKey: TransferKey? = null,
         output: ((HttpsURLConnection) -> Unit)? = null,
         response: (HttpsURLConnection) -> T,
     ): T {
         if (cancelled) throw IOException("The connection is paused.")
+        if (transferKey != null && transferKey in interruptedTransfers) throw TransferInterruptedException()
         val url = URI("https", null, peer.host, peer.port, path, query, null).toURL()
         val http = network.openConnection(url, Proxy.NO_PROXY) as HttpsURLConnection
         activeConnections.add(http)
+        if (transferKey != null) transferConnections[transferKey] = http
         var failed = true
         try {
             if (cancelled) throw IOException("The connection is paused.")
+            if (transferKey != null && transferKey in interruptedTransfers) throw TransferInterruptedException()
             configureConnection(http, method, authenticated, readTimeoutMs = 15_000)
             output?.invoke(http)
             val status = http.responseCode
@@ -362,6 +410,7 @@ internal class PortalSession(
             failed = false
             return result
         } finally {
+            if (transferKey != null) transferConnections.remove(transferKey, http)
             activeConnections.remove(http)
             // Keep healthy connections pooled for instant TLS keep-alive reuse; disconnect only on error/cancel.
             if (failed || cancelled) http.disconnect()
@@ -391,7 +440,7 @@ internal class PortalSession(
         http.setRequestProperty("X-Portal-Drop-Name", localDeviceName)
         if (authenticated) {
             http.setRequestProperty("Authorization", "Bearer ${peer.token}")
-            http.setRequestProperty("X-Portal-Drop-Version", "3")
+            http.setRequestProperty("X-Portal-Drop-Version", "5")
         }
     }
 
@@ -399,6 +448,7 @@ internal class PortalSession(
         val os = http.getHeaderField("X-Portal-Drop-OS")?.trim()?.takeIf { it.isNotEmpty() }
         val name = http.getHeaderField("X-Portal-Drop-Name")?.trim()?.takeIf { it.isNotEmpty() }
         val version = http.getHeaderField("X-Portal-Drop-Version")?.trim()?.toIntOrNull() ?: 1
+        if (version > peerProtocolVersion) peerProtocolVersion = version
         return PeerMeta(os, name, version)
     }
 

@@ -1,8 +1,9 @@
 use crate::{
     files::Files,
     model::{
-        Chat, DEFAULT_CHAT, Item, Kind, StatusInfo, date_title, is_hex_secret, local_name,
-        local_os, now_ms, random_secret, sanitize_device_label, sanitize_os, valid_id,
+        Chat, DEFAULT_CHAT, Item, Kind, StatusInfo, TransferAction, TransferDirection,
+        TransferState, date_title, is_hex_secret, local_name, local_os, now_ms, random_secret,
+        sanitize_device_label, sanitize_os, valid_id,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -46,6 +47,12 @@ pub struct HistoryEntry {
     pub saved_name: Option<String>,
     pub peer: Peer,
     pub expires_at: Option<i64>,
+    pub transfer_state: Option<TransferState>,
+}
+
+pub struct Transfer {
+    pub item: Item,
+    pub state: TransferState,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,6 +68,8 @@ pub struct Progress {
     #[serde(default)]
     pub started_at: i64,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_state: Option<TransferState>,
 }
 
 pub struct HistoryQuery<'a> {
@@ -80,15 +89,18 @@ impl Store {
         };
         open_private_database_file(&store.path).context("open private Portal Drop database")?;
         let mut connection = store.connect()?;
-        if version(&connection)? < 2 {
+        if version(&connection)? < 3 {
             connection.pragma_update(None, "journal_mode", "WAL")?;
             let transaction = connection.transaction_with_behavior(Immediate)?;
             let current = version(&transaction)?;
             if current == 0 {
                 migrate_v1(&transaction)?;
+            }
+            if current < 2 {
                 migrate_v2(&transaction)?;
-            } else if current == 1 {
-                migrate_v2(&transaction)?;
+            }
+            if current < 3 {
+                migrate_v3(&transaction)?;
             }
             transaction.commit()?;
         }
@@ -102,9 +114,9 @@ impl Store {
         Ok(connection)
     }
 
-    pub fn data_version(&self) -> Result<i64> {
+    pub fn wake_revision(&self) -> Result<i64> {
         let connection = self.connect()?;
-        Ok(connection.pragma_query_value(None, "data_version", |row| row.get(0))?)
+        Ok(connection.query_row("SELECT revision FROM wake_revision", [], |row| row.get(0))?)
     }
 
     pub fn identity(&self) -> Result<Identity> {
@@ -316,25 +328,35 @@ impl Store {
     }
 
     pub fn queue(&self, peer: &Peer, item: &Item) -> Result<()> {
-        item.validate()?;
-        let encoded = serde_json::to_string(item)?;
-        let expires_at = item
-            .ttl_sec
-            .map(|ttl| now_ms().saturating_add((ttl as i64).saturating_mul(1_000)));
+        self.queue_batch(peer, std::slice::from_ref(item))
+    }
+
+    pub fn queue_batch(&self, peer: &Peer, items: &[Item]) -> Result<()> {
+        for item in items {
+            item.validate()?;
+        }
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(Immediate)?;
         ensure!(
             active_peer(&transaction)? == Some(*peer),
             "pairing changed while preparing item"
         );
-        ensure!(
-            active_chat_exists(&transaction, item.chat_id())?,
-            "chat not found"
-        );
-        transaction.execute(
-            "INSERT INTO outbox (id, peer, item, ts, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![item.id, peer, encoded, item.ts, expires_at],
-        )?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO outbox (id, peer, item, ts, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for item in items {
+                ensure!(
+                    active_chat_exists(&transaction, item.chat_id())?,
+                    "chat not found"
+                );
+                let encoded = serde_json::to_string(item)?;
+                let expires_at = item
+                    .ttl_sec
+                    .map(|ttl| now_ms().saturating_add((ttl as i64).saturating_mul(1_000)));
+                statement.execute(params![item.id, peer, encoded, item.ts, expires_at])?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -344,21 +366,35 @@ impl Store {
         let now = now_ms();
         let modern = protocol_version >= 2;
         let supports_ttl = protocol_version >= 3;
+        let supports_folders = protocol_version >= crate::model::FOLDER_PROTOCOL_VERSION;
         let mut stmt = connection.prepare(
             "SELECT item FROM outbox
              WHERE peer = ?1
                AND delivered = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM transfer_controls AS control
+                   WHERE control.id = outbox.id AND control.peer = outbox.peer
+                     AND control.direction = 'sent' AND control.state != 'queued'
+               )
                AND (expires_at IS NULL OR expires_at > ?4)
                AND (?2 OR (json_extract(item, '$.text_size') IS NULL
                            AND coalesce(json_extract(item, '$.chat_id'), ?3) = ?3))
                AND (?5 OR json_extract(item, '$.ttl_sec') IS NULL)
+               AND (?6 OR json_extract(item, '$.relative_path') IS NULL)
              ORDER BY CASE WHEN json_extract(item, '$.kind') = 'text'
                             AND json_extract(item, '$.text_size') IS NULL THEN 0 ELSE 1 END,
                       ts, rowid
              LIMIT 32",
         )?;
         stmt.query_map(
-            params![peer, modern, DEFAULT_CHAT, now, supports_ttl],
+            params![
+                peer,
+                modern,
+                DEFAULT_CHAT,
+                now,
+                supports_ttl,
+                supports_folders
+            ],
             |row| row.get::<_, String>(0),
         )?
         .map(|entry| {
@@ -375,32 +411,14 @@ impl Store {
         .collect()
     }
 
-    pub fn outgoing(&self, peer: &Peer, id: &str) -> Result<Option<(Item, bool)>> {
-        let now = now_ms();
-        let raw = self
-            .connect()?
-            .query_row(
-                "SELECT item, delivered, expires_at FROM outbox WHERE id = ?1 AND peer = ?2",
-                params![id, peer],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, bool>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        raw.map(|(encoded, delivered, expires_at)| {
-            let expired = expires_at.is_some_and(|exp| exp <= now);
-            Ok((serde_json::from_str(&encoded)?, delivered || expired))
-        })
-        .transpose()
-    }
-
     pub fn acknowledge(&self, peer: &Peer, id: &str) -> Result<bool> {
         let updated = self.connect()?.execute(
-            "UPDATE outbox SET delivered = 1 WHERE id = ?1 AND peer = ?2 AND (SELECT peer FROM trust) = ?2",
+            "UPDATE outbox SET delivered = 1
+             WHERE id = ?1 AND peer = ?2 AND (SELECT peer FROM trust) = ?2
+               AND (delivered = 1 OR NOT EXISTS (
+                   SELECT 1 FROM transfer_controls
+                   WHERE id = ?1 AND peer = ?2 AND direction = 'sent' AND state != 'queued'
+               ))",
             params![id, peer],
         )?;
         Ok(updated == 1)
@@ -423,6 +441,61 @@ impl Store {
             })
         })
         .transpose()
+    }
+
+    pub fn transfer(
+        &self,
+        peer: &Peer,
+        direction: TransferDirection,
+        id: &str,
+    ) -> Result<Option<Transfer>> {
+        let connection = self.connect()?;
+        find_transfer(&connection, peer, direction, id)
+    }
+
+    pub fn control_transfer(
+        &self,
+        peer: &Peer,
+        direction: TransferDirection,
+        id: &str,
+        action: TransferAction,
+    ) -> Result<Option<Transfer>> {
+        self.change_transfer(peer, direction, id, |state| action.apply(state))
+    }
+
+    pub fn fail_transfer(&self, peer: &Peer, direction: TransferDirection, id: &str) -> Result<()> {
+        self.change_transfer(peer, direction, id, |state| {
+            if state == TransferState::Queued {
+                TransferState::Failed
+            } else {
+                state
+            }
+        })?;
+        Ok(())
+    }
+
+    fn change_transfer(
+        &self,
+        peer: &Peer,
+        direction: TransferDirection,
+        id: &str,
+        action: impl FnOnce(TransferState) -> TransferState,
+    ) -> Result<Option<Transfer>> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(Immediate)?;
+        if active_peer(&transaction)? != Some(*peer) {
+            return Ok(None);
+        }
+        let Some(mut transfer) = find_transfer(&transaction, peer, direction, id)? else {
+            return Ok(None);
+        };
+        let state = action(transfer.state);
+        if state != transfer.state {
+            write_transfer_state(&transaction, peer, direction, id, state)?;
+            transfer.state = state;
+        }
+        transaction.commit()?;
+        Ok(Some(transfer))
     }
 
     pub fn offer(&self, peer: &Peer, item: &Item, saved_name: Option<&str>) -> Result<bool> {
@@ -477,7 +550,10 @@ impl Store {
     ) -> Result<bool> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(Immediate)?;
-        if active_peer(&transaction)? != Some(*peer) {
+        if active_peer(&transaction)? != Some(*peer)
+            || !find_transfer(&transaction, peer, TransferDirection::Received, id)?
+                .is_some_and(|transfer| transfer.state == TransferState::Queued)
+        {
             return Ok(false);
         }
         if let Some(name) = changed_name {
@@ -489,6 +565,11 @@ impl Store {
         if let Some(expires_at) = refreshed_expires_at {
             transaction.execute(
                 "UPDATE inbox SET expires_at = ?3 WHERE id = ?1 AND peer = ?2",
+                params![id, peer, expires_at],
+            )?;
+            transaction.execute(
+                "UPDATE timeline SET expires_at = ?3
+                 WHERE id = ?1 AND peer = ?2 AND direction = 'received'",
                 params![id, peer, expires_at],
             )?;
         }
@@ -656,7 +737,7 @@ impl Store {
             "?2 IS NULL"
         };
         let filter = if query.files {
-            "AND t.direction = 'received' AND t.kind = 'file' AND i.hidden = 0"
+            "AND t.direction = 'received' AND t.kind = 'file' AND i.received = 1 AND i.hidden = 0"
         } else if query.include_hidden {
             ""
         } else {
@@ -674,6 +755,54 @@ impl Store {
         )?
         .map(decode_history)
         .collect()
+    }
+
+    pub fn search_candidates(&self, query: &str, before: i64) -> Result<Vec<HistoryEntry>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(&format!(
+            "{HISTORY_SELECT}
+             WHERE t.deleted = 0 AND t.seq < ?1 AND (t.expires_at IS NULL OR t.expires_at > ?2)
+               AND (instr(lower(json_extract(coalesce(i.item, o.item), '$.text')), lower(?3)) > 0
+                 OR instr(lower(json_extract(coalesce(i.item, o.item), '$.name')), lower(?3)) > 0
+                 OR json_extract(coalesce(i.item, o.item), '$.text_size') IS NOT NULL)
+             ORDER BY t.seq DESC LIMIT 50"
+        ))?;
+        statement
+            .query_map(params![before, now_ms(), query], history_from_row)?
+            .map(decode_history)
+            .collect()
+    }
+
+    pub fn media_candidates(
+        &self,
+        chat: Option<&str>,
+        before: i64,
+        links: bool,
+    ) -> Result<Vec<HistoryEntry>> {
+        let connection = self.connect()?;
+        let chat_filter = if chat.is_some() {
+            "t.chat_id = ?2"
+        } else {
+            "?2 IS NULL"
+        };
+        let media_filter = if links {
+            "t.kind = 'text' AND (
+                instr(lower(json_extract(coalesce(i.item, o.item), '$.text')), 'http://') > 0
+                OR instr(lower(json_extract(coalesce(i.item, o.item), '$.text')), 'https://') > 0
+                OR json_extract(coalesce(i.item, o.item), '$.text_size') IS NOT NULL)"
+        } else {
+            "t.kind = 'file' AND (t.direction = 'sent' OR i.received = 1) AND coalesce(i.hidden, 0) = 0"
+        };
+        let mut statement = connection.prepare(&format!(
+            "{HISTORY_SELECT}
+             WHERE t.deleted = 0 AND t.seq < ?1 AND (t.expires_at IS NULL OR t.expires_at > ?3)
+               AND {chat_filter} AND {media_filter}
+             ORDER BY t.seq DESC LIMIT 80"
+        ))?;
+        statement
+            .query_map(params![before, chat, now_ms()], history_from_row)?
+            .map(decode_history)
+            .collect()
     }
 
     pub fn message(&self, id: &str) -> Result<Option<HistoryEntry>> {
@@ -729,10 +858,23 @@ impl Store {
             }
             deleted_count += 1;
             if direction == "sent" {
-                let _ = transaction.execute(
-                    "UPDATE outbox SET delivered = 1 WHERE id = ?1 AND peer = ?2",
-                    params![id, peer],
-                );
+                let transfer = find_transfer(&transaction, &peer, TransferDirection::Sent, id)?;
+                if let Some(transfer) = transfer {
+                    if transfer.state != TransferState::Delivered {
+                        write_transfer_state(
+                            &transaction,
+                            &peer,
+                            TransferDirection::Sent,
+                            id,
+                            TransferState::Canceled,
+                        )?;
+                    }
+                } else {
+                    transaction.execute(
+                        "UPDATE outbox SET delivered = 1 WHERE id = ?1 AND peer = ?2",
+                        params![id, peer],
+                    )?;
+                }
                 let _ = transaction.execute(
                     "DELETE FROM progress WHERE id = ?1 AND direction = 'sent'",
                     [id],
@@ -741,6 +883,22 @@ impl Store {
                 paths_to_remove.push(files.outgoing_ref(id));
                 paths_to_remove.push(files.sent_text(id));
             } else {
+                if let Some(transfer) =
+                    find_transfer(&transaction, &peer, TransferDirection::Received, id)?
+                    && !matches!(
+                        transfer.state,
+                        TransferState::Delivered | TransferState::Canceled
+                    )
+                {
+                    write_transfer_state(
+                        &transaction,
+                        &peer,
+                        TransferDirection::Received,
+                        id,
+                        TransferState::Canceled,
+                    )?;
+                    paths_to_remove.push(files.partial(&peer, &transfer.item));
+                }
                 if kind == "text" {
                     paths_to_remove.push(files.received_text(&peer, id));
                 }
@@ -876,11 +1034,25 @@ impl Store {
     pub fn progress(&self) -> Result<Vec<Progress>> {
         let connection = self.connect()?;
         let mut stmt = connection.prepare(
-            "SELECT info FROM progress WHERE updated_at >= ?1 ORDER BY updated_at DESC LIMIT 64",
+            "SELECT progress.info, control.state FROM progress
+             LEFT JOIN transfer_controls AS control ON control.id = progress.id
+                  AND control.direction = progress.direction AND control.peer = (SELECT peer FROM trust)
+             WHERE coalesce(control.state, '') != 'canceled'
+               AND (progress.updated_at >= ?1 OR control.state IN ('paused', 'failed'))
+             ORDER BY progress.updated_at DESC LIMIT 64",
         )?;
-        stmt.query_map([now_ms() - 45_000], |row| row.get::<_, String>(0))?
-            .map(|entry| Ok(serde_json::from_str(&entry?)?))
-            .collect()
+        stmt.query_map([now_ms() - 45_000], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .map(|entry| {
+            let (encoded, state) = entry?;
+            let mut progress: Progress = serde_json::from_str(&encoded)?;
+            progress.transfer_state = state
+                .as_deref()
+                .map(|state| TransferState::from_database(Some(state), false));
+            Ok(progress)
+        })
+        .collect()
     }
 
     pub fn clear_history(&self) -> Result<usize> {
@@ -899,6 +1071,7 @@ fn scrub_item(item: &Item) -> Item {
         ts: item.ts,
         text: None,
         name: None,
+        relative_path: None,
         size: None,
         sha256: None,
         chat_id: item.chat_id.clone(),
@@ -948,12 +1121,81 @@ fn mark_chat_items_deleted(
 
 const HISTORY_SELECT: &str =
     "SELECT t.seq, t.direction, coalesce(i.item, o.item), coalesce(i.received, o.delivered),
-            i.saved_name, t.peer, t.expires_at
+            i.saved_name, t.peer, t.expires_at, control.state
      FROM timeline AS t
      LEFT JOIN inbox AS i ON t.direction = 'received' AND i.id = t.id AND i.peer = t.peer
-     LEFT JOIN outbox AS o ON t.direction = 'sent' AND o.id = t.id AND o.peer = t.peer";
+     LEFT JOIN outbox AS o ON t.direction = 'sent' AND o.id = t.id AND o.peer = t.peer
+     LEFT JOIN transfer_controls AS control
+          ON control.id = t.id AND control.peer = t.peer AND control.direction = t.direction";
 
-type HistoryRow = (i64, String, String, bool, Option<String>, Peer, Option<i64>);
+type HistoryRow = (
+    i64,
+    String,
+    String,
+    bool,
+    Option<String>,
+    Peer,
+    Option<i64>,
+    Option<String>,
+);
+
+fn find_transfer(
+    connection: &Connection,
+    peer: &Peer,
+    direction: TransferDirection,
+    id: &str,
+) -> Result<Option<Transfer>> {
+    let (table, completed) = match direction {
+        TransferDirection::Sent => ("outbox", "delivered"),
+        TransferDirection::Received => ("inbox", "received"),
+    };
+    let raw: Option<(String, bool, Option<String>)> = connection
+        .query_row(
+            &format!(
+                "SELECT item, {completed}, control.state FROM {table} AS item_record
+             LEFT JOIN transfer_controls AS control ON control.id = item_record.id
+                  AND control.peer = item_record.peer AND control.direction = ?3
+             WHERE item_record.id = ?1 AND item_record.peer = ?2
+               AND (item_record.expires_at IS NULL OR item_record.expires_at > ?4)"
+            ),
+            params![id, peer, direction.as_str(), now_ms()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((encoded, done, state)) = raw else {
+        return Ok(None);
+    };
+    let item: Item = serde_json::from_str(&encoded)?;
+    let state = TransferState::from_database(state.as_deref(), done);
+    Ok(item.payload().is_some().then_some(Transfer { item, state }))
+}
+
+fn write_transfer_state(
+    connection: &Connection,
+    peer: &Peer,
+    direction: TransferDirection,
+    id: &str,
+    state: TransferState,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO transfer_controls (id, peer, direction, state, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id, peer, direction) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+        params![id, peer, direction.as_str(), state.as_str(), now_ms()],
+    )?;
+    if state == TransferState::Canceled {
+        connection.execute(
+            "DELETE FROM progress WHERE id = ?1 AND direction = ?2",
+            params![id, direction.as_str()],
+        )?;
+        if matches!(direction, TransferDirection::Received) {
+            connection.execute(
+                "UPDATE inbox SET saved_name = NULL WHERE id = ?1 AND peer = ?2 AND received = 0",
+                params![id, peer],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 fn history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
     Ok((
@@ -964,19 +1206,25 @@ fn history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 
 fn decode_history(row: rusqlite::Result<HistoryRow>) -> Result<HistoryEntry> {
-    let (seq, direction, item, delivered, saved_name, peer, expires_at) = row?;
+    let (seq, direction, item, delivered, saved_name, peer, expires_at, state) = row?;
+    let item: Item = serde_json::from_str(&item)?;
+    let transfer_state = item
+        .payload()
+        .map(|_| TransferState::from_database(state.as_deref(), delivered));
     Ok(HistoryEntry {
         seq,
-        item: serde_json::from_str(&item)?,
+        item,
         direction,
         delivered,
         saved_name,
         peer,
         expires_at,
+        transfer_state,
     })
 }
 
@@ -1101,6 +1349,54 @@ fn migrate_v2(connection: &Connection) -> Result<()> {
         ))?;
     }
     connection.pragma_update(None, "user_version", 2)?;
+    Ok(())
+}
+
+fn migrate_v3(connection: &Connection) -> Result<()> {
+    connection.execute_batch(&format!(
+        "CREATE TABLE transfer_controls (
+             id TEXT NOT NULL, peer BLOB NOT NULL, direction TEXT NOT NULL,
+             state TEXT NOT NULL CHECK (state IN ('queued', 'paused', 'canceled', 'failed')),
+             updated_at INTEGER NOT NULL,
+             PRIMARY KEY (id, peer, direction)
+         );
+         CREATE TABLE wake_revision (revision INTEGER NOT NULL);
+         INSERT INTO wake_revision VALUES (0);
+         DROP TRIGGER timeline_inbox;
+         CREATE TRIGGER timeline_inbox AFTER INSERT ON inbox BEGIN
+            INSERT OR IGNORE INTO timeline (id, peer, direction, chat_id, kind, expires_at)
+            VALUES (NEW.id, NEW.peer, 'received',
+                    coalesce(json_extract(NEW.item, '$.chat_id'), '{DEFAULT_CHAT}'),
+                    json_extract(NEW.item, '$.kind'), NEW.expires_at);
+         END;
+         INSERT OR IGNORE INTO timeline (id, peer, direction, chat_id, kind, expires_at)
+         SELECT id, peer, 'received', coalesce(json_extract(item, '$.chat_id'), '{DEFAULT_CHAT}'),
+                json_extract(item, '$.kind'), expires_at
+         FROM inbox WHERE received = 0;"
+    ))?;
+    for (name, event) in [
+        ("wake_outbox", "AFTER INSERT ON outbox"),
+        ("wake_new_chat", "AFTER INSERT ON chats"),
+        (
+            "wake_changed_chat",
+            "AFTER UPDATE ON chats WHEN NEW.updated_at != OLD.updated_at OR NEW.title != OLD.title",
+        ),
+        (
+            "wake_new_transfer_control",
+            "AFTER INSERT ON transfer_controls",
+        ),
+        (
+            "wake_changed_transfer_control",
+            "AFTER UPDATE ON transfer_controls WHEN NEW.state != OLD.state",
+        ),
+    ] {
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER {name} {event} BEGIN
+                UPDATE wake_revision SET revision = revision + 1;
+             END;"
+        ))?;
+    }
+    connection.pragma_update(None, "user_version", 3)?;
     Ok(())
 }
 

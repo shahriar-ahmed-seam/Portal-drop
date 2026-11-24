@@ -3,6 +3,7 @@ package app.portaldrop
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
@@ -20,6 +21,8 @@ import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.io.RandomAccessFile
+import java.io.Reader
+import java.io.StringReader
 import java.net.URI
 import java.nio.charset.CodingErrorAction
 import java.security.DigestInputStream
@@ -31,6 +34,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import org.json.JSONObject
+import org.json.JSONArray
 
 private const val INLINE_TEXT_BYTES = 16_384
 const val DEFAULT_CHAT_ID = "00000000-0000-0000-0000-000000000001"
@@ -38,6 +42,8 @@ const val TEMP_MESSAGE_TTL_SEC = 600L
 private const val MIN_TTL_SEC = 10L
 private const val MAX_TTL_SEC = 86_400L
 private const val MAX_FILENAME_BYTES = 240
+private const val MAX_RELATIVE_PATH_BYTES = 1_024
+private const val MAX_RELATIVE_PATH_SEGMENTS = 32
 private const val CHAT_RANGE =
     "peer = ? AND chat_id = ? AND deleted = 0 AND (expires_at IS NULL OR expires_at > ?)"
 private val hex256 = Regex("[0-9a-f]{64}")
@@ -194,6 +200,7 @@ data class PortalItem(
     val textSize: Long? = null,
     val textSha256: String? = null,
     val ttlSec: Long? = null,
+    val relativePath: String? = null,
 ) {
     internal val binarySize: Long? get() = size ?: textSize
 }
@@ -210,7 +217,18 @@ data class ChatItem(
     internal val peerFingerprint: String,
     val expiresAt: Long? = null,
     val sourceUri: Uri? = null,
+    val transferState: TransferState = if (delivered) TransferState.DELIVERED else TransferState.QUEUED,
+    internal val transferAction: TransferAction? = null,
+    internal val transferRevision: Long = 0,
 )
+
+enum class TransferState { QUEUED, PAUSED, CANCELED, FAILED, DELIVERED }
+enum class TransferAction { PAUSE, RESUME, CANCEL, RETRY }
+
+internal val TransferState.wireName: String get() = name.lowercase(Locale.ROOT)
+internal val TransferAction.wireName: String get() = name.lowercase(Locale.ROOT)
+internal fun transferState(value: String?): TransferState? =
+    TransferState.entries.firstOrNull { it.wireName == value }
 
 data class ChatRoom(
     val id: String,
@@ -235,6 +253,7 @@ internal fun PortalItem.toJson(): JSONObject = JSONObject()
     .put("reply_to", replyTo)
     .put("text_size", textSize)
     .put("text_sha256", textSha256)
+    .put("relative_path", relativePath)
     .apply { if (ttlSec != null) put("ttl_sec", ttlSec) }
 
 internal fun ChatRoom.toJson(): JSONObject = JSONObject()
@@ -267,9 +286,11 @@ internal fun portalItemFromJson(value: JSONObject): PortalItem {
     val chatId = if (value.isNull("chat_id")) DEFAULT_CHAT_ID else value.getString("chat_id")
     val replyTo = if (value.isNull("reply_to")) null else value.getString("reply_to")
     val ttlSec = if (value.has("ttl_sec") && !value.isNull("ttl_sec")) value.getLong("ttl_sec") else null
+    val relativePath = if (value.isNull("relative_path")) null else value.getString("relative_path")
     require(itemId.matches(id) && ts >= 0 && itemId.matches(chatId) &&
         (replyTo == null || itemId.matches(replyTo)) &&
-        (ttlSec == null || ttlSec in MIN_TTL_SEC..MAX_TTL_SEC)) { "Invalid item identity." }
+        (ttlSec == null || ttlSec in MIN_TTL_SEC..MAX_TTL_SEC) &&
+        (relativePath == null || kind == "file")) { "Invalid item identity." }
     return when (kind) {
         "text" -> {
             if (!value.isNull("text")) {
@@ -293,11 +314,31 @@ internal fun portalItemFromJson(value: JSONObject): PortalItem {
             require(name.isNotBlank() && name.toByteArray().size <= MAX_FILENAME_BYTES &&
                 size >= 0 && hex256.matches(sha256)
             ) { "Invalid file metadata." }
+            if (relativePath != null) relativeFolderParts(relativePath, name)
             PortalItem(id, kind, ts, name = name, size = size, sha256 = sha256, chatId = chatId,
-                replyTo = replyTo, ttlSec = ttlSec)
+                replyTo = replyTo, ttlSec = ttlSec, relativePath = relativePath)
         }
         else -> throw IllegalArgumentException("Unsupported item type.")
     }
+}
+
+private fun validFolderPart(part: String): Boolean {
+    if (part.isEmpty() || part.endsWith('.') || part.endsWith(' ') ||
+        part.toByteArray().size > MAX_FILENAME_BYTES ||
+        part.any { it.isISOControl() || it in "/\\<>:\"|?*" }
+    ) return false
+    val stem = part.substringBefore('.').uppercase(Locale.ROOT)
+    if (stem in setOf("CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$")) return false
+    return stem.length != 4 || (stem.take(3) != "COM" && stem.take(3) != "LPT") ||
+        stem.last() !in "123456789¹²³"
+}
+
+internal fun relativeFolderParts(path: String, leaf: String): List<String> {
+    require(path.toByteArray().size <= MAX_RELATIVE_PATH_BYTES) { "A folder path exceeds 1,024 bytes." }
+    val parts = path.split('/')
+    require(parts.size in 2..MAX_RELATIVE_PATH_SEGMENTS && parts.last() == leaf &&
+        parts.all(::validFolderPart)) { "The folder path contains a name that cannot be sent." }
+    return parts.dropLast(1)
 }
 
 internal fun safeFilename(name: String): String {
@@ -335,7 +376,7 @@ internal fun InputStream.sha256(): String {
 }
 
 class PortalStore private constructor(private val app: Context) :
-    SQLiteOpenHelper(app, "portal-drop.db", null, 4) {
+    SQLiteOpenHelper(app, "portal-drop.db", null, 6) {
 
     private val settings = app.getSharedPreferences("portal_drop", Context.MODE_PRIVATE)
     private val staging = File(app.noBackupFilesDir, "outbox")
@@ -375,6 +416,11 @@ class PortalStore private constructor(private val app: Context) :
                 ttl_sec INTEGER,
                 expires_at INTEGER,
                 source_uri TEXT,
+                transfer_state TEXT NOT NULL DEFAULT 'queued',
+                transfer_action TEXT,
+                transfer_revision INTEGER NOT NULL DEFAULT 0,
+                transfer_cleaned INTEGER NOT NULL DEFAULT 0,
+                relative_path TEXT,
                 UNIQUE (peer, incoming, id)
             )
             """.trimIndent(),
@@ -403,6 +449,15 @@ class PortalStore private constructor(private val app: Context) :
         }
         if (oldVersion < 4) {
             db.execSQL("ALTER TABLE items ADD COLUMN source_uri TEXT")
+        }
+        if (oldVersion < 5) {
+            db.execSQL("ALTER TABLE items ADD COLUMN transfer_state TEXT NOT NULL DEFAULT 'queued'")
+            db.execSQL("ALTER TABLE items ADD COLUMN transfer_action TEXT")
+            db.execSQL("ALTER TABLE items ADD COLUMN transfer_revision INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE items ADD COLUMN transfer_cleaned INTEGER NOT NULL DEFAULT 0")
+        }
+        if (oldVersion < 6) {
+            db.execSQL("ALTER TABLE items ADD COLUMN relative_path TEXT")
         }
     }
 
@@ -434,6 +489,63 @@ class PortalStore private constructor(private val app: Context) :
         val os = settings.getString("peer_os", null)
         val name = settings.getString("peer_name", null)
         return Peer(host, port, fingerprint, token, os, name)
+    }
+
+    @Synchronized
+    fun rememberedPeers(): List<Peer> {
+        val active = peer()
+        val saved = settings.getString("remembered_desktops", null)?.let { raw ->
+            runCatching {
+                val values = JSONArray(raw)
+                buildList {
+                    for (index in 0 until values.length()) {
+                        val value = values.getJSONObject(index)
+                        val fingerprint = value.getString("fingerprint")
+                        val token = value.getString("token")
+                        val port = value.getInt("port")
+                        val host = value.getString("host")
+                        if (hex256.matches(fingerprint) && hex256.matches(token) && port in 1..65535 &&
+                            host.isNotBlank()
+                        ) add(Peer(host, port, fingerprint, token,
+                            value.optString("os").ifBlank { null }, value.optString("name").ifBlank { null }))
+                    }
+                }
+            }.getOrNull()
+        }.orEmpty()
+        return (listOfNotNull(active) + saved).distinctBy(Peer::fingerprint)
+    }
+
+    @Synchronized
+    internal fun rememberedPeer(fingerprint: String): Peer? =
+        rememberedPeers().firstOrNull { it.fingerprint == fingerprint }
+
+    @Synchronized
+    internal fun activatePeer(fingerprint: String): Boolean {
+        val peers = rememberedPeers()
+        val selected = peers.firstOrNull { it.fingerprint == fingerprint } ?: return false
+        if (peer()?.fingerprint == fingerprint) return true
+        return settings.edit().writeActivePeer(selected).writeRememberedPeers(peers).commit()
+    }
+
+    private fun SharedPreferences.Editor.writeActivePeer(peer: Peer?): SharedPreferences.Editor = apply {
+        if (peer == null) {
+            remove("host").remove("port").remove("fingerprint").remove("token")
+            remove("peer_os").remove("peer_name")
+        } else {
+            putString("host", peer.host).putInt("port", peer.port)
+            putString("fingerprint", peer.fingerprint).putString("token", peer.token)
+            putString("peer_os", peer.os).putString("peer_name", peer.name)
+        }
+    }
+
+    private fun SharedPreferences.Editor.writeRememberedPeers(peers: List<Peer>): SharedPreferences.Editor {
+        val encoded = JSONArray()
+        for (peer in peers) {
+            encoded.put(JSONObject().put("host", peer.host).put("port", peer.port)
+                .put("fingerprint", peer.fingerprint).put("token", peer.token)
+                .put("os", peer.os).put("name", peer.name))
+        }
+        return putString("remembered_desktops", encoded.toString())
     }
 
     fun backgroundEnabled(): Boolean = settings.getBoolean("background_enabled", false)
@@ -498,8 +610,7 @@ class PortalStore private constructor(private val app: Context) :
 
     @Synchronized
     internal fun pairingToken(fingerprint: String): String {
-        val existing = peer()
-        if (existing?.fingerprint == fingerprint) return existing.token
+        rememberedPeer(fingerprint)?.let { return it.token }
         if (settings.getString("pending_fingerprint", null) == fingerprint) {
             settings.getString("pending_token", null)?.let { return it }
         }
@@ -511,48 +622,60 @@ class PortalStore private constructor(private val app: Context) :
 
     @Synchronized
     internal fun savePeer(peer: Peer) {
-        check(settings.edit()
-            .putString("host", peer.host).putInt("port", peer.port)
-            .putString("fingerprint", peer.fingerprint).putString("token", peer.token)
-            .apply {
-                if (peer.os != null) putString("peer_os", peer.os) else remove("peer_os")
-                if (peer.name != null) putString("peer_name", peer.name) else remove("peer_name")
-            }
-            .remove("pending_fingerprint").remove("pending_token").commit()) {
+        val active = peer()
+        val peers = rememberedPeers().filterNot { it.fingerprint == peer.fingerprint } + peer
+        val editor = settings.edit().writeRememberedPeers(peers)
+        if (active == null || active.fingerprint == peer.fingerprint) editor.writeActivePeer(peer)
+        check(editor.remove("pending_fingerprint").remove("pending_token").commit()) {
             "Could not save the paired device."
         }
     }
 
     @Synchronized
     internal fun updateEndpoint(original: Peer, host: String, port: Int) {
-        val current = peer() ?: return
-        if (current.fingerprint == original.fingerprint && (current.host != host || current.port != port)) {
-            settings.edit().putString("host", host).putInt("port", port).commit()
-        }
+        val current = rememberedPeer(original.fingerprint) ?: return
+        if (current.token != original.token || (current.host == host && current.port == port)) return
+        updateRememberedPeer(current.copy(host = host, port = port))
     }
 
     @Synchronized
     internal fun updatePeerMeta(fingerprint: String, os: String?, name: String?): Boolean {
-        val current = peer() ?: return false
-        if (current.fingerprint != fingerprint) return false
+        val current = rememberedPeer(fingerprint) ?: return false
         val cleanOs = os?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
         val cleanName = sanitizeHeaderAscii(name)
         val nextOs = cleanOs ?: current.os
         val nextName = cleanName ?: current.name
         if (nextOs == current.os && nextName == current.name) return false
-        settings.edit().apply {
-            if (nextOs != null) putString("peer_os", nextOs)
-            if (nextName != null) putString("peer_name", nextName)
-        }.apply()
+        updateRememberedPeer(current.copy(os = nextOs, name = nextName))
         return true
+    }
+
+    private fun updateRememberedPeer(updated: Peer) {
+        val peers = rememberedPeers().map { if (it.fingerprint == updated.fingerprint) updated else it }
+        val editor = settings.edit().writeRememberedPeers(peers)
+        if (peer()?.fingerprint == updated.fingerprint) editor.writeActivePeer(updated)
+        editor.apply()
     }
 
     @Synchronized
     fun forgetPeer() {
-        settings.edit().remove("host").remove("port").remove("fingerprint").remove("token")
-            .remove("peer_os").remove("peer_name")
-            .remove("pending_fingerprint").remove("pending_token")
-            .putBoolean("background_enabled", false).commit()
+        peer()?.let { removeRememberedPeer(it.fingerprint) }
+    }
+
+    @Synchronized
+    internal fun removeRememberedPeer(fingerprint: String): Boolean {
+        val peers = rememberedPeers()
+        val remaining = peers.filterNot { it.fingerprint == fingerprint }
+        if (remaining.size == peers.size) return false
+        val editor = settings.edit().writeRememberedPeers(remaining)
+        if (peer()?.fingerprint == fingerprint) {
+            editor.writeActivePeer(remaining.firstOrNull())
+            if (remaining.isEmpty()) editor.putBoolean("background_enabled", false)
+        }
+        if (settings.getString("pending_fingerprint", null) == fingerprint) {
+            editor.remove("pending_fingerprint").remove("pending_token")
+        }
+        return editor.commit()
     }
 
     fun chats(): List<ChatRoom> {
@@ -681,6 +804,25 @@ class PortalStore private constructor(private val app: Context) :
         )
     }
 
+    fun sharedFiles(chatId: String): List<ChatItem> {
+        val current = peer() ?: return emptyList()
+        return list(
+            "$CHAT_RANGE AND kind = 'file' AND (incoming = 0 OR done = 1)",
+            chatRangeArgs(current, chatId),
+            "seq DESC",
+        )
+    }
+
+    fun sharedLinkMessages(chatId: String): List<ChatItem> {
+        val current = peer() ?: return emptyList()
+        return list(
+            "$CHAT_RANGE AND kind = 'text' AND (text LIKE '%http://%' OR text LIKE '%https://%' " +
+                "OR text LIKE '%www.%' OR (text_size IS NOT NULL AND (incoming = 0 OR done = 1)))",
+            chatRangeArgs(current, chatId),
+            "seq DESC",
+        )
+    }
+
     private fun chatRangeArgs(peer: Peer, chatId: String): Array<String> =
         arrayOf(peer.fingerprint, chatId, System.currentTimeMillis().toString())
 
@@ -693,6 +835,48 @@ class PortalStore private constructor(private val app: Context) :
             "incoming DESC",
             "1",
         ).firstOrNull()
+    }
+
+    fun searchMessages(query: String): List<ChatItem> {
+        val current = peer() ?: return emptyList()
+        val term = query.trim()
+        if (term.isEmpty() || term.length > 256) return emptyList()
+        val now = System.currentTimeMillis().toString()
+        val found = mutableListOf<ChatItem>()
+        var before = Long.MAX_VALUE
+        while (found.size < 50 && !Thread.currentThread().isInterrupted) {
+            val candidates = list(
+                """peer = ? AND seq < ? AND deleted = 0 AND (expires_at IS NULL OR expires_at > ?)
+                   AND (instr(lower(text), lower(?)) > 0 OR instr(lower(name), lower(?)) > 0 OR text_size IS NOT NULL)""",
+                arrayOf(current.fingerprint, before.toString(), now, term, term), "seq DESC", "50",
+            )
+            if (candidates.isEmpty()) break
+            for (row in candidates) {
+                if (Thread.currentThread().isInterrupted) return emptyList()
+                before = row.seq
+                if (row.item.textSize == null || searchableTextContains(row, term)) found.add(row)
+                if (found.size == 50) break
+            }
+        }
+        return found
+    }
+
+    private fun searchableTextContains(row: ChatItem, term: String): Boolean {
+        val file = readableTextFile(row) ?: return false
+        return runCatching {
+            file.bufferedReader(Charsets.UTF_8).use { reader ->
+                val buffer = CharArray(8192)
+                var overlap = ""
+                while (!Thread.currentThread().isInterrupted) {
+                    val count = reader.read(buffer)
+                    if (count == -1) break
+                    val window = overlap + String(buffer, 0, count)
+                    if (window.contains(term, ignoreCase = true)) return true
+                    overlap = window.takeLast(term.length - 1)
+                }
+                false
+            }
+        }.getOrDefault(false)
     }
 
     fun deleteItem(chatId: String, id: String, incoming: Boolean, deleteDownloadedFile: Boolean = false) {
@@ -1056,6 +1240,114 @@ class PortalStore private constructor(private val app: Context) :
         require(target != null && !target.deleted) { "This chat is unavailable." }
     }
 
+    fun folderName(treeUri: Uri): String {
+        require(treeUri.scheme == "content" && DocumentsContract.isTreeUri(treeUri)) {
+            "Choose a folder with the system file picker."
+        }
+        val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+        val document = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootId)
+        val name = app.contentResolver.query(document, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null, null, null)?.use { if (it.moveToFirst()) it.getString(0) else null }
+            ?: throw IOException("Could not read the selected folder.")
+        require(validFolderPart(name)) { "The folder name cannot be sent. Rename it and try again." }
+        return name
+    }
+
+    fun enqueueFolder(
+        treeUri: Uri,
+        chatId: String = activeChatId(),
+        replyTo: String? = null,
+        ttlSec: Long? = null,
+    ): Int {
+        val current = peer() ?: error("Pair your computer first.")
+        require(ttlSec == null || ttlSec in MIN_TTL_SEC..MAX_TTL_SEC) { "Invalid temporary timer." }
+        validateComposeTarget(current, chatId, replyTo)
+        val rootName = folderName(treeUri)
+        val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+        val canReuseTree = persistReadPermission(treeUri)
+        val sources = folderFiles(treeUri, rootId, rootName)
+        require(sources.isNotEmpty()) { "This folder has no files to send." }
+        val ids = mutableListOf<String>()
+        try {
+            val items = sources.map { source ->
+                val id = newId()
+                ids.add(id)
+                prepareOutgoingFile(source.uri, id, source.leaf, chatId, replyTo, ttlSec,
+                    relativePath = source.path, inheritedGrant = canReuseTree)
+            }
+            val db = writableDatabase
+            val expiresAt = ttlSec?.let { System.currentTimeMillis() + it * 1000L }
+            db.beginTransaction()
+            try {
+                check(peer()?.token == current.token) { "The paired device changed during import." }
+                validateComposeTarget(current, chatId, replyTo)
+                for ((item, sourceUri) in items) {
+                    insert(current, item, incoming = false, done = false, expiresAt = expiresAt,
+                        sourceUri = sourceUri)
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+            return items.size
+        } catch (error: Exception) {
+            for (id in ids) File(staging, id).delete()
+            throw error
+        }
+    }
+
+    private data class FolderSource(val uri: Uri, val leaf: String, val path: String)
+    private data class FolderDirectory(val documentId: String, val path: String, val depth: Int)
+
+    private fun folderFiles(tree: Uri, rootId: String, rootName: String): List<FolderSource> {
+        val directories = ArrayDeque<FolderDirectory>()
+        val visited = mutableSetOf(rootId)
+        val files = mutableListOf<FolderSource>()
+        val pathKeys = mutableSetOf<String>()
+        directories.add(FolderDirectory(rootId, rootName, 1))
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+        )
+        while (directories.isNotEmpty()) {
+            val directory = directories.removeFirst()
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, directory.documentId)
+            val rows = app.contentResolver.query(children, projection, null, null, null)
+                ?: throw IOException("Could not list the selected folder.")
+            rows.use {
+                while (it.moveToNext()) {
+                    val id = it.getString(0) ?: throw IOException("A folder item has no document ID.")
+                    val name = it.getString(1) ?: throw IOException("A folder item has no name.")
+                    val path = "${directory.path}/$name"
+                    relativeFolderParts(path, name)
+                    require(pathKeys.add(path.lowercase(Locale.ROOT))) {
+                        "The folder contains names that would conflict on Windows."
+                    }
+                    if (it.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        require(directory.depth + 1 < MAX_RELATIVE_PATH_SEGMENTS && visited.add(id)) {
+                            "The folder is too deeply nested or contains a duplicate directory."
+                        }
+                        directories.add(FolderDirectory(id, path, directory.depth + 1))
+                    } else {
+                        val document = DocumentsContract.buildDocumentUriUsingTree(tree, id)
+                        files.add(FolderSource(document, name, path))
+                    }
+                }
+            }
+        }
+        return files.sortedBy(FolderSource::path)
+    }
+
+    private fun persistReadPermission(uri: Uri): Boolean = try {
+        app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        true
+    } catch (_: SecurityException) {
+        false
+    } catch (_: IllegalArgumentException) {
+        false
+    }
+
     private fun prepareOutgoingFile(
         uri: Uri,
         id: String,
@@ -1063,15 +1355,10 @@ class PortalStore private constructor(private val app: Context) :
         chatId: String,
         replyTo: String?,
         ttlSec: Long?,
+        relativePath: String? = null,
+        inheritedGrant: Boolean = false,
     ): Pair<PortalItem, Uri?> {
-        val persisted = try {
-            app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            true
-        } catch (_: SecurityException) {
-            false
-        } catch (_: IllegalArgumentException) {
-            false
-        }
+        val persisted = inheritedGrant || persistReadPermission(uri)
         val digest = MessageDigest.getInstance("SHA-256")
         if (persisted) {
             var total = 0L
@@ -1087,6 +1374,7 @@ class PortalStore private constructor(private val app: Context) :
             val item = PortalItem(
                 id, "file", System.currentTimeMillis(), name = name, size = total,
                 sha256 = digest.digest().hex(), chatId = chatId, replyTo = replyTo, ttlSec = ttlSec,
+                relativePath = relativePath,
             )
             return item to uri
         }
@@ -1094,12 +1382,14 @@ class PortalStore private constructor(private val app: Context) :
             stagedFile(id).outputStream().use { output ->
                 val copied = DigestInputStream(input, digest).copyTo(output, 256 * 1024)
                 output.flush()
+                if (relativePath != null) output.fd.sync()
                 copied
             }
         } ?: throw IOException("Could not read the selected file.")
         val item = PortalItem(
             id, "file", System.currentTimeMillis(), name = name, size = size,
             sha256 = digest.digest().hex(), chatId = chatId, replyTo = replyTo, ttlSec = ttlSec,
+            relativePath = relativePath,
         )
         return item to null
     }
@@ -1131,6 +1421,9 @@ class PortalStore private constructor(private val app: Context) :
     }
 
     fun readText(row: ChatItem): String? = row.item.text ?: readableTextFile(row)?.readText(Charsets.UTF_8)
+
+    fun openTextReader(row: ChatItem): Reader? =
+        row.item.text?.let(::StringReader) ?: readableTextFile(row)?.bufferedReader(Charsets.UTF_8)
 
     fun sharedTextUri(row: ChatItem): Uri? {
         if (row.item.kind != "text") return null
@@ -1173,7 +1466,8 @@ class PortalStore private constructor(private val app: Context) :
     }
 
     internal fun outgoing(peer: Peer): List<ChatItem> = list(
-        "peer = ? AND incoming = 0 AND done = 0 AND deleted = 0 AND (expires_at IS NULL OR expires_at > ?)",
+        "peer = ? AND incoming = 0 AND done = 0 AND deleted = 0 AND transfer_state = 'queued' " +
+            "AND transfer_action IS NULL AND (expires_at IS NULL OR expires_at > ?)",
         arrayOf(peer.fingerprint, System.currentTimeMillis().toString()),
         "CASE WHEN kind = 'text' AND text_size IS NULL THEN 0 ELSE 1 END, seq",
         "64",
@@ -1215,17 +1509,102 @@ class PortalStore private constructor(private val app: Context) :
         list("peer = ? AND incoming = ? AND id = ? AND (deleted = 1 OR done = 1)",
             arrayOf(peer.fingerprint, if (item.incoming) "1" else "0", item.item.id), limit = "1").isNotEmpty()
 
+    internal fun transfer(peer: Peer, id: String, incoming: Boolean): ChatItem? =
+        list("peer = ? AND incoming = ? AND id = ? AND kind = 'file' AND deleted = 0",
+            transferArgs(peer, id, incoming), limit = "1").firstOrNull()
+
+    internal fun applyTransferAction(row: ChatItem, action: TransferAction): Boolean {
+        val current = peer() ?: return false
+        if (current.fingerprint != row.peerFingerprint) return false
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val fresh = transfer(current, row.item.id, row.incoming) ?: return false
+            val state = when (action) {
+                TransferAction.PAUSE -> if (fresh.transferState == TransferState.QUEUED) TransferState.PAUSED else null
+                TransferAction.RESUME -> if (fresh.transferState == TransferState.PAUSED) TransferState.QUEUED else null
+                TransferAction.CANCEL -> if (fresh.transferState in setOf(
+                        TransferState.QUEUED, TransferState.PAUSED, TransferState.FAILED,
+                    )) TransferState.CANCELED else null
+                TransferAction.RETRY -> if (fresh.transferState == TransferState.FAILED) TransferState.QUEUED else null
+            } ?: return false
+            update(current, row.item.id, row.incoming, ContentValues().apply {
+                put("transfer_state", state.wireName)
+                put("transfer_action", action.wireName)
+                put("transfer_revision", fresh.transferRevision + 1)
+                if (state != TransferState.FAILED) putNull("error")
+            })
+            db.setTransactionSuccessful()
+            return true
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    internal fun pendingTransferActions(peer: Peer): List<ChatItem> = list(
+        "peer = ? AND deleted = 0 AND kind = 'file' AND transfer_action IS NOT NULL " +
+            "AND (expires_at IS NULL OR expires_at > ?)",
+        arrayOf(peer.fingerprint, System.currentTimeMillis().toString()), "seq", "64",
+    )
+
+    internal fun observedTransfers(peer: Peer): List<ChatItem> = list(
+        "peer = ? AND deleted = 0 AND kind = 'file' AND done = 0 AND transfer_action IS NULL " +
+            "AND (incoming = 1 OR transfer_state IN ('paused','failed')) AND transfer_state <> 'canceled' " +
+            "AND (expires_at IS NULL OR expires_at > ?)",
+        arrayOf(peer.fingerprint, System.currentTimeMillis().toString()), "seq",
+    )
+
+    internal fun reconcileTransfer(peer: Peer, row: ChatItem, state: TransferState): Boolean {
+        if (row.transferAction == null && row.transferState == state) return false
+        val args = transferArgs(peer, row.item.id, row.incoming) + row.transferRevision.toString()
+        val changed = writableDatabase.update("items", ContentValues().apply {
+            put("transfer_state", state.wireName)
+            putNull("transfer_action")
+            if (state == TransferState.DELIVERED) put("done", 1)
+            if (state != TransferState.FAILED) putNull("error")
+        }, "peer = ? AND incoming = ? AND id = ? AND transfer_revision = ? AND deleted = 0", args)
+        return changed > 0
+    }
+
+    internal fun failTransfer(peer: Peer, row: ChatItem, reason: String): Boolean =
+        writableDatabase.update("items", ContentValues().apply {
+            put("transfer_state", TransferState.FAILED.wireName)
+            put("error", reason)
+        }, "peer = ? AND incoming = ? AND id = ? AND kind = 'file' AND done = 0 AND deleted = 0 " +
+            "AND transfer_state = 'queued' AND transfer_action IS NULL", transferArgs(peer, row.item.id, row.incoming)) > 0
+
+    internal fun canceledTransferPayloads(peer: Peer): List<ChatItem> = list(
+        "peer = ? AND kind = 'file' AND transfer_state = 'canceled' AND transfer_cleaned = 0 AND done = 0",
+        arrayOf(peer.fingerprint), "seq", "64",
+    )
+
+    internal fun finishTransferCleanup(peer: Peer, row: ChatItem) {
+        writableDatabase.update("items", ContentValues().apply {
+            put("transfer_cleaned", 1)
+            putNull("media_uri")
+            putNull("source_uri")
+        }, "peer = ? AND incoming = ? AND id = ? AND transfer_state = 'canceled' AND done = 0",
+            transferArgs(peer, row.item.id, row.incoming))
+    }
+
+    private fun transferArgs(peer: Peer, id: String, incoming: Boolean): Array<String> =
+        arrayOf(peer.fingerprint, if (incoming) "1" else "0", id)
+
     internal fun setDownloadUri(peer: Peer, id: String, uri: Uri?) {
         val values = ContentValues().apply { put("media_uri", uri?.toString()) }
         update(peer, id, incoming = true, values)
     }
 
-    internal fun complete(peer: Peer, id: String, incoming: Boolean) {
+    internal fun complete(peer: Peer, id: String, incoming: Boolean): Boolean {
         val values = ContentValues().apply {
             put("done", 1)
             putNull("error")
+            put("transfer_state", TransferState.DELIVERED.wireName)
+            putNull("transfer_action")
         }
-        update(peer, id, incoming, values)
+        return writableDatabase.update("items", values,
+            "peer = ? AND incoming = ? AND id = ? AND transfer_state <> 'canceled' AND deleted = 0",
+            transferArgs(peer, id, incoming)) > 0
     }
 
     internal fun setError(peer: Peer, id: String, incoming: Boolean, error: String?) {
@@ -1261,6 +1640,7 @@ class PortalStore private constructor(private val app: Context) :
             put("text_size", item.textSize)
             put("text_sha256", item.textSha256)
             put("ttl_sec", item.ttlSec)
+            put("relative_path", item.relativePath)
             put("expires_at", expiresAt)
             put("done", done)
             if (sourceUri != null) put("source_uri", sourceUri.toString())
@@ -1292,12 +1672,18 @@ class PortalStore private constructor(private val app: Context) :
         val item = PortalItem(
             string("id"), string("kind"), long("ts"), string("text"), string("name"),
             optionalLong("size"), string("sha256"), string("chat_id"), string("reply_to"),
-            optionalLong("text_size"), string("text_sha256"), optionalLong("ttl_sec"),
+            optionalLong("text_size"), string("text_sha256"), optionalLong("ttl_sec"), optionalString("relative_path"),
         )
+        val delivered = long("done") == 1L
+        val state = if (delivered) TransferState.DELIVERED else
+            transferState(optionalString("transfer_state")) ?: TransferState.QUEUED
+        val action = optionalString("transfer_action")?.let { raw ->
+            TransferAction.entries.firstOrNull { it.wireName == raw }
+        }
         return ChatItem(
             item,
             long("incoming") == 1L,
-            long("done") == 1L,
+            delivered,
             string("media_uri")?.let(Uri::parse),
             string("error"),
             long("seq"),
@@ -1306,6 +1692,9 @@ class PortalStore private constructor(private val app: Context) :
             string("peer"),
             optionalLong("expires_at"),
             optionalString("source_uri")?.let(Uri::parse),
+            state,
+            action,
+            long("transfer_revision"),
         )
     }
 

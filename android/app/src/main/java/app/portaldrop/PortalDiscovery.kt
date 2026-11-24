@@ -1,6 +1,7 @@
 package app.portaldrop
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -12,10 +13,11 @@ import java.net.Inet4Address
 
 internal class PortalDiscovery(private val context: Context) {
     private val nsd = context.getSystemService(NsdManager::class.java)
+    private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val main = Handler(Looper.getMainLooper())
     private var scan: Scan? = null
 
-    fun find(peer: Peer, network: Network, found: (String, Int) -> Unit) {
+    fun find(peer: Peer, network: Network, found: (List<String>, Int) -> Unit) {
         main.post {
             if (scan != null) return@post
             val next = Scan(peer, network, found)
@@ -32,7 +34,7 @@ internal class PortalDiscovery(private val context: Context) {
     private inner class Scan(
         private val peer: Peer,
         private val network: Network,
-        private val found: (String, Int) -> Unit,
+        private val found: (List<String>, Int) -> Unit,
     ) : NsdManager.DiscoveryListener {
         private val timeout = Runnable(::finish)
         private val pending = ArrayDeque<NsdServiceInfo>()
@@ -104,20 +106,22 @@ internal class PortalDiscovery(private val context: Context) {
         private fun resolved(info: NsdServiceInfo?) {
             if (scan !== this) return
             activeResolve = null
-            val resolvedInfo = info
-            val pinned = resolvedInfo?.attributes?.get("fp")?.toString(Charsets.UTF_8) == peer.fingerprint
-            if (pinned && resolvedInfo.port in 1..65535) {
-                val address = if (Build.VERSION.SDK_INT >= 34) {
-                    info.hostAddresses.firstOrNull { it is Inet4Address }
+            val matches = info?.attributes?.get("fp")?.toString(Charsets.UTF_8) == peer.fingerprint
+            if (info != null && matches && info.port in 1..65535) {
+                val addresses = if (Build.VERSION.SDK_INT >= 34) {
+                    info.hostAddresses
                 } else {
-                    info.host as? Inet4Address
+                    listOfNotNull(info.host)
                 }
-                val host = address?.hostAddress
-                if (host != null && !address.isLoopbackAddress &&
-                    !address.isMulticastAddress && !address.isAnyLocalAddress
-                ) {
+                val properties = connectivity.getLinkProperties(network)
+                val hosts = addresses
+                    .filter { !it.isLoopbackAddress && !it.isMulticastAddress && !it.isAnyLocalAddress }
+                    .sortedWith(compareByDescending<java.net.InetAddress> { properties.hasLocalRoute(it) }
+                        .thenByDescending { it is Inet4Address })
+                    .mapNotNull { it.hostAddress }.distinct().take(8)
+                if (hosts.isNotEmpty()) {
                     finish()
-                    found(host, info.port)
+                    found(hosts, info.port)
                     return
                 }
             }

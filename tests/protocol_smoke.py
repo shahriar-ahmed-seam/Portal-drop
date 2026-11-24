@@ -1,5 +1,8 @@
-"""Exercise the Portal Drop server using the same protocol as the Android app (v1, v2, and v3)."""
+"""Exercise the Portal Drop server using legacy and current Android protocols."""
 
+from contextlib import closing
+
+import base64
 import hashlib
 import http.client
 import json
@@ -141,7 +144,7 @@ def smoke(desktop):
     _, pair_headers = desktop.request("POST", "/v1/pair", authorized=False, payload=pair, code=204, return_headers=True)
     header_keys = {k.lower(): v for k, v in pair_headers.items()}
     assert header_keys["x-portal-drop-os"] in ("linux", "windows", "macos"), header_keys
-    assert header_keys["x-portal-drop-version"] == "3", header_keys
+    assert int(header_keys["x-portal-drop-version"]) >= 4, header_keys
 
     desktop.request("POST", "/v1/pair", authorized=False, payload=pair, code=204)
     desktop.request("POST", "/v1/pair", authorized=False, payload={**pair, "token": secrets.token_hex(32)}, code=403)
@@ -196,12 +199,13 @@ def smoke(desktop):
     assert target.name not in desktop.cli("history")
 
     modern_smoke(desktop)
+    clipboard_and_search_smoke(desktop)
     v3_smoke(desktop)
 
     desktop.cli("unpair")
     desktop.request("GET", "/v1/outbox", code=401)
     desktop.request("POST", "/v1/pair", authorized=False, payload=pair, code=403)
-    print("PASS: pairing, v1/v2/v3 compatibility, device info, SSE instant push, chat delete, 10m TTL expiry, resume, revocation")
+    print("PASS: pairing, v1/v2/v3 compatibility, device info, SSE push, clipboard images, search, chat deletion, TTL expiry, resume, revocation")
 
 
 def modern_smoke(desktop):
@@ -250,10 +254,37 @@ def modern_smoke(desktop):
     assert [row["id"] for row in json.loads(desktop.cli(*args))["items"]] == [sent_id]
 
 
+def clipboard_and_search_smoke(desktop):
+    # A small PNG as it arrives from either native desktop host.
+    encoded = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg=="
+    pixels = base64.b64decode(encoded)
+    chat = json.loads(desktop.cli("new-chat", "Clipboard tests"))
+    queued = subprocess.check_output(
+        [*desktop.cmd, "send-image", "--chat", chat["id"], "--ttl", "300"], input=encoded,
+    )
+    item_id = queued.decode().split()[-1]
+    image = next(row for row in desktop.request("GET", "/v1/outbox", version=3) if row["id"] == item_id)
+    assert image["name"].startswith("Clipboard_") and image["name"].endswith(".png")
+    assert image["chat_id"] == chat["id"] and image["ttl_sec"] == 300
+    assert desktop.request("GET", f"/v1/outbox/{item_id}/file?offset=0", version=3) == pixels
+    desktop.request("POST", f"/v1/outbox/{item_id}/ack", code=204, version=3)
+
+    long_text = ("First chapter\n" + "x" * 40_940 + "BoundarySearchToken").encode()
+    queued = subprocess.check_output([*desktop.cmd, "send-text", "--chat", chat["id"], "-"], input=long_text)
+    text_id = queued.decode().split()[-1]
+    (match,) = json.loads(desktop.cli("search", "boundarysearchtoken"))
+    assert match["id"] == text_id and match["chat_id"] == chat["id"]
+    assert any(row["id"] == item_id for row in json.loads(desktop.cli("search", "CLIPBOARD_")))
+    desktop.cli("delete-message", text_id)
+    assert json.loads(desktop.cli("search", "boundarysearchtoken")) == []
+    outbox = desktop.request("GET", "/v1/outbox", version=3)
+    assert all(row["id"] != text_id for row in outbox)
+
+
 def v3_smoke(desktop):
     # 1. Device info & presence
     info = desktop.request("GET", "/v1/info", version=3)
-    assert info["protocol_version"] == 3 and info["os"] in ("linux", "windows", "macos")
+    assert info["protocol_version"] >= 4 and info["os"] in ("linux", "windows", "macos")
 
     # 2. SSE instant push (/v1/events) wakes in milliseconds when CLI queues a message
     ready_event = threading.Event()
@@ -442,6 +473,117 @@ def v3_smoke(desktop):
     assert resp.status == 204, resp.status
     assert (desktop.directory / "received" / "Videos" / "concurrent-video.mp4").read_bytes() == slow_data
 
+    transfer_controls(desktop)
+    folders_and_media(desktop)
+
+
+def transfer_controls(desktop):
+    request = desktop.request
+    payload = bytes(range(256)) * 1024
+    incoming = {
+        "id": str(uuid.uuid4()), "kind": "file", "ts": int(time.time() * 1000),
+        "name": "transfer-control.txt", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    item_id = incoming["id"]
+    route = f"/v1/transfers/received/{item_id}"
+    upload = f"/v1/inbox/{item_id}/file"
+    assert request("POST", "/v1/inbox", payload=incoming, version=4)["offset"] == 0
+    partial_bytes = payload[:45_000]
+    partials = desktop.directory / "received" / ".portal-drop-partial"
+    with closing(desktop.connect()) as connection:
+        connection.putrequest("PUT", f"{upload}?offset=0")
+        connection.putheader("Authorization", f"Bearer {desktop.token}")
+        connection.putheader("Content-Length", str(len(payload)))
+        connection.putheader("X-Portal-Drop-Version", "4")
+        connection.endheaders()
+        connection.send(partial_bytes)
+        wait_until(lambda: any(p.stat().st_size == len(partial_bytes) for p in partials.glob("*" + item_id)))
+        assert json.loads(desktop.cli("transfer-control", "received", item_id, "pause")) == {"state": "paused"}
+        assert connection.getresponse().status == 423
+    request("POST", "/v1/inbox", payload=incoming, version=4, code=423)
+    rows = json.loads(desktop.cli("history", "--json"))["items"]
+    paused = next(row for row in rows if row["id"] == item_id)
+    assert paused["transfer_state"] == "paused" and "path" not in paused
+    desktop.stop()
+    desktop.start()
+    assert request("GET", route) == {"state": "paused"}
+    for _ in range(2):
+        assert request("POST", route, payload={"action": "resume"}) == {"state": "queued"}
+    assert request("POST", "/v1/inbox", payload=incoming, version=4)["offset"] == len(partial_bytes)
+    request("PUT", f"{upload}?offset={len(partial_bytes)}", payload=payload[len(partial_bytes):], version=4, code=204)
+    assert request("POST", route, payload={"action": "cancel"}) == {"state": "delivered"}
+
+    failed_id = str(uuid.uuid4())
+    failed_item = {**incoming, "id": failed_id, "name": "transfer-retry.txt"}
+    failed_route = f"/v1/transfers/received/{failed_id}"
+    failed_upload = f"/v1/inbox/{failed_id}/file?offset=0"
+    request("POST", "/v1/inbox", payload=failed_item, version=4)
+    request("PUT", failed_upload, payload=b"x" * len(payload), version=4, code=422)
+    assert request("GET", failed_route) == {"state": "failed"}
+    request("POST", "/v1/inbox", payload=failed_item, version=4, code=424)
+    assert request("POST", failed_route, payload={"action": "retry"}) == {"state": "queued"}
+    assert request("POST", "/v1/inbox", payload=failed_item, version=4)["offset"] == 0
+    desktop.start_interrupted_upload(failed_item, partial_bytes)
+    assert request("POST", failed_route, payload={"action": "cancel"}) == {"state": "canceled"}
+    assert request("POST", failed_route, payload={"action": "resume"}) == {"state": "canceled"}
+    assert not any(partials.glob("*" + failed_id))
+    request("POST", "/v1/inbox", payload=failed_item, version=4, code=410)
+
+    source = desktop.directory / "original.txt"
+    source.write_bytes(payload)
+    sent_id = desktop.cli("send-file", str(source)).split()[-1]
+    sent_route = f"/v1/transfers/sent/{sent_id}"
+    download = f"/v1/outbox/{sent_id}/file?offset=0"
+    assert request("POST", sent_route, payload={"action": "pause"}) == {"state": "paused"}
+    for version in (1, 4):
+        assert sent_id not in {row["id"] for row in request("GET", "/v1/outbox", version=version)}
+    request("GET", download, code=423)
+    assert request("POST", sent_route, payload={"action": "resume"}) == {"state": "queued"}
+    assert request("GET", download) == payload
+    assert json.loads(desktop.cli("transfer-control", "sent", sent_id, "cancel")) == {"state": "canceled"}
+    request("GET", download, code=410)
+    request("POST", f"/v1/outbox/{sent_id}/ack", code=410)
+    assert source.read_bytes() == payload
+    print("PASS: durable transfer controls, partial resume, failure retry, and cancel cleanup")
+
+
+def folders_and_media(desktop):
+    request = desktop.request
+    source = desktop.directory / "Project"
+    (source / "Notes").mkdir(parents=True)
+    (source / "readme.txt").write_bytes(b"root")
+    (source / "Notes" / "draft.txt").write_bytes(b"nested")
+    assert json.loads(desktop.cli("send-folder", str(source))) == {"sent": 2}
+    assert not any(row.get("relative_path") for row in request("GET", "/v1/outbox", version=4))
+    paths = {
+        entry["relative_path"]: entry
+        for entry in request("GET", "/v1/outbox", version=5)
+        if "relative_path" in entry
+    }
+    assert set(paths) == {"Project/readme.txt", "Project/Notes/draft.txt"}
+    for path, entry in paths.items():
+        assert request("GET", f'/v1/outbox/{entry["id"]}/file?offset=0', version=5) == (
+            source.parent / path
+        ).read_bytes()
+
+    payload = b"GIF89a desktop media fixture"
+    item = {
+        "id": str(uuid.uuid4()), "kind": "file", "ts": int(time.time() * 1000),
+        "name": "preview.gif", "relative_path": "Album/Drafts/preview.gif",
+        "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    for unsafe in ("../outside/preview.gif", "Album/../../preview.gif",
+                   "/Album/preview.gif", "Album/Other.gif", "Album/NUL/preview.gif"):
+        request("POST", "/v1/inbox", payload={**item, "relative_path": unsafe}, version=5, code=400)
+    request("POST", "/v1/inbox", payload=item, version=5)
+    request("PUT", f'/v1/inbox/{item["id"]}/file?offset=0', payload=payload, version=5, code=204)
+    saved = desktop.directory / "received" / "Folders" / item["relative_path"]
+    assert saved.read_bytes() == payload
+    gallery = json.loads(desktop.cli("shared-media", "photos-videos"))["items"]
+    assert any(row["id"] == item["id"] and Path(row["path"]) == saved for row in gallery)
+    media = json.loads(desktop.cli("media-path", item["id"]))
+    assert Path(media["path"]) == saved and media["mime"] == "image/gif"
+    print("PASS: nested folders, protocol compatibility, path validation, and shared media")
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "linux/target/debug/portal-drop").resolve()

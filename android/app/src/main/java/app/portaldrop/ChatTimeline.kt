@@ -33,6 +33,24 @@ private sealed interface TimelineEntry {
 
 internal fun canRead(row: ChatItem) = !row.incoming || row.delivered
 
+internal fun ChatItem.availableTransferActions(): List<TransferAction> {
+    if (item.kind != "file") return emptyList()
+    return when (transferState) {
+        TransferState.QUEUED -> listOf(TransferAction.PAUSE, TransferAction.CANCEL)
+        TransferState.PAUSED -> listOf(TransferAction.RESUME, TransferAction.CANCEL)
+        TransferState.FAILED -> listOf(TransferAction.RETRY, TransferAction.CANCEL)
+        TransferState.CANCELED, TransferState.DELIVERED -> emptyList()
+    }
+}
+
+internal val TransferAction.label: String
+    get() = when (this) {
+        TransferAction.PAUSE -> "Pause"
+        TransferAction.RESUME -> "Resume"
+        TransferAction.CANCEL -> "Cancel"
+        TransferAction.RETRY -> "Retry"
+    }
+
 internal fun author(row: ChatItem, peerLabel: String = "Computer") =
     if (row.incoming) peerLabel else "You"
 
@@ -44,10 +62,13 @@ internal fun previewOf(row: ChatItem): String {
 
 internal fun formatRemainingLabel(expiresAt: Long): String {
     val remainingSec = ((expiresAt - System.currentTimeMillis()) / 1000L).toInt()
+    val minutes = (remainingSec + 59) / 60
     return when {
         remainingSec <= 0 -> "Expiring"
         remainingSec < 60 -> "<1m left"
-        else -> "${(remainingSec + 59) / 60}m left"
+        minutes < 60 -> "${minutes}m left"
+        minutes % 60 == 0 -> "${minutes / 60}h left"
+        else -> "${minutes / 60}h ${minutes % 60}m left"
     }
 }
 
@@ -113,12 +134,14 @@ internal class ChatTimelineAdapter(
     private val context: Context,
     private val ui: PortalViews,
     private val store: PortalStore,
+    private val previews: MediaPreviews,
     private val received: Boolean,
     private val loadOlder: () -> Unit,
     private val openFile: (ChatItem) -> Unit,
     private val showFullMessage: (ChatItem) -> Unit,
     private val showMessageMenu: (View, ChatItem) -> Unit,
     private val toggleSelect: (ChatItem) -> Unit,
+    private val controlTransfer: (ChatItem, TransferAction) -> Unit,
 ) : BaseAdapter() {
     private var items = emptyList<ChatItem>()
     private var entries = emptyList<TimelineEntry>()
@@ -131,6 +154,9 @@ internal class ChatTimelineAdapter(
 
     fun visibleItems(): List<ChatItem> = items
 
+    fun replyCandidate(position: Int): ChatItem? = if (selecting || received) null
+    else (entries.getOrNull(position) as? TimelineEntry.Message)?.row
+
     fun replace(
         newItems: List<ChatItem>,
         hasEarlier: Boolean,
@@ -140,7 +166,10 @@ internal class ChatTimelineAdapter(
         viewport: ListView,
     ): Boolean {
         val visibleTransfer = transfer?.takeIf { active ->
-            newItems.any { row -> row.item.id == active.id && row.incoming == active.incoming && !row.delivered }
+            newItems.any { row ->
+                row.item.id == active.id && row.incoming == active.incoming &&
+                    row.transferState == TransferState.QUEUED
+            }
         }
         val minuteBucket = if (newItems.any { it.expiresAt != null }) System.currentTimeMillis() / 20_000L else 0L
         val sameRows = items == newItems && earlier == hasEarlier
@@ -248,7 +277,7 @@ internal class ChatTimelineAdapter(
         val largeText = item.textSize != null
         val isSelected = selecting && message.seq in selectedSeqs
         val peerLabel = store.peer()?.platformLabel() ?: "Computer"
-        val openUri = if (file && message.incoming && message.delivered) message.downloadUri else null
+        val openUri = if (file) message.localFileUri() else null
         val open: (() -> Unit)? = when {
             selecting -> ({ toggleSelect(message) })
             openUri != null -> ({ openFile(message) })
@@ -299,6 +328,15 @@ internal class ChatTimelineAdapter(
         }
         var compactText: TextView? = null
         if (file) {
+            val media = message.visualMedia()
+            if (media != null && openUri != null && !received) {
+                val preview = MediaThumbnail(context, ui, previews, square = false).apply {
+                    bind(message, media)
+                }
+                bubble.addView(preview, LinearLayout.LayoutParams(MATCH, ui.dp(146)).apply {
+                    bottomMargin = ui.dp(6)
+                })
+            }
             bubble.addView(fileHeader(message, openUri, metaColor), LinearLayout.LayoutParams(MATCH, WRAP))
         } else {
             val output = ui.label("", 15, ui.ink).apply {
@@ -338,6 +376,20 @@ internal class ChatTimelineAdapter(
         if (active != null) {
             bubble.addWithGap(TransferProgressView(context, ui).apply { update(active) }, 5)
         }
+        if (!selecting && !received) {
+            val actions = message.availableTransferActions()
+            if (actions.isNotEmpty()) {
+                bubble.addWithGap(ui.row().apply {
+                    for (action in actions) {
+                        val button = ui.action(action.label) { controlTransfer(message, action) }.apply {
+                            contentDescription = "${action.label} transfer"
+                            if (action == TransferAction.CANCEL) setTextColor(ui.errorColor)
+                        }
+                        addView(button, LinearLayout.LayoutParams(WRAP, ui.dp(40)))
+                    }
+                }, 3)
+            }
+        }
         val shownTime = DateUtils.formatDateTime(
             context,
             item.ts,
@@ -345,7 +397,10 @@ internal class ChatTimelineAdapter(
                 (if (received) DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_ABBREV_MONTH else 0),
         )
         val state = when {
+            message.transferState == TransferState.PAUSED -> "Paused"
+            message.transferState == TransferState.CANCELED -> "Canceled"
             message.error != null -> message.error
+            message.transferState == TransferState.FAILED -> "Failed"
             active != null -> null
             message.incoming && !message.delivered -> "Receiving"
             message.incoming -> null
@@ -435,6 +490,12 @@ internal class ChatTimelineAdapter(
         val size = file.size?.let { Formatter.formatShortFileSize(context, it) }
         val type = extension.takeIf { it.length in 1..8 }?.uppercase()
         details.addView(ui.label(listOfNotNull(size, type).joinToString(" · "), 12, metaColor))
+        file.relativePath?.substringBeforeLast('/', "")?.takeIf { it.isNotEmpty() }?.let { folder ->
+            details.addView(ui.label(folder, 12, metaColor).apply {
+                setSingleLine(true)
+                ellipsize = TextUtils.TruncateAt.START
+            })
+        }
         body.addView(details, LinearLayout.LayoutParams(0, WRAP, 1f))
         if (!selecting) {
             val menu = ui.iconAction(R.drawable.ic_chat_more, "Options for ${name}") {
@@ -442,7 +503,7 @@ internal class ChatTimelineAdapter(
             }
             body.addView(menu, LinearLayout.LayoutParams(ui.dp(36), ui.dp(36)).apply { marginStart = ui.dp(4) })
         }
-        if (openUri != null) body.contentDescription = "Open ${name}"
+        if (openUri != null && !selecting) body.contentDescription = "Open ${name}"
         return body
     }
 

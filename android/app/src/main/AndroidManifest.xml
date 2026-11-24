@@ -54,6 +54,7 @@
         </receiver>
 
         <receiver android:name=".NotificationReplyReceiver" android:exported="false" />
+        <receiver android:name=".NotificationTransferControlReceiver" android:exported="false" />
 
         <provider
             android:name=".SharedTextFileProvider"

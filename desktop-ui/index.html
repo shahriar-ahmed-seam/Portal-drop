@@ -391,7 +391,13 @@ svg { display: block; flex-shrink: 0; }
   display: block; margin: -2px -6px 6px -7px; border-radius: 12px; overflow: hidden; cursor: pointer;
   background: color-mix(in srgb, var(--muted) 15%, transparent);
 }
-.thumb img { display: block; width: 100%; max-height: 340px; object-fit: cover; }
+.thumb { position: relative; }
+.thumb img, .thumb video { display: block; width: 100%; max-height: 340px; object-fit: cover; }
+.thumb video { width: min(380px, 100%); aspect-ratio: 16 / 9; }
+.media-duration { position: absolute; right: 6px; bottom: 6px; padding: 2px 6px; border-radius: 6px; background: #18231e; color: #fff; font-size: 11px; }
+.media-play { position: absolute; left: 8px; bottom: 8px; color: white; background: #18231e; display: grid; place-items: center; border-radius: 50%; width: 26px; height: 26px; }
+.transfer-actions { display: flex; gap: 3px; align-self: flex-start; }
+.transfer-actions button { color: var(--accent); }
 
 .hover-tools {
   align-self: center; display: flex; gap: 2px; opacity: 0; transition: opacity .12s; pointer-events: none;
@@ -524,6 +530,16 @@ svg { display: block; flex-shrink: 0; }
 .files-row .meta2 { font-size: 12.5px; color: var(--muted); }
 .files-row .row-act { flex: 0 0 auto; opacity: .75; }
 .files-row:hover .row-act { opacity: 1; }
+.media-tabs { display: flex; margin-bottom: 12px; gap: 6px; flex-wrap: wrap; }
+.media-tabs [aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }
+.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(116px, 1fr)); gap: 8px; }
+.media-grid .list-empty { grid-column: 1 / -1; }
+.media-tile { color: var(--text); overflow: hidden; text-align: left; background: var(--input-bg); border-radius: 10px; }
+.media-tile:disabled { cursor: default; }
+.media-tile .thumb { margin: 0; border-radius: 0; aspect-ratio: 1; display: grid; place-items: center; color: var(--accent); }
+.media-tile .thumb img, .media-tile .thumb video { position: absolute; width: 100%; height: 100%; object-fit: cover; }
+.media-title { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 6px 8px; font-size: 12px; }
+.media-more { margin-top: 10px; }
 .path-card { padding: 14px; border-radius: 12px; background: var(--input-bg); border: 1px solid var(--line); }
 .path-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .path-badge { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
@@ -639,13 +655,18 @@ svg { display: block; flex-shrink: 0; }
           </div>
           <div class="banner" id="temp-banner" hidden>
             <span id="temp-icon"></span>
-            <div class="banner-body"><div class="banner-title">Temporary message</div><div class="banner-text">Deletes itself from both devices 10 minutes after sending</div></div>
+            <div class="banner-body"><div class="banner-title">Temporary message</div><div class="banner-text" id="temp-detail"></div></div>
             <button class="icon-btn sm" id="temp-cancel" title="Turn off"></button>
+          </div>
+          <div class="banner" id="clipboard-banner" hidden>
+            <img id="clipboard-preview" alt="Pasted image" width="42" height="42" style="object-fit:contain">
+            <div class="banner-body"><div class="banner-title">Clipboard image</div><div class="banner-text" id="clipboard-detail"></div></div>
+            <button class="icon-btn sm" id="clipboard-remove" title="Remove pasted image" aria-label="Remove pasted image"></button>
           </div>
           <div class="compose-row">
             <button class="icon-btn" id="attach" title="Attach files"></button>
             <textarea id="composer" rows="1" placeholder="Write a message…" spellcheck="true"></textarea>
-            <button class="icon-btn" id="temp-btn" title="Send next message as temporary (10 min)"></button>
+            <button class="icon-btn" id="temp-btn" title="Choose a temporary message timer" aria-label="Choose a temporary message timer"></button>
             <button class="send" id="send" title="Send (Enter)" disabled></button>
           </div>
         </div>
@@ -680,7 +701,7 @@ svg { display: block; flex-shrink: 0; }
     <div class="drawer-status"><i class="dot" id="drawer-dot"></i><span id="drawer-status">Checking…</span></div>
   </div>
   <div class="drawer-items scroll" id="drawer-items"></div>
-  <div class="drawer-foot">Portal Drop 0.3.2 · Local network only</div>
+  <div class="drawer-foot" id="drawer-version"></div>
 </nav>
 <div class="toast" id="toast"></div>
 
@@ -690,7 +711,10 @@ svg { display: block; flex-shrink: 0; }
    Host bridge (wry on Windows → window.ipc, WebKitGTK on Linux → messageHandlers)
    ======================================================================== */
 const DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001";
-const TEMP_TTL = 600;
+const APP_VERSION = "0.4.0";
+const RELEASE_REPO = "shahriar-ahmed-seam/Portal-drop";
+const TEMP_TIMERS = new Map([[300, "5 minutes"], [600, "10 minutes"], [3600, "1 hour"], [86400, "24 hours"]]);
+const MAX_CLIPBOARD_IMAGE = 16 * 1024 * 1024;
 const HOST = window.__PORTAL_HOST || (window.ipc ? "windows" : (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.portal ? "linux" : "demo"));
 const post = window.ipc && window.ipc.postMessage ? (m) => window.ipc.postMessage(m)
   : (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.portal) ? (m) => window.webkit.messageHandlers.portal.postMessage(m)
@@ -818,7 +842,10 @@ function remaining(exp) {
   const s = Math.floor((exp - Date.now()) / 1000);
   if (s <= 0) return "now";
   if (s < 60) return `${s}s`;
-  return `${Math.ceil(s / 60)}m`;
+  const minutes = Math.ceil(s / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const rest = minutes % 60;
+  return `${Math.floor(minutes / 60)}h${rest ? ` ${rest}m` : ""}`;
 }
 const AVATAR_COLORS = [["#6fe0b0", "#1f9d68"], ["#7cc8ff", "#2b86d6"], ["#ffb27a", "#e2703a"], ["#c49cff", "#7c55d9"], ["#ff95b4", "#d9467a"], ["#7ee0e0", "#1f9aa6"], ["#ffd36e", "#d39a14"]];
 function avatarFor(target, id, title) {
@@ -838,11 +865,52 @@ function fileKind(name) {
   return "file";
 }
 const isImageName = (n) => ["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"].includes((String(n || "").split(".").pop() || "").toLowerCase());
-function fileUrl(path) {
-  if (!path) return null;
-  if (HOST === "linux") return "file://" + String(path).split("/").map(encodeURIComponent).join("/");
-  if (HOST === "windows" && window.__PORTAL_FILE_PROTO) return window.__PORTAL_FILE_PROTO + encodeURIComponent(path);
+function fileUrl(r) {
+  if (!r.path) return null;
+  if (HOST === "linux") return "file://" + String(r.path).split("/").map(encodeURIComponent).join("/");
+  if (HOST === "windows" && window.__PORTAL_FILE_PROTO) return window.__PORTAL_FILE_PROTO + encodeURIComponent(r.id);
   return null;
+}
+const mediaObserver = new IntersectionObserver((entries, observer) => {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue;
+    observer.unobserve(entry.target);
+    entry.target.src = entry.target.dataset.mediaSrc;
+  }
+});
+function releaseMedia(node) {
+  for (const player of node.querySelectorAll("video")) mediaObserver.unobserve(player);
+}
+function previewMedia(container, r, isTile = false) {
+  const url = fileUrl(r), video = fileKind(r.name) === "video";
+  if (!url || (!video && !isImageName(r.name))) return;
+  if (!video) {
+    const image = el("img");
+    image.alt = "";
+    image.loading = "lazy";
+    image.onerror = () => isTile ? image.remove() : container.remove();
+    image.src = url;
+    container.append(image);
+    return;
+  }
+  const player = el("video");
+  player.preload = "metadata";
+  player.muted = true;
+  player.playsInline = true;
+  player.dataset.mediaSrc = url + "#t=0.1";
+  const duration = el("span", "media-duration");
+  duration.hidden = true;
+  player.onloadedmetadata = () => {
+    if (!Number.isFinite(player.duration) || player.duration <= 0) return;
+    const seconds = Math.floor(player.duration);
+    const mins = Math.floor(seconds / 60);
+    duration.textContent = mins + ":" + String(seconds % 60).padStart(2, "0");
+    duration.hidden = false;
+  };
+  const play = el("span", "media-play", icon("play", 15));
+  player.onerror = () => isTile ? (player.remove(), play.remove(), duration.remove()) : container.remove();
+  container.append(player, play, duration);
+  mediaObserver.observe(player);
 }
 function renderRich(text) {
   const parts = String(text || "").split(/```[^\n]*\n?([\s\S]*?)```/g);
@@ -870,7 +938,8 @@ function toast(text) {
    ======================================================================== */
 const state = {
   chatId: DEFAULT_CHAT, chats: [], previews: {}, rows: [], older: [], before: null, olderBefore: null,
-  status: {}, serviceActive: true, progress: new Map(), replyTo: {}, drafts: {}, tempArmed: false,
+  status: {}, serviceActive: true, progress: new Map(), replyTo: {}, drafts: {}, tempTtl: null,
+  pastedImage: null, sendingImage: false,
   selecting: false, selected: new Set(), refreshing: false, pendingRefresh: false, chatSig: "",
   stickBottom: true, forceBottom: true, filter: "", loaded: false, pairOpen: null,
   prefs: Object.assign({ theme: "light", sidebarCollapsed: false }, window.__PORTAL_PREFS || {}),
@@ -938,6 +1007,7 @@ $("reply-icon").innerHTML = icon("reply", 22, 2);
 $("temp-icon").innerHTML = icon("timer", 22, 2);
 $("reply-cancel").innerHTML = icon("close", 18);
 $("temp-cancel").innerHTML = icon("close", 18);
+$("clipboard-remove").innerHTML = icon("close", 18);
 $("attach").innerHTML = icon("clip", 23);
 $("temp-btn").innerHTML = icon("timer", 23);
 $("send").innerHTML = icon("send", 22);
@@ -1045,6 +1115,7 @@ function visibleRows() {
         delivered: false,
         name: p.name || "Receiving file…",
         size: p.total,
+        transfer_state: p.transfer_state,
         _live: true,
       });
     }
@@ -1080,9 +1151,38 @@ function metaHtml(r, block) {
   let h = "";
   if (r.expires_at) h += `<span class="ttl" title="Temporary message">${icon("timer", 11, 2.4)}${esc(remaining(r.expires_at))}</span>`;
   h += `<span>${esc(fmtTime(r.ts))}</span>`;
-  if (out) h += r.delivered ? `<span class="tick" title="Delivered">${icon("checks", 16, 2)}</span>` : `<span class="tick pending" title="Waiting for phone">${icon("clock", 13, 2)}</span>`;
-  else if (r.kind === "file" && !r.delivered) h += `<span>· receiving</span>`;
+  if (out && (r.delivered || !r.transfer_state || r.transfer_state === "queued")) {
+    h += r.delivered ? `<span class="tick" title="Delivered">${icon("checks", 16, 2)}</span>` : `<span class="tick pending" title="Waiting for phone">${icon("clock", 13, 2)}</span>`;
+  }
   return `<span class="meta${block ? " block" : ""}">${h}</span>`;
+}
+
+function transferButtons(r) {
+  if (r.delivered || !r.transfer_state || r.transfer_state === "canceled") return null;
+  const controls = el("div", "transfer-actions");
+  const primary = r.transfer_state === "paused" ? ["resume", "play"]
+    : r.transfer_state === "failed" ? ["retry", "history"]
+    : ["pause", "pause"];
+  for (const [action, glyph] of [primary, ["cancel", "close"]]) {
+    const label = action[0].toUpperCase() + action.slice(1) + " transfer";
+    const button = el("button", "icon-btn sm", icon(glyph, 16, 2));
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.onclick = async (event) => {
+      event.stopPropagation();
+      for (const child of controls.children) child.disabled = true;
+      try {
+        await ipc("transfer_control", { direction: r.direction, id: r.id, action });
+        await refresh();
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        for (const child of controls.children) child.disabled = false;
+      }
+    };
+    controls.append(button);
+  }
+  return controls;
 }
 
 function buildMessage(r, ctx) {
@@ -1097,7 +1197,7 @@ function buildMessage(r, ctx) {
     const snippet = ref ? (ref.text || ref.name || "Message").split("\n")[0] : "Original message";
     html += `<div class="quote" data-jump="${esc(r.reply_to)}"><div class="quote-author">${esc(author)}</div><div class="quote-text">${esc(snippet)}</div></div>`;
   }
-  if (r.kind === "text") {
+  if (r.kind === "text" && (r.delivered || !r.transfer_state)) {
     html += `<div class="text">${renderRich(r.text || "")}`;
     const endsWithCode = /```\s*$/.test(r.text || "");
     if (!endsWithCode && !r.text_truncated) html += metaHtml(r, false);
@@ -1106,21 +1206,33 @@ function buildMessage(r, ctx) {
     if (endsWithCode || r.text_truncated) html += metaHtml(r, true);
   } else {
     const prog = state.progress.get(r.id);
-    const url = r.path && isImageName(r.name) ? fileUrl(r.path) : null;
-    if (url) html += `<div class="thumb" data-open="1"><img src="${esc(url)}" alt="" loading="lazy" onerror="this.parentNode.remove()"></div>`;
     const kind = fileKind(r.name);
     const ic = !r.delivered ? (out ? "upload" : "download") : kind;
-    const tInfo = prog && !r.delivered ? transferSub(prog) : null;
+    const label = { paused: "Paused", canceled: "Canceled", failed: "Failed" }[r.transfer_state];
+    const tInfo = prog && !r.delivered && !label ? transferSub(prog) : null;
     let sub = fmtSize(r.size);
-    if (tInfo) sub = tInfo.text;
+    if (label) sub += ` · ${label}`;
+    else if (tInfo) sub = tInfo.text;
     else if (!r.delivered) sub += out ? " · waiting for phone" : " · receiving";
+    const name = r.name || (r.kind === "text" ? "Text message" : "File");
     html += `<div class="file${r.path ? " clickable" : ""}" ${r.path ? 'data-open="1"' : ""}>
       <div class="file-icon">${icon(ic, 22, 2)}</div>
-      <div class="file-info"><div class="file-name" title="${esc(r.name || "File")}">${esc(r.name || "File")}</div>
+      <div class="file-info"><div class="file-name" title="${esc(name)}">${esc(name)}</div>
       <div class="file-sub">${esc(sub)}</div>${tInfo ? `<div class="progress"><i style="width:${tInfo.pct}%"></i></div>` : ""}</div></div>`;
     html += metaHtml(r, true);
   }
   bubble.innerHTML = html;
+  const file = bubble.querySelector(".file");
+  if (file && r.path && (isImageName(r.name) || fileKind(r.name) === "video")) {
+    const preview = el("div", "thumb");
+    preview.dataset.open = "1";
+    previewMedia(preview, r);
+    if (preview.hasChildNodes()) file.before(preview);
+  }
+  if (file && !state.selecting) {
+    const controls = transferButtons(r);
+    if (controls) file.append(controls);
+  }
   if (!r._live) {
     bubble.oncontextmenu = (e) => { if (state.selecting) return; e.preventDefault(); messageMenu(e.clientX, e.clientY, r); };
   }
@@ -1184,13 +1296,19 @@ function renderMessages(mode) {
     let node = existing.get(it.key);
     if (!node || node.dataset.sig !== it.sig) {
       const fresh = it.build(); fresh.dataset.key = it.key; fresh.dataset.sig = it.sig;
-      if (node) node.replaceWith(fresh);
+      if (node) {
+        releaseMedia(node);
+        node.replaceWith(fresh);
+      }
       node = fresh;
     }
     const cur = inner.children[i];
     if (cur !== node) inner.insertBefore(node, cur || null);
   });
-  while (inner.children.length > items.length) inner.lastElementChild.remove();
+  while (inner.children.length > items.length) {
+    releaseMedia(inner.lastElementChild);
+    inner.lastElementChild.remove();
+  }
   restoreScroll(snap, mode);
   updateJump();
 }
@@ -1304,7 +1422,7 @@ $("chat-more").onclick = () => {
   const items = [];
   if (chat) items.push({ icon: "rename", label: "Rename chat", run: () => renameChat(chat) });
   items.push({ icon: "select", label: "Select messages", run: () => enterSelection() });
-  items.push({ icon: "history", label: "Received files", run: showReceived });
+  items.push({ icon: "image", label: "Shared media", run: () => showSharedMedia(state.chatId) });
   items.push({ icon: "folder", label: "Open download folder", run: () => ipc("open_receive_folder").catch((e) => toast(e.message)) });
   if (chat && state.chats.length > 1) items.push("-", { icon: "trash", label: "Delete chat", danger: true, run: () => deleteChat(chat) });
   showMenu(b.right - 230, b.bottom + 6, items);
@@ -1323,10 +1441,11 @@ function renderDrawer() {
   };
   add("qr", state.status.paired ? "Pair a new phone" : "Pair Android device", showPair);
   add("edit", "New chat", newChat);
+  add("search", "Search messages", showMessageSearch);
   add("sidebar", state.prefs.sidebarCollapsed ? "Show chat list" : "Hide chat list", toggleSidebar);
   add("bell", "Notifications & sounds", showNotificationSettings);
   add("folder", "Save location", showSaveFolderSettings);
-  add("history", "Received files", showReceived);
+  add("image", "Shared media", () => showSharedMedia());
   add("open", "Open save folder", () => ipc("open_receive_folder").catch((e) => toast(e.message)));
   add(state.serviceActive ? "pause" : "play", state.serviceActive ? "Pause background service" : "Resume background service",
     () => ipc(state.serviceActive ? "pause_service" : "resume_service").then(refresh).catch((e) => toast(e.message)));
@@ -1341,7 +1460,18 @@ function renderDrawer() {
   box.appendChild(sw);
   box.appendChild(el("div", "drawer-sep"));
   add("broom", "Clear received-files list", confirmClearHistory);
+  add("history", "Check for updates", checkForUpdates);
   if (state.status.paired) add("unlink", "Unpair phone", confirmUnpair, true);
+  if (state.trayAvailable) {
+    add("monitor", state.prefs.minimizeToTray ? "Close normally" : "Minimize to tray on close", async () => {
+      const prefs = { ...state.prefs, minimizeToTray: !state.prefs.minimizeToTray };
+      try {
+        await ipc("set_prefs", { prefs });
+        state.prefs = prefs;
+        toast(prefs.minimizeToTray ? "Closing the window will keep Portal Drop in the tray." : "Closing the window will exit the chat app.");
+      } catch (error) { toast(error.message); }
+    });
+  }
 }
 function openDrawer() { renderDrawer(); $("drawer").classList.add("show"); $("scrim").classList.add("show"); }
 function closeDrawer() { $("drawer").classList.remove("show"); $("scrim").classList.remove("show"); }
@@ -1352,7 +1482,14 @@ $("scrim").onclick = closeDrawer;
    Modals
    ======================================================================== */
 let openModalEl = null;
-function closeModal() { if (openModalEl) { openModalEl.remove(); openModalEl = null; state.pairOpen = null; } }
+function closeModal() {
+  if (openModalEl) {
+    releaseMedia(openModalEl);
+    openModalEl.remove();
+    openModalEl = null;
+    state.pairOpen = null;
+  }
+}
 function modal({ title, body, actions = [], wide = false, onClose }) {
   closeModal();
   const scrim = el("div", "modal-scrim");
@@ -1443,26 +1580,184 @@ function viewFull(id) {
     modal({ title: "Message", body: pre, wide: true, actions: [{ label: "Copy", keepOpen: true, onClick: () => copyText({ text: res.text }) }, { label: "Close", cls: "solid" }] });
   }).catch((e) => toast(e.message));
 }
-function showReceived() {
-  ipc("received_files").then((res) => {
-    const list = el("div", "files-list");
-    if (!res.items || !res.items.length) list.appendChild(el("div", "list-empty", "No received files yet"));
-    for (const it of res.items || []) {
-      const row = el("div", "files-row", `<div class="file-icon">${icon(fileKind(it.name), 20, 2)}</div>
-        <div class="file-info"><div class="file-name">${esc(it.name || "File")}</div><div class="meta2">${esc(fmtSize(it.size))} · ${esc(dayLabel(it.ts))}, ${esc(fmtTime(it.ts))}</div></div>`);
-      if (it.path) {
-        row.onclick = () => openFile(it.path);
-        const reveal = el("button", "icon-btn sm row-act", icon("folder", 18, 2));
-        reveal.title = "Show in folder";
-        reveal.onclick = (e) => { e.stopPropagation(); ipc("show_in_folder", { path: it.path }).catch(() => ipc("open_receive_folder")); };
-        row.appendChild(reveal);
-      } else {
-        row.style.opacity = ".55";
+function showMessageSearch() {
+  const body = el("div");
+  const input = el("input", "field");
+  input.type = "search";
+  input.placeholder = "Search message text or filenames";
+  input.setAttribute("aria-label", input.placeholder);
+  input.maxLength = 256;
+  const results = el("div", "files-list");
+  results.setAttribute("aria-live", "polite");
+  body.append(input, results);
+  modal({ title: "Search messages", body, wide: true });
+  let timer, generation = 0;
+  const showStatus = (message) => { results.replaceChildren(el("div", "list-empty", esc(message))); };
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const current = ++generation;
+    const query = input.value.trim();
+    if (!query) { results.replaceChildren(); return; }
+    showStatus("Searching…");
+    timer = setTimeout(async () => {
+      try {
+        const matches = await ipc("search_messages", { query });
+        if (current !== generation || !body.isConnected) return;
+        if (!matches.length) { showStatus("No matching messages or files"); return; }
+        results.replaceChildren();
+        for (const item of matches) {
+          const chat = state.chats.find((entry) => entry.id === item.chat_id);
+          const preview = item.kind === "file" ? item.name : item.text?.trim() || "Text message";
+          const row = el("div", "files-row");
+          const info = el("div", "file-info");
+          const title = el("div", "file-name");
+          title.textContent = `${preview}${item.text_truncated ? "…" : ""}`;
+          const meta = el("div", "meta2");
+          meta.textContent = `${chat?.title || "Chat"} · ${dayLabel(item.ts)}, ${fmtTime(item.ts)}`;
+          info.append(title, meta);
+          row.append(info);
+          if (item.kind === "text" || item.path) {
+            const view = el("button", "pill-btn", item.kind === "text" ? "Read" : "Open file");
+            view.onclick = () => item.kind === "text" ? viewFull(item.id) : openFile(item.path);
+            row.append(view);
+          }
+          if (chat) {
+            const destination = el("button", "pill-btn", "Open chat");
+            destination.onclick = () => { closeModal(); openChat(chat.id); };
+            row.append(destination);
+          }
+          results.append(row);
+        }
+      } catch (error) {
+        if (current === generation && body.isConnected) showStatus(error.message);
       }
-      list.appendChild(row);
+    }, 250);
+  });
+  input.focus();
+}
+function showSharedMedia(chatId) {
+  const body = el("div"), tabs = el("div", "media-tabs"), list = el("div");
+  const more = el("button", "pill-btn media-more", "Load more");
+  const status = el("div", "list-empty");
+  status.setAttribute("aria-live", "polite");
+  body.append(tabs, status, list, more);
+  modal({ title: "Shared media", body, wide: true });
+  const choices = [["photos-videos", "Photos & videos"], ["files", "Files"], ["links", "Links"]];
+  let selected, cursor, generation = 0;
+
+  for (const [key, title] of choices) {
+    const tab = el("button", "pill-btn", esc(title));
+    tab.dataset.tab = key;
+    tab.onclick = () => select(key);
+    tabs.append(tab);
+  }
+  more.onclick = () => load();
+  select(choices[0][0]);
+
+  function select(tab) {
+    selected = tab;
+    cursor = null;
+    generation++;
+    for (const button of tabs.children) button.setAttribute("aria-pressed", String(button.dataset.tab === tab));
+    releaseMedia(list);
+    list.replaceChildren();
+    list.className = tab === "photos-videos" ? "media-grid" : "files-list";
+    load();
+  }
+
+  async function load() {
+    const token = generation, tab = selected;
+    more.hidden = true;
+    status.hidden = false;
+    status.textContent = "Loading…";
+    try {
+      const page = await ipc("shared_media", { tab, before: cursor, chatId });
+      if (token !== generation || !body.isConnected) return;
+      for (const item of page.items || []) {
+        list.append(tab === "photos-videos" ? mediaTile(item) : mediaRow(item, tab));
+      }
+      cursor = page.next_before ?? null;
+      more.hidden = cursor === null;
+      status.hidden = list.hasChildNodes() || cursor !== null;
+      status.textContent = status.hidden ? "" : "Nothing shared here yet";
+    } catch (error) {
+      if (token === generation && body.isConnected) status.textContent = error.message;
     }
-    modal({ title: "Received files", body: list, wide: true, actions: [{ label: "Open folder", onClick: () => ipc("open_receive_folder") }, { label: "Close", cls: "solid" }] });
-  }).catch((e) => toast(e.message));
+  }
+}
+
+function mediaTile(item) {
+  const button = el("button", "media-tile");
+  const thumb = el("div", "thumb", icon(fileKind(item.name), 24));
+  const title = el("span", "media-title");
+  title.textContent = item.name || "Media";
+  button.title = title.textContent;
+  button.disabled = !item.path;
+  button.onclick = () => openFile(item.path);
+  previewMedia(thumb, item, true);
+  button.append(thumb, title);
+  return button;
+}
+
+function mediaRow(item, tab) {
+  const links = tab === "links";
+  const row = el("div", "files-row", `<div class="file-icon">${icon(links ? "link" : fileKind(item.name), 20, 2)}</div>`);
+  const info = el("div", "file-info");
+  const title = el("div", "file-name");
+  const meta = el("div", "meta2");
+  const link = links && (item.text || "").match(/https?:\/\/[^\s<>"']+/i)?.[0].replace(/[.,;!?)]*$/, "");
+  title.textContent = links ? link || "Link in message" : item.name || "File";
+  meta.textContent = `${links ? "" : fmtSize(item.size) + " · "}${dayLabel(item.ts)}, ${fmtTime(item.ts)}`;
+  info.append(title, meta);
+  row.append(info);
+  if (links || item.path) {
+    const open = el("button", "pill-btn", links && !link ? "Read message" : "Open");
+    open.onclick = () => {
+      if (links && link) ipc("open_url", { url: link }).catch((error) => toast(error.message));
+      else if (links) viewFull(item.id);
+      else openFile(item.path);
+    };
+    row.append(open);
+  }
+  if (item.path) {
+    const reveal = el("button", "icon-btn sm row-act", icon("folder", 18, 2));
+    reveal.title = "Show in folder";
+    reveal.setAttribute("aria-label", reveal.title);
+    reveal.onclick = () => ipc("show_in_folder", { path: item.path }).catch((error) => toast(error.message));
+    row.append(reveal);
+  }
+  return row;
+}
+
+async function checkForUpdates() {
+  const body = el("div", null, "Checking GitHub Releases…");
+  body.setAttribute("aria-live", "polite");
+  modal({ title: "Check for updates", body });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`, {
+      headers: { Accept: "application/vnd.github+json" }, signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`GitHub returned HTTP ${response.status}`);
+    const { tag_name: tag } = await response.json();
+    if (!/^v?\d+\.\d+\.\d+$/.test(tag)) throw new Error("The release has an unrecognized version");
+    const current = APP_VERSION.split(".").map(Number);
+    const latest = tag.replace(/^v/, "").split(".").map(Number);
+    const changed = latest.findIndex((value, i) => value !== current[i]);
+    if (changed < 0 || latest[changed] < current[changed]) {
+      body.textContent = `Portal Drop ${APP_VERSION} is up to date.`;
+      return;
+    }
+    body.textContent = `Portal Drop ${latest.join(".")} is available. You have ${APP_VERSION}.`;
+    const open = el("button", "pill-btn solid media-more", "View release");
+    open.onclick = () => ipc("open_url", { url: `https://github.com/${RELEASE_REPO}/releases/tag/${tag}` }).catch((error) => toast(error.message));
+    body.append(el("br"), open);
+  } catch (error) {
+    body.textContent = error.name === "AbortError" ? "The update check timed out." : `Could not check for updates. ${error.message}`;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 async function showSaveFolderSettings() {
   let cur;
@@ -1657,35 +1952,115 @@ function setReply(r, focus = true) {
     if (focus) $("composer").focus();
   }
 }
-function setTemp(on) {
-  state.tempArmed = !!on;
-  $("temp-banner").hidden = !on;
-  $("temp-btn").classList.toggle("active", !!on);
+function setTemp(ttl) {
+  state.tempTtl = ttl;
+  $("temp-banner").hidden = ttl === null;
+  $("temp-btn").classList.toggle("active", ttl !== null);
+  $("temp-detail").textContent = ttl ? `Expires ${TEMP_TIMERS.get(ttl)} after sending` : "";
 }
 $("reply-cancel").onclick = () => setReply(null);
-$("temp-cancel").onclick = () => setTemp(false);
-$("temp-btn").onclick = () => { setTemp(!state.tempArmed); $("composer").focus(); };
+$("temp-cancel").onclick = () => setTemp(null);
+$("temp-btn").onclick = () => modal({
+  title: "Temporary message timer",
+  body: "Applies to the next message or attachment.",
+  actions: [...TEMP_TIMERS].map(([ttl, label]) => ({ label, cls: state.tempTtl === ttl ? "solid" : "", onClick: () => setTemp(ttl) }))
+    .concat({ label: "Off", onClick: () => setTemp(null) })
+});
+
+function imageForChat() {
+  return state.pastedImage?.chatId === state.chatId ? state.pastedImage : null;
+}
+function setPastedImage(image) {
+  if (state.pastedImage) URL.revokeObjectURL(state.pastedImage.preview);
+  state.pastedImage = image;
+  resizeComposer();
+}
+$("clipboard-remove").onclick = () => setPastedImage(null);
+function stagePastedImage(file) {
+  if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) {
+    toast("Paste a PNG, JPEG, WebP or GIF image.");
+    return;
+  }
+  if (!file.size || file.size > MAX_CLIPBOARD_IMAGE) {
+    toast("Clipboard images must be between 1 byte and 16 MiB.");
+    return;
+  }
+  setPastedImage({ file, chatId: state.chatId, preview: URL.createObjectURL(file) });
+}
+window.__portalClipboardImage = ({ chatId, mimeType, base64, error }) => {
+  if (document.activeElement !== $("composer") || !state.status.paired || state.chatId !== chatId) return;
+  if (error) { toast(error); return; }
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  stagePastedImage(new Blob([bytes], { type: mimeType }));
+};
+$("composer").addEventListener("paste", (event) => {
+  const file = Array.from(event.clipboardData?.files || []).find((entry) => entry.type.startsWith("image/")) ||
+    Array.from(event.clipboardData?.items || []).find((entry) => entry.kind === "file" && entry.type.startsWith("image/"))?.getAsFile();
+  if (!file || !state.status.paired) return;
+  event.preventDefault();
+  stagePastedImage(file);
+});
 function resizeComposer() {
   const c = $("composer");
   c.style.height = "auto"; c.style.height = Math.min(c.scrollHeight, 180) + "px";
-  const ready = !!c.value.trim();
+  const image = imageForChat();
+  $("clipboard-banner").hidden = !image;
+  if (image) {
+    $("clipboard-preview").src = image.preview;
+    $("clipboard-detail").textContent = fmtSize(image.file.size);
+  } else $("clipboard-preview").removeAttribute("src");
+  const ready = !state.sendingImage && (!!image || !!c.value.trim());
+  $("send").title = image ? "Send image (Enter)" : "Send (Enter)";
   $("send").disabled = !ready; $("send").classList.toggle("ready", ready);
 }
 function consumeMeta() {
   const meta = { chatId: state.chatId };
   const r = state.replyTo[state.chatId]; if (r) meta.replyTo = r.id;
-  if (state.tempArmed) { meta.ttl = TEMP_TTL; setTemp(false); }
+  if (state.tempTtl !== null) { meta.ttl = state.tempTtl; setTemp(null); }
   setReply(null, false);
   return meta;
 }
 async function sendText() {
+  if (state.sendingImage) return;
+  const image = imageForChat();
+  if (image) {
+    state.sendingImage = true;
+    resizeComposer();
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(",", 2)[1]);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(image.file);
+      });
+      if (image !== imageForChat()) return;
+      const prevReply = state.replyTo[state.chatId];
+      const meta = consumeMeta();
+      try {
+        await ipc("send_image", { ...meta, base64 });
+        if (state.pastedImage === image) setPastedImage(null);
+        if (state.chatId === meta.chatId) state.forceBottom = true;
+        refresh();
+      } catch (error) {
+        if (state.chatId === meta.chatId) {
+          if (meta.ttl && !state.tempTtl) setTemp(meta.ttl);
+          if (prevReply && !state.replyTo[state.chatId]) setReply(prevReply, false);
+        }
+        throw error;
+      }
+    } catch (error) { toast(error?.message || "Could not send the clipboard image."); }
+    finally { state.sendingImage = false; resizeComposer(); }
+    return;
+  }
   const c = $("composer"); const text = c.value;
   if (!text.trim()) return;
-  const wasTemp = state.tempArmed, prevReply = state.replyTo[state.chatId];
+  const wasTemp = state.tempTtl, prevReply = state.replyTo[state.chatId];
   const meta = consumeMeta();
   c.value = ""; resizeComposer(); state.forceBottom = true;
   try { await ipc("send_text", { ...meta, text }); refresh(); }
-  catch (e) { if (!c.value) { c.value = text; resizeComposer(); } if (wasTemp) setTemp(true); if (prevReply) setReply(prevReply); toast(e.message); }
+  catch (e) { if (state.chatId === meta.chatId) { if (!c.value) { c.value = text; resizeComposer(); } if (wasTemp && !state.tempTtl) setTemp(wasTemp); if (prevReply && !state.replyTo[state.chatId]) setReply(prevReply); } toast(e.message); }
 }
 $("composer").addEventListener("input", resizeComposer);
 $("composer").addEventListener("keydown", (e) => {
@@ -1698,18 +2073,18 @@ $("composer").addEventListener("keydown", (e) => {
 });
 $("send").onclick = sendText;
 $("attach").onclick = async () => {
-  const wasTemp = state.tempArmed;
+  const wasTemp = state.tempTtl;
   const meta = consumeMeta();
   state.forceBottom = true;
   try {
     const res = await ipc("pick_files", meta);
-    if (res && res.cancelled) { if (wasTemp) setTemp(true); }
+    if (res && res.cancelled) { if (wasTemp && state.chatId === meta.chatId && !state.tempTtl) setTemp(wasTemp); }
     else {
       if (res && res.errors && res.errors.length) toast(`Added ${res.sent || 0} file(s); ${res.errors.length} failed`);
       refresh();
     }
   }
-  catch (e) { if (wasTemp) setTemp(true); toast(e.message); }
+  catch (e) { if (wasTemp && state.chatId === meta.chatId && !state.tempTtl) setTemp(wasTemp); toast(e.message); }
 };
 $("new-chat").onclick = newChat;
 $("onboard-pair").onclick = showPair;
@@ -1719,7 +2094,7 @@ $("onboard-pair").onclick = showPair;
    ======================================================================== */
 window.__portalDragEnter = ({ names = [] } = {}) => {
   const chat = state.chats.find((c) => c.id === state.chatId);
-  $("dnd-sub").textContent = `${names.length ? `${names.length} file${names.length > 1 ? "s" : ""}` : "Files"} will be sent to ${chat ? chat.title : "this chat"}`;
+  $("dnd-sub").textContent = `${names.length ? `${names.length} item${names.length > 1 ? "s" : ""}` : "Files and folders"} will be sent to ${chat ? chat.title : "this chat"}`;
   $("dnd-chips").innerHTML = names.slice(0, 8).map((n) => `<span class="chip">${esc(n)}</span>`).join("") + (names.length > 8 ? `<span class="chip">+${names.length - 8} more</span>` : "");
   $("dnd").classList.add("show");
 };
@@ -1728,7 +2103,12 @@ window.__portalDropFiles = async ({ paths = [] } = {}) => {
   $("dnd").classList.remove("show");
   if (!paths.length || !state.status.paired) return;
   const meta = consumeMeta(); state.forceBottom = true;
-  try { const res = await ipc("send_files", { ...meta, paths }); if (res && res.skipped) toast(`Skipped ${res.skipped} folder${res.skipped > 1 ? "s" : ""}`); refresh(); }
+  try {
+    const res = await ipc("send_files", { ...meta, paths });
+    if (res?.errors?.length) toast(res.errors[0]);
+    else if (res?.skipped) toast(`Skipped ${res.skipped} unavailable item${res.skipped > 1 ? "s" : ""}`);
+    refresh();
+  }
   catch (e) { toast(e.message); }
 };
 // Block the browser's own file-drop navigation; the native host delivers real paths.
@@ -1744,7 +2124,9 @@ async function refresh() {
     const wasPaired = !!state.status.paired;
     const snap = await ipc("snapshot", { chatId: state.chatId });
     state.serviceActive = snap.serviceActive !== false;
+    state.trayAvailable = snap.trayAvailable === true;
     state.status = snap.status || {};
+    if (wasPaired && !state.status.paired && state.pastedImage) setPastedImage(null);
     state.chats = snap.chats || [];
     state.previews = {}; for (const p of snap.previews || []) state.previews[p.chat_id] = p;
     if (snap.chatId && snap.chatId !== state.chatId) {
@@ -1794,8 +2176,7 @@ document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") { e.preventDefault(); toggleSidebar(); return; }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
     e.preventDefault();
-    if (state.prefs.sidebarCollapsed) setSidebarCollapsed(false);
-    $("search").focus();
+    showMessageSearch();
     return;
   }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
@@ -1844,6 +2225,8 @@ const Demo = {
       case "snapshot": return ok({ serviceActive: true, status: d.status, chats: d.chats, chatId: p.chatId || DEFAULT_CHAT,
         history: { items: (p.chatId === DEFAULT_CHAT || !p.chatId) ? [...d.rows].reverse() : [], next_before: null }, progress: d.progress, previews: d.previews });
       case "send_text": d.rows.push({ id: "x" + Date.now(), kind: "text", ts: Date.now(), direction: "sent", delivered: false, text: p.text, reply_to: p.replyTo, expires_at: p.ttl ? Date.now() + p.ttl * 1000 : undefined }); return ok({ ok: true });
+      case "send_image": d.rows.push({ id: "x" + Date.now(), kind: "file", ts: Date.now(), direction: "sent", delivered: false, name: "Clipboard image.png", reply_to: p.replyTo, expires_at: p.ttl ? Date.now() + p.ttl * 1000 : undefined }); return ok({ ok: true });
+      case "search_messages": return ok(d.rows.filter((r) => (r.text || r.name || "").toLowerCase().includes(p.query.toLowerCase())).reverse().map((r) => ({ ...r, chat_id: r.chat_id || DEFAULT_CHAT })));
       case "new_chat": { const c = { id: "n" + Date.now(), title: new Date().toISOString().slice(0, 10), created_at: Date.now(), updated_at: Date.now() }; d.chats.push(c); return ok(c); }
       case "pair": return ok({ qr: "", link: "portaldrop://pair?h=192.168.0.10&p=53621&c=demo" });
       case "received_files": return ok({ items: d.rows.filter((r) => r.kind === "file" && r.direction === "received").map((r) => ({ ...r, path: r.path || "/tmp/x" })) });
@@ -1859,6 +2242,7 @@ const Demo = {
 };
 
 /* boot */
+$("drawer-version").textContent = `Portal Drop ${APP_VERSION} · Local network only`;
 resizeComposer();
 renderDrawer();
 refresh();

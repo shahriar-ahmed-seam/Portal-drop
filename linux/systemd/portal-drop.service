@@ -7,6 +7,9 @@ Type=simple
 ExecStart=%h/.local/bin/portal-drop serve
 Restart=on-failure
 RestartSec=3s
+WatchdogSec=30s
+NotifyAccess=main
+TimeoutStopSec=12s
 UMask=0077
 NoNewPrivileges=yes
 
