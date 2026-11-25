@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import subprocess
@@ -159,6 +160,154 @@ def service_active():
         ).returncode
         == 0
     )
+
+
+class LocalHotspot:
+    BUS = "org.freedesktop.NetworkManager"
+    ROOT = "/org/freedesktop/NetworkManager"
+    DEVICE = f"{BUS}.Device"
+    WIRELESS = f"{DEVICE}.Wireless"
+    ACTIVE = f"{BUS}.Connection.Active"
+    IP4 = f"{BUS}.IP4Config"
+    WIFI = 2
+    WIFI_AP = 0x40
+    WIFI_RSN = 0x20
+    DEVICE_DISCONNECTED = 30
+    DEVICE_ACTIVATED = 100
+    ACTIVATING = 1
+    ACTIVATED = 2
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = None
+        self.bus = None
+
+    def call(self, path, interface, method, parameters=None, interactive=False):
+        if self.bus is None or self.bus.is_closed():
+            self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        flags = (Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION if interactive
+                 else Gio.DBusCallFlags.NO_AUTO_START)
+        return self.bus.call_sync(
+            self.BUS, path, interface, method, parameters, None,
+            flags, 30_000 if interactive else 3_000, None,
+        ).unpack()
+
+    def properties(self, path, interface):
+        return self.call(path, "org.freedesktop.DBus.Properties", "GetAll",
+                         GLib.Variant("(s)", (interface,)))[0]
+
+    def adapters(self):
+        paths = self.call(self.ROOT, self.BUS, "GetDevices")[0]
+        adapters = []
+        for path in paths:
+            try:
+                device = self.properties(path, self.DEVICE)
+                if device.get("DeviceType") != self.WIFI or not device.get("Managed"):
+                    continue
+                state = device.get("State", 0)
+                if not self.DEVICE_DISCONNECTED <= state <= self.DEVICE_ACTIVATED:
+                    continue
+                wireless = self.properties(path, self.WIRELESS)
+                caps = wireless.get("WirelessCapabilities", 0)
+                # Avoid taking over a hotspot created outside Portal Drop.
+                protected_ap = self.WIFI_AP | self.WIFI_RSN
+                if wireless.get("Mode") == 3 or caps & protected_ap != protected_ap:
+                    continue
+                adapters.append({"device": path, "interface": device["Interface"],
+                                 "connected": state != self.DEVICE_DISCONNECTED})
+            except GLib.Error:
+                # An adapter can disappear between the device list and its properties.
+                continue
+        return sorted(adapters, key=lambda adapter: (adapter["connected"], adapter["interface"]))
+
+    def info(self):
+        if self.active is None:
+            return None
+        path, config = self.active
+        try:
+            active = self.properties(path, self.ACTIVE)
+        except GLib.Error as error:
+            # NetworkManager removes the active object on disconnect.
+            if Gio.DBusError.get_remote_error(error) not in (
+                "org.freedesktop.DBus.Error.UnknownObject", "org.freedesktop.DBus.Error.UnknownMethod",
+            ):
+                raise
+            active = {}
+        if active.get("State") not in (self.ACTIVATING, self.ACTIVATED):
+            self.active = None
+            return None
+        ip_config = active.get("Ip4Config")
+        addresses = self.properties(ip_config, self.IP4).get("AddressData", []) if ip_config and ip_config != "/" else []
+        address = next((row["address"] for row in addresses if row.get("address")), None)
+        return {**config, "address": address, "ready": bool(address and active["State"] == self.ACTIVATED)}
+
+    def status(self):
+        with self.lock:
+            hotspot = self.info()
+            if hotspot:
+                return {"active": hotspot, "adapters": []}
+            try:
+                adapters = self.adapters()
+            except GLib.Error:
+                return {"active": None, "adapters": [], "reason": "NetworkManager is unavailable."}
+            reason = None if adapters else "No available Wi-Fi adapter supports a protected hotspot."
+            return {"active": None, "adapters": adapters, "reason": reason}
+
+    def start(self, device_path):
+        with self.lock:
+            hotspot = self.info()
+            if hotspot:
+                return hotspot
+            adapter = next((item for item in self.adapters() if item["device"] == device_path), None)
+            if adapter is None:
+                raise RuntimeError("Choose an available Wi-Fi adapter.")
+            service_ctl("start")
+            ssid = f"Portal Drop {secrets.token_hex(3).upper()}"
+            password = secrets.token_urlsafe(15)
+            variant = GLib.Variant
+            settings = {
+                "connection": {
+                    "id": variant("s", ssid), "type": variant("s", "802-11-wireless"),
+                    "autoconnect": variant("b", False),
+                },
+                "802-11-wireless": {"ssid": variant("ay", ssid.encode("ascii")), "mode": variant("s", "ap")},
+                "802-11-wireless-security": {
+                    "key-mgmt": variant("s", "wpa-psk"), "proto": variant("as", ["rsn"]),
+                    "psk": variant("s", password),
+                },
+                "ipv4": {"method": variant("s", "shared"), "never-default": variant("b", True)},
+                "ipv6": {"method": variant("s", "disabled")},
+            }
+            options = {"persist": variant("s", "volatile"), "bind-activation": variant("s", "dbus-client")}
+            try:
+                _, path, _ = self.call(
+                    self.ROOT, self.BUS, "AddAndActivateConnection2",
+                    variant("(a{sa{sv}}ooa{sv})", (settings, device_path, "/", options)), interactive=True,
+                )
+            except GLib.Error as error:
+                raise RuntimeError("NetworkManager could not start the hotspot. Check the adapter and Wi-Fi permissions.") from error
+            self.active = (path, {"ssid": ssid, "password": password, "interface": adapter["interface"]})
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                hotspot = self.info()
+                if hotspot is None:
+                    raise RuntimeError("The Wi-Fi adapter could not activate the hotspot.")
+                if hotspot["ready"]:
+                    return hotspot
+                time.sleep(0.25)
+            self.deactivate()
+            raise RuntimeError("The hotspot did not receive a local IP address.")
+
+    def deactivate(self):
+        if self.active is not None:
+            self.call(self.ROOT, self.BUS, "DeactivateConnection",
+                      GLib.Variant("(o)", (self.active[0],)), interactive=True)
+            self.active = None
+
+    def stop(self):
+        with self.lock:
+            if self.info():
+                self.deactivate()
 
 
 def error_details(error):
@@ -553,6 +702,7 @@ class PortalWindow(Gtk.ApplicationWindow):
         self.set_size_request(680, 480)
 
         self.work = ThreadPoolExecutor(max_workers=4)
+        self.hotspot = LocalHotspot()
         self.closed = False
         self.ui_ready = False
         self.queued_js = []
@@ -1022,12 +1172,25 @@ class PortalWindow(Gtk.ApplicationWindow):
         if action == "clear_history":
             run_cli("clear-history")
             return {"ok": True}
+        if action == "lan_addresses":
+            return get_json("lan-addresses")
+        if action == "announce_hotspot":
+            return get_json("announce-hotspot", "--address", str(payload.get("address") or ""))
+        if action == "hotspot_status":
+            return self.hotspot.status()
+        if action == "hotspot_start":
+            return self.hotspot.start(payload.get("device"))
+        if action == "hotspot_stop":
+            self.hotspot.stop()
+            return {"ok": True}
         if action == "pair":
             try:
                 service_ctl("start")
             except Exception:
                 pass
-            output = run_cli("pair").rstrip("\n")
+            address = str(payload.get("address") or "")
+            args = ["pair", "--address", address] if address else ["pair"]
+            output = run_cli(*args).rstrip("\n")
             lines = output.split("\n")
             link = lines[-1] if lines else ""
             qr = "\n".join(lines[:-2]) if len(lines) >= 2 else ""

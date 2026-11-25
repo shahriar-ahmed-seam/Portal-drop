@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, ErrorKind, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
@@ -97,20 +97,34 @@ struct WakeConfig {
 }
 
 pub fn wake_daemon(data_dir: &FsPath) {
-    let path = data_dir.join("wake.json");
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(config) = serde_json::from_str::<WakeConfig>(&raw) else {
-        return;
-    };
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
-    if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+    if let Some((mut stream, config)) = connect_local_wake(data_dir) {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
         let _ = writeln!(stream, "wake {}", config.token);
         let _ = stream.flush();
     }
+}
+
+fn connect_local_wake(data_dir: &FsPath) -> Option<(TcpStream, WakeConfig)> {
+    let raw = fs::read_to_string(data_dir.join("wake.json")).ok()?;
+    let config = serde_json::from_str::<WakeConfig>(&raw).ok()?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
+    Some((stream, config))
+}
+
+pub fn local_listen_address(data_dir: &FsPath) -> Option<SocketAddr> {
+    let (mut stream, config) = connect_local_wake(data_dir)?;
+    let timeout = Some(Duration::from_millis(250));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+    writeln!(stream, "listen {}", config.token).ok()?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .take(80)
+        .read_line(&mut response)
+        .ok()?;
+    response.trim().parse().ok()
 }
 
 pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: bool) -> Result<()> {
@@ -126,7 +140,7 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
 
     let (events_tx, _) = broadcast::channel::<&'static str>(64);
     let wake_path = files.data_dir().join("wake.json");
-    let _wake_guard = start_local_wake_server(&wake_path, events_tx.clone());
+    let _wake_guard = start_local_wake_server(&wake_path, events_tx.clone(), address);
 
     let app_state = App {
         store: store.clone(),
@@ -254,6 +268,7 @@ impl Drop for WakeGuard {
 fn start_local_wake_server(
     wake_path: &FsPath,
     events_tx: broadcast::Sender<&'static str>,
+    transfer_address: SocketAddr,
 ) -> Option<WakeGuard> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let port = listener.local_addr().ok()?.port();
@@ -290,6 +305,12 @@ fn start_local_wake_server(
                 if let Some(candidate) = trimmed.strip_prefix("wake ") {
                     if bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())) {
                         let _ = tx.send("sync");
+                    }
+                } else if let Some(candidate) = trimmed.strip_prefix("listen ") {
+                    if bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())) {
+                        let mut out = stream;
+                        let _ = out.set_write_timeout(Some(Duration::from_millis(250)));
+                        let _ = writeln!(out, "{transfer_address}");
                     }
                 } else if let Some(candidate) = trimmed.strip_prefix("watch ") {
                     if !bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())) {

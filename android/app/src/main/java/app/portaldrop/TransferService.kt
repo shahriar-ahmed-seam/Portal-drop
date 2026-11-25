@@ -64,6 +64,7 @@ class TransferService : Service() {
     private val inFlight = ConcurrentHashMap.newKeySet<String>()
     private val store by lazy { PortalStore.get(this) }
     private val discovery by lazy { PortalDiscovery(applicationContext) }
+    private val hotspotAnnouncements = HotspotAnnouncements()
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
     private val notifications by lazy { getSystemService(NotificationManager::class.java) }
     private val networkGeneration = AtomicInteger()
@@ -74,7 +75,7 @@ class TransferService : Service() {
 
         override fun onLost(network: Network) {
             val link = currentLink
-            if (link?.network == network) link.session.cancel()
+            if (link != null && (link.route as? PortalRoute.Attached)?.network == network) link.session.cancel()
             networkChanged()
         }
     }
@@ -120,6 +121,7 @@ class TransferService : Service() {
         running = false
         currentLink?.session?.cancel()
         discovery.stop()
+        hotspotAnnouncements.stop()
         if (observing) connectivity.unregisterNetworkCallback(observer)
         signal()
         signalMessages()
@@ -135,8 +137,8 @@ class TransferService : Service() {
     private fun runTransfers() {
         var retryDelay = 1_000L
         var lastDiscovery = -DISCOVERY_INTERVAL_MS
-        var preferredNetwork: Network? = null
-        var previousNetworks: List<Network> = emptyList()
+        var preferredRoute: PortalRoute? = null
+        var previousRoutes: List<PortalRoute> = emptyList()
         var previousGeneration = -1
         var routeFailures = 0
         var idlePolls = 0
@@ -153,37 +155,62 @@ class TransferService : Service() {
                     idlePolls = 0
                 }
                 cleanupCanceledTransfers(this, store, peer)
-                val networks = portalNetworks(this, peer.host)
+                val hotspot = store.hotspotPeer(peer)
+                val previous = store.previousPeer(peer)
+                val hosting = OfflineHotspotService.isActive()
+                val routes = portalRoutes(
+                    this, peer.host, allowHotspot = hotspot != null || hosting, previousHost = previous?.host,
+                )
+                    .sortedByDescending { route -> route is PortalRoute.Hosted && route.permits(hotspot?.host?.let(::portalAddress)) }
                 val generation = networkGeneration.get()
-                if (previousNetworks != networks || previousGeneration != generation) {
-                    previousNetworks = networks
+                if (previousRoutes != routes || previousGeneration != generation) {
+                    previousRoutes = routes
                     previousGeneration = generation
                     discovered.removeAll { it.generation != generation }
-                    preferredNetwork = null
+                    preferredRoute = null
                     routeFailures = 0
                     retryDelay = 1_000L
                     lastDiscovery = -DISCOVERY_INTERVAL_MS
                 }
-                if (networks.isEmpty()) {
+                val hostedRoute = routes.filterIsInstance<PortalRoute.Hosted>().firstOrNull()
+                hotspotAnnouncements.update(peer.fingerprint, hostedRoute?.takeIf { hosting }, generation) { host, port ->
+                    if (running && hosting && networkGeneration.get() == generation && hostedRoute != null &&
+                        OfflineHotspotService.isActive()
+                    ) {
+                        enqueueEndpoint(Endpoint(peer.fingerprint, hostedRoute, host, port, generation))
+                        signal()
+                    }
+                }
+                if (routes.isEmpty()) {
                     dropLink()
                     markOffline()
                     await(15_000L)
                     continue
                 }
-                val network = preferredNetwork?.takeIf(networks::contains) ?: networks.first()
-                val candidate = discovered.firstOrNull {
-                    it.peer.fingerprint == peer.fingerprint && it.network == network && it.generation == generation
+                val candidate = if (status == Status.CONNECTED) null else discovered.firstOrNull {
+                    it.fingerprint == peer.fingerprint && it.route in routes && it.generation == generation
                 }
-                val endpoint = candidate?.let { peer.copy(host = it.host, port = it.port) } ?: peer
-                val link = linkFor(endpoint, network)
+                val route = candidate?.route ?: preferredRoute?.takeIf(routes::contains) ?: routes.first()
+                val cached = when (route) {
+                    is PortalRoute.Hosted -> hotspot?.takeIf { route.matches(this, it.host) }
+                    is PortalRoute.Attached -> previous?.takeIf {
+                        !route.matches(this, peer.host) && route.matches(this, it.host)
+                    }
+                }
+                val rememberedEndpoint = if (route is PortalRoute.Hosted) hotspot else peer
+                val endpoint = candidate?.let { peer.copy(host = it.host, port = it.port) } ?: cached ?: peer
+                val endpointChanged = rememberedEndpoint == null ||
+                    endpoint.host != rememberedEndpoint.host || endpoint.port != rememberedEndpoint.port
+                val link = linkFor(endpoint, route)
                 var delay: Long
                 var authenticated = false
                 try {
                     val available = link.session.outbox()
                     authenticated = true
                     if (!running) break
-                    if (candidate != null) {
-                        store.updateEndpoint(peer, candidate.host, candidate.port)
+                    if (endpointChanged && networkGeneration.get() == generation) {
+                        if (route is PortalRoute.Hosted) store.updateHotspotEndpoint(peer, endpoint.host, endpoint.port)
+                        else store.updateEndpoint(peer, endpoint.host, endpoint.port)
                         discovered.clear()
                         publishUpdate(this)
                     }
@@ -212,7 +239,7 @@ class TransferService : Service() {
                     }
                     retryDelay = 1_000L
                     routeFailures = 0
-                    preferredNetwork = network
+                    preferredRoute = route
                 } catch (error: Exception) {
                     if (!running) break
                     if (store.peer()?.fingerprint != peer.fingerprint) continue
@@ -230,15 +257,20 @@ class TransferService : Service() {
                     }
                     Log.d(TAG, "The transfer connection will retry.", error)
                     markOffline()
+                    if (route is PortalRoute.Attached && previous != null &&
+                        (previous.host != endpoint.host || previous.port != endpoint.port) &&
+                        route.matches(this, previous.host)
+                    ) {
+                        enqueueEndpoint(Endpoint(peer.fingerprint, route, previous.host, previous.port, generation))
+                    }
                     val now = SystemClock.elapsedRealtime()
-                    if (localRoute(this, network) && now - lastDiscovery >= DISCOVERY_INTERVAL_MS) {
+                    if (now - lastDiscovery >= DISCOVERY_INTERVAL_MS) {
                         lastDiscovery = now
-                        discovery.find(peer, network) { hosts, port ->
+                        discovery.find(peer, routes) { candidates, port ->
                             if (running && networkGeneration.get() == generation) {
-                                discovered.removeAll { it.network == network }
-                                for (host in hosts) {
-                                    if (host != peer.host || port != peer.port) {
-                                        discovered.add(Endpoint(peer, network, host, port, generation))
+                                for ((foundRoute, host) in candidates) {
+                                    if (host != endpoint.host || port != endpoint.port || foundRoute != route) {
+                                        enqueueEndpoint(Endpoint(peer.fingerprint, foundRoute, host, port, generation))
                                     }
                                 }
                                 signal()
@@ -246,15 +278,15 @@ class TransferService : Service() {
                         }
                     }
                     if (candidate != null && discovered.any {
-                            it.network == network && it.generation == generation &&
-                                it.peer.fingerprint == peer.fingerprint
+                            it.route == route && it.generation == generation &&
+                                it.fingerprint == peer.fingerprint
                         }) {
-                        preferredNetwork = network
+                        preferredRoute = route
                         continue
                     }
                     routeFailures += 1
-                    preferredNetwork = networks[(networks.indexOf(network) + 1) % networks.size]
-                    if (routeFailures < networks.size) {
+                    preferredRoute = routes[(routes.indexOf(route) + 1) % routes.size]
+                    if (routeFailures < routes.size) {
                         delay = 200L
                     } else {
                         routeFailures = 0
@@ -265,6 +297,7 @@ class TransferService : Service() {
                 await(delay)
             }
         } finally {
+            hotspotAnnouncements.stop()
             dropLink()
             if (running) stopSelf()
         }
@@ -280,7 +313,12 @@ class TransferService : Service() {
     private fun networkChanged() {
         networkGeneration.incrementAndGet()
         discovery.stop()
+        hotspotAnnouncements.stop()
         signal()
+    }
+
+    private fun enqueueEndpoint(endpoint: Endpoint) {
+        if (discovered.size < 16 && endpoint !in discovered) discovered.add(endpoint)
     }
 
     private fun purgeExpiredAndNotify() {
@@ -332,17 +370,17 @@ class TransferService : Service() {
         }
     }
 
-    private fun linkFor(peer: Peer, network: Network): Link {
+    private fun linkFor(peer: Peer, route: PortalRoute): Link {
         currentLink?.let {
             if (it.peer.fingerprint == peer.fingerprint &&
                 it.peer.host == peer.host &&
                 it.peer.port == peer.port &&
-                it.network == network
+                it.route == route
             ) return it
         }
         dropLink()
         lateinit var link: Link
-        val session = PortalSession(peer, network) { meta ->
+        val session = PortalSession(applicationContext, peer, route) { meta ->
             if (meta.protocolVersion > link.protocolVersion) {
                 link.protocolVersion = meta.protocolVersion
             }
@@ -350,7 +388,7 @@ class TransferService : Service() {
                 publishUpdate(this)
             }
         }
-        link = Link(peer, network, session)
+        link = Link(peer, route, session)
         currentLink = link
         return link
     }
@@ -1263,7 +1301,7 @@ class TransferService : Service() {
         }
     }
 
-    private class Link(val peer: Peer, val network: Network, val session: PortalSession) {
+    private class Link(val peer: Peer, val route: PortalRoute, val session: PortalSession) {
         var supportsChats: Boolean? = null
         var supportsEvents: Boolean? = null
         @Volatile var protocolVersion: Int = 1
@@ -1274,8 +1312,8 @@ class TransferService : Service() {
         var transferCursor: Int = 0
     }
     private data class Endpoint(
-        val peer: Peer,
-        val network: Network,
+        val fingerprint: String,
+        val route: PortalRoute,
         val host: String,
         val port: Int,
         val generation: Int,
@@ -1365,6 +1403,10 @@ class TransferService : Service() {
         fun wake() {
             instance?.signal()
             instance?.signalMessages()
+        }
+
+        internal fun hotspotChanged() {
+            instance?.networkChanged()
         }
 
         fun control(context: Context, row: ChatItem, action: TransferAction): Boolean {

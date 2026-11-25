@@ -132,7 +132,11 @@ class Desktop:
 
 def smoke(desktop):
     desktop.start()
-    invite = urlparse(desktop.cli("pair", "--address", f"127.0.0.1:{desktop.port}", "--print-only"))
+    # A loopback-only daemon should advertise no LAN endpoints but should use
+    # the service's selected port when the address is given explicitly.
+    wait_until(lambda: (desktop.directory / "data" / "wake.json").is_file())
+    assert json.loads(desktop.cli("lan-addresses")) == []
+    invite = urlparse(desktop.cli("pair", "--address", "127.0.0.1", "--print-only"))
     assert invite.scheme == "portaldrop" and invite.port == desktop.port
     query = parse_qs(invite.query)
     desktop.fp = query["fp"][0]

@@ -2,7 +2,6 @@ package app.portaldrop
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
@@ -17,10 +16,14 @@ internal class PortalDiscovery(private val context: Context) {
     private val main = Handler(Looper.getMainLooper())
     private var scan: Scan? = null
 
-    fun find(peer: Peer, network: Network, found: (List<String>, Int) -> Unit) {
+    fun find(peer: Peer, routes: List<PortalRoute>, found: (List<Pair<PortalRoute, String>>, Int) -> Unit) {
         main.post {
             if (scan != null) return@post
-            val next = Scan(peer, network, found)
+            val localRoutes = routes.filter {
+                it !is PortalRoute.Attached || isPortalNetwork(connectivity.getNetworkCapabilities(it.network))
+            }
+            if (localRoutes.isEmpty()) return@post
+            val next = Scan(peer, localRoutes, found)
             scan = next
             next.start()
         }
@@ -33,8 +36,8 @@ internal class PortalDiscovery(private val context: Context) {
     @Suppress("DEPRECATION")
     private inner class Scan(
         private val peer: Peer,
-        private val network: Network,
-        private val found: (List<String>, Int) -> Unit,
+        private val routes: List<PortalRoute>,
+        private val found: (List<Pair<PortalRoute, String>>, Int) -> Unit,
     ) : NsdManager.DiscoveryListener {
         private val timeout = Runnable(::finish)
         private val pending = ArrayDeque<NsdServiceInfo>()
@@ -44,11 +47,12 @@ internal class PortalDiscovery(private val context: Context) {
 
         fun start() {
             try {
-                if (Build.VERSION.SDK_INT < 33) {
+                val network = (routes.singleOrNull() as? PortalRoute.Attached)?.network
+                if (Build.VERSION.SDK_INT < 33 || network == null) {
                     val wifi = context.getSystemService(WifiManager::class.java)
                     multicastLock = wifi?.createMulticastLock("Portal Drop discovery")?.apply { acquire() }
                 }
-                if (Build.VERSION.SDK_INT >= 33) {
+                if (Build.VERSION.SDK_INT >= 33 && network != null) {
                     nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, network,
                         context.mainExecutor, this)
                 } else {
@@ -113,15 +117,21 @@ internal class PortalDiscovery(private val context: Context) {
                 } else {
                     listOfNotNull(info.host)
                 }
-                val properties = connectivity.getLinkProperties(network)
-                val hosts = addresses
+                val ordered = addresses
                     .filter { !it.isLoopbackAddress && !it.isMulticastAddress && !it.isAnyLocalAddress }
-                    .sortedWith(compareByDescending<java.net.InetAddress> { properties.hasLocalRoute(it) }
-                        .thenByDescending { it is Inet4Address })
-                    .mapNotNull { it.hostAddress }.distinct().take(8)
-                if (hosts.isNotEmpty()) {
+                    .sortedByDescending { it is Inet4Address }
+                val candidates = routes.flatMap { route ->
+                    val properties = (route as? PortalRoute.Attached)?.let { connectivity.getLinkProperties(it.network) }
+                    ordered.filter { address ->
+                        when (route) {
+                            is PortalRoute.Attached -> properties.hasLocalRoute(address)
+                            is PortalRoute.Hosted -> route.permits(address)
+                        }
+                    }.mapNotNull { address -> address.hostAddress?.let { route to it } }
+                }.distinct().take(8)
+                if (candidates.isNotEmpty()) {
                     finish()
-                    found(hosts, info.port)
+                    found(candidates, info.port)
                     return
                 }
             }

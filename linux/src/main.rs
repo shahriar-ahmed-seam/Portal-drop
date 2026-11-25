@@ -1,6 +1,7 @@
 mod files;
 mod folders;
 mod model;
+mod network;
 mod server;
 mod sound;
 mod store;
@@ -12,15 +13,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 use files::{Files, preview_file, preview_text};
 use fs2::FileExt;
 use model::{
-    Chat, Item, Kind, MAX_TTL_SEC, MIN_TTL_SEC, PORT, TEMP_TTL_SEC, TransferAction,
-    TransferDirection, TransferResponse, TransferState, valid_id,
+    Chat, Item, Kind, MAX_TTL_SEC, MIN_TTL_SEC, TEMP_TTL_SEC, TransferAction, TransferDirection,
+    TransferResponse, TransferState, valid_id,
 };
 use qrcode::{QrCode, render::unicode};
 use serde::Serialize;
 use std::{
     fs::{File, OpenOptions},
     io::{self, IsTerminal, Write},
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     path::PathBuf,
 };
 use store::{HistoryEntry, HistoryQuery, Store, private_directory};
@@ -66,6 +67,14 @@ enum Command {
         /// Print the pairing link without rendering the QR code
         #[arg(long)]
         print_only: bool,
+    },
+    /// List the desktop's reachable local address candidates as JSON
+    LanAddresses,
+    /// Send a one-time discovery hint to the selected Wi-Fi adapter's gateway
+    AnnounceHotspot {
+        /// Desktop Wi-Fi IPv4 address, optionally with its service port
+        #[arg(long)]
+        address: String,
     },
     /// Revoke the current Android device and cancel unused invitations
     Unpair,
@@ -272,7 +281,7 @@ fn main() -> Result<()> {
             address,
             print_only,
         } => {
-            let address = pairing_address(address)?;
+            let address = network::pairing_address(&data, address.as_deref())?;
             let identity = store.identity()?;
             let code = store.issue_invite()?;
             let invite = format!(
@@ -291,6 +300,15 @@ fn main() -> Result<()> {
                 println!("Scan or paste this single-use link. It expires in 10 minutes.");
             }
             println!("{invite}");
+        }
+        Command::LanAddresses => print_json(&network::lan_addresses(&data)?)?,
+        Command::AnnounceHotspot { address } => {
+            ensure!(
+                store.active_peer()?.is_some(),
+                "pair your phone before announcing this computer"
+            );
+            network::announce_hotspot(&data, &address, &store.identity()?.fingerprint)?;
+            print_json(&serde_json::json!({ "sent": true }))?;
         }
         Command::Unpair => {
             store.unpair()?;
@@ -980,36 +998,4 @@ fn print_json(data: &impl Serialize) -> Result<()> {
     serde_json::to_writer(&mut output, data)?;
     output.write_all(b"\n")?;
     Ok(())
-}
-
-fn pairing_address(hint: Option<String>) -> Result<String> {
-    let hint = match hint {
-        Some(value) => value,
-        None => {
-            let socket = UdpSocket::bind("0.0.0.0:0")?;
-            // UDP connect selects an interface without sending a packet.
-            socket
-                .connect("192.0.2.1:9")
-                .context("set --address to the desktop's LAN address")?;
-            socket.local_addr()?.ip().to_string()
-        }
-    };
-    let (host, port) = match hint.split_once(':') {
-        Some((host, port)) => (host, port.parse::<u16>().context("invalid --address port")?),
-        None => (hint.as_str(), PORT),
-    };
-    if host.is_empty()
-        || host.len() > 253
-        || port == 0
-        || !host
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-    {
-        bail!("use an IPv4 address or hostname, optionally followed by :PORT");
-    }
-    ensure!(
-        !host.starts_with('.') && !host.ends_with('.'),
-        "invalid --address hostname"
-    );
-    Ok(format!("{host}:{port}"))
 }

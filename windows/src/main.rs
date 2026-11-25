@@ -709,9 +709,33 @@ fn dispatch_ipc(
             "clear_history" => {
                 run_cli(&cli, &["clear-history".into()], None).map(|_| json!({ "ok": true }))
             }
+            "lan_addresses" => run_cli(&cli, &["lan-addresses".into()], None)
+                .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string())),
+            "announce_hotspot" => {
+                let address = msg.payload["address"].as_str().unwrap_or_default();
+                run_cli(
+                    &cli,
+                    &[
+                        "announce-hotspot".into(),
+                        "--address".into(),
+                        address.into(),
+                    ],
+                    None,
+                )
+                .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+            }
+            "wifi_settings" => hidden_command(Path::new("explorer.exe"))
+                .arg("ms-settings:network-wifi")
+                .spawn()
+                .map(|_| json!({ "ok": true }))
+                .map_err(|e| e.to_string()),
             "pair" => {
                 svc.start(&cli, &dir);
-                run_cli(&cli, &["pair".into()], None).map(|output| {
+                let mut args = vec!["pair".into()];
+                if let Some(address) = msg.payload["address"].as_str().filter(|s| !s.is_empty()) {
+                    args.extend(["--address".into(), address.into()]);
+                }
+                run_cli(&cli, &args, None).map(|output| {
                     let lines: Vec<&str> = output.trim_end_matches('\n').lines().collect();
                     let link = lines.last().copied().unwrap_or_default();
                     let qr = if lines.len() >= 2 {

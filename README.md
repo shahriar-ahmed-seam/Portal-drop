@@ -166,6 +166,20 @@ adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 - Android may pause background sync during extended Doze or after a manual Force Stop; reopening the app resumes the service immediately.
 - On Linux, the systemd user service checks that the TLS listener is responsive and restarts the daemon if it stalls. Inspect it with `systemctl --user status portal-drop.service`.
 
+### Offline sharing over a Wi-Fi hotspot
+
+Portal Drop needs a local IP connection. Messages and files can move over a hotspot with the router off and mobile data disabled.
+
+| Hotspot host | How to join |
+| --- | --- |
+| Android | Open **Offline hotspot** in Portal Drop on Android. Join the Wi-Fi network shown there from a Linux or Windows desktop. You can also use an existing Android system hotspot if your phone allows it with mobile data off. |
+| Linux | Open **Offline sharing** on the desktop and start a hotspot on an adapter supported by NetworkManager. Join the Wi-Fi network shown there from Android. Starting the hotspot can replace the adapter's current Wi-Fi connection. Keep Portal Drop open or in the tray while hosting. |
+| Windows | Join an Android hotspot in Windows Wi-Fi settings. A Windows-hosted hotspot created in system settings can also be used when the OS and adapter let it run. |
+
+Portal Drop tries to rediscover the paired desktop when the network changes. If it stays offline, open **Offline sharing** on the desktop and copy the address for the hotspot adapter. On Android, open **Connect by address** and enter it. On a hotspot started inside Portal Drop for Android, **Find phone hotspot** on the desktop can also send a discovery hint to the phone. The app checks the desktop certificate and existing pairing before adopting a new address.
+
+For a first-time pairing, choose the hotspot adapter’s address in the desktop pairing dialog before scanning the QR code. If Windows Firewall blocks the connection, check the profile and allow Portal Drop on the trusted hotspot network. Transfer speed depends on the hotspot adapter, band, and signal.
+
 ---
 
 ## Architecture and Security

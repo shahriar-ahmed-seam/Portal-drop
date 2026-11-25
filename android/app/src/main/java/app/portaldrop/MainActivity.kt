@@ -13,6 +13,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Typeface
+import android.location.LocationManager
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
@@ -93,6 +94,8 @@ class MainActivity : ComponentActivity() {
     private var sharedMedia: SharedMediaView? = null
     private var replyArea: LinearLayout? = null
     private var attachmentReview: AlertDialog? = null
+    private var hotspotDialog: AlertDialog? = null
+    private var reconnecting = false
 
     private var page = Page.CHAT
     private var chatId = DEFAULT_CHAT_ID
@@ -149,7 +152,9 @@ class MainActivity : ComponentActivity() {
     private val ui by lazy { PortalViews(this) }
 
     private val updates = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) = refresh()
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == OfflineHotspotService.ACTION_UPDATE) renderHotspotDialog() else refresh()
+        }
     }
 
     private val scan = registerForActivityResult(ScanContract()) { result ->
@@ -186,6 +191,15 @@ class MainActivity : ComponentActivity() {
         if (!it) notifyUser("Background connection is on. Allow notifications for message and file alerts.")
     }
 
+    private val hotspotPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        if (hotspotPermissionGranted()) {
+            startOfflineHotspot()
+        } else {
+            val permission = if (Build.VERSION.SDK_INT >= 33) "Nearby devices" else "Precise location"
+            notifyUser("Allow $permission for Portal Drop in Android Settings to start a hotspot.")
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = PortalStore.get(this)
@@ -204,7 +218,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        val filter = IntentFilter(TransferService.ACTION_UPDATE)
+        val filter = IntentFilter(TransferService.ACTION_UPDATE).apply {
+            addAction(OfflineHotspotService.ACTION_UPDATE)
+        }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(updates, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -220,6 +236,7 @@ class MainActivity : ComponentActivity() {
         }
         store.purgeExpired()
         refresh()
+        renderHotspotDialog()
         mainHandler.postDelayed(expiryTick, 15_000L)
     }
 
@@ -235,6 +252,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        hotspotDialog?.dismiss()
         searchWorker.shutdownNow()
         mediaWorker.shutdownNow()
         updateWorker.shutdownNow()
@@ -1121,6 +1139,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun consumeIntent(request: Intent) {
+        if (request.action == OfflineHotspotService.ACTION_OPEN) {
+            setIntent(Intent(this, MainActivity::class.java))
+            showOfflineHotspot()
+            return
+        }
         val target = request.getStringExtra(TransferService.EXTRA_DESKTOP)
         if (target != null && target != store.peer()?.fingerprint) {
             if (!canSwitchDesktop() || !TransferService.selectDesktop(this, target)) return
@@ -1473,12 +1496,15 @@ class MainActivity : ComponentActivity() {
                 menu.add(0, MENU_SEARCH, 4, "Search messages")
                 menu.add(0, MENU_SAVE_LOCATION, 5, "Save location")
                 menu.add(0, MENU_PAUSE, 6, if (store.backgroundEnabled()) "Pause connection" else "Resume connection")
+                menu.add(0, MENU_RECONNECT, 6, "Connect by address").isEnabled = !reconnecting
                 menu.add(0, MENU_FORGET, 7, "Forget this computer")
                 menu.add(0, MENU_COMPUTERS, 7, "Paired computers").isEnabled = canSwitchDesktop()
             } else if (addingComputer) {
                 menu.add(0, MENU_CANCEL_PAIR, 7, "Cancel pairing").isEnabled = !pairing
             }
-            menu.add(0, MENU_CHECK_UPDATES, 8, "Check for updates").isEnabled = !checkingForUpdates
+            val hotspot = if (OfflineHotspotService.isActive()) "Offline hotspot · on" else "Offline hotspot"
+            menu.add(0, MENU_OFFLINE_HOTSPOT, 8, hotspot)
+            menu.add(0, MENU_CHECK_UPDATES, 9, "Check for updates").isEnabled = !checkingForUpdates
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_SELECT -> enterSelection()
@@ -1491,6 +1517,8 @@ class MainActivity : ComponentActivity() {
                     MENU_NOTIFICATIONS -> showNotificationSettings()
                     MENU_CHECK_UPDATES -> checkForUpdates()
                     MENU_SAVE_LOCATION -> showSaveLocationSettings()
+                    MENU_RECONNECT -> showReconnectByAddress()
+                    MENU_OFFLINE_HOTSPOT -> showOfflineHotspot()
                     MENU_PAUSE -> {
                         if (store.backgroundEnabled()) TransferService.pause(this@MainActivity)
                         else enableBackground()
@@ -1507,6 +1535,122 @@ class MainActivity : ComponentActivity() {
             }
             show()
         }
+    }
+
+    private fun showReconnectByAddress() {
+        val peer = store.peer() ?: return
+        if (reconnecting) return
+        val body = ui.column().apply { setPadding(ui.dp(24), ui.dp(12), ui.dp(24), 0) }
+        body.addView(ui.label("Enter the address shown in Portal Drop on your computer.", 14, ui.muted))
+        val input = ui.entry("Computer address", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI).apply {
+            setSingleLine(true)
+            setSelectAllOnFocus(true)
+            filters = arrayOf(InputFilter.LengthFilter(64))
+            setText(if (peer.port == PortalClient.DEFAULT_PORT) peer.host else "${peer.host}:${peer.port}")
+        }
+        body.addWithGap(input, 12)
+        val error = ui.label("", 13, ui.muted).apply { visibility = View.GONE }
+        body.addWithGap(error, 8)
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Connect by address")
+            .setView(body)
+            .setNegativeButton("Close", null)
+            .setPositiveButton("Connect", null)
+            .show()
+        val connect = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        connect.setOnClickListener {
+            val address = input.text.toString().trim()
+            if (reconnecting) return@setOnClickListener
+            if (address.isEmpty()) {
+                error.text = "Enter your computer’s local IP address."
+                error.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+            reconnecting = true
+            connect.isEnabled = false
+            connect.text = "Connecting…"
+            error.visibility = View.GONE
+            worker.execute {
+                val result = runCatching { PortalClient.reconnect(applicationContext, peer, address) }
+                onUi {
+                    reconnecting = false
+                    if (result.isSuccess) {
+                        dialog.dismiss()
+                        if (store.peer()?.fingerprint == peer.fingerprint) enableBackground()
+                    } else {
+                        val failure = result.exceptionOrNull()
+                        val message = when (failure) {
+                            is IOException, is IllegalArgumentException -> failure.message
+                            else -> null
+                        } ?: "Portal Drop could not verify the computer at that address."
+                        if (dialog.isShowing) {
+                            connect.text = "Connect"
+                            connect.isEnabled = true
+                            error.text = message
+                            error.visibility = View.VISIBLE
+                        } else notifyUser(message)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun showOfflineHotspot() {
+        if (hotspotDialog?.isShowing == true) return
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Offline hotspot")
+            .setMessage("")
+            .setNegativeButton("Close", null)
+            .setPositiveButton("Start hotspot", null)
+            .show()
+        hotspotDialog = dialog
+        dialog.setOnDismissListener { hotspotDialog = null }
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            when (OfflineHotspotService.state) {
+                is OfflineHotspotService.State.Active -> OfflineHotspotService.stop(this)
+                OfflineHotspotService.State.Starting -> Unit
+                else -> {
+                    if (hotspotPermissionGranted()) startOfflineHotspot()
+                    else hotspotPermissions.launch(if (Build.VERSION.SDK_INT >= 33) {
+                        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
+                    } else {
+                        arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+                    })
+                }
+            }
+        }
+        renderHotspotDialog()
+    }
+
+    private fun renderHotspotDialog() {
+        val dialog = hotspotDialog ?: return
+        val state = OfflineHotspotService.state
+        dialog.setMessage(when (state) {
+            OfflineHotspotService.State.Off -> "Create a local Wi-Fi network your computer can join. File transfers work with mobile data off."
+            OfflineHotspotService.State.Starting -> "Starting the hotspot…"
+            is OfflineHotspotService.State.Active ->
+                "Join this Wi-Fi network from your computer.\n\nWi-Fi name\n${state.ssid}\n\nPassword\n${state.passphrase}"
+            is OfflineHotspotService.State.Failed -> state.message
+        })
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).apply {
+            isEnabled = state !is OfflineHotspotService.State.Starting
+            text = if (state is OfflineHotspotService.State.Active) "Stop hotspot" else "Start hotspot"
+        }
+    }
+
+    private fun hotspotPermissionGranted(): Boolean {
+        val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.NEARBY_WIFI_DEVICES
+        else Manifest.permission.ACCESS_FINE_LOCATION
+        return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun startOfflineHotspot() {
+        if (Build.VERSION.SDK_INT < 33 && getSystemService(LocationManager::class.java)?.isLocationEnabled != true) {
+            notifyUser("Turn on Location in Android Settings, then try again.")
+            return
+        }
+        OfflineHotspotService.start(this)
+        renderHotspotDialog()
     }
 
     private fun checkForUpdates() {
@@ -2147,6 +2291,8 @@ class MainActivity : ComponentActivity() {
         const val MENU_SEND_FOLDER = 12
         const val MENU_COMPUTERS = 13
         const val MENU_CANCEL_PAIR = 14
+        const val MENU_RECONNECT = 15
+        const val MENU_OFFLINE_HOTSPOT = 16
         const val CHAT_MENU_RENAME = 1
         const val CHAT_MENU_DELETE = 2
         const val MESSAGE_REPLY = 1

@@ -518,6 +518,12 @@ svg { display: block; flex-shrink: 0; }
 .steps { margin: 4px 0 10px 18px; }
 .steps li { margin: 3px 0; }
 .link-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.offline-section { margin: 16px 0; }
+.offline-section .field { margin: 6px 0; }
+.offline-section .path-card { margin-top: 8px; }
+.offline-value { font-family: var(--mono); overflow-wrap: anywhere; }
+.pair-address { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.pair-address .field { flex: 1 1 210px; }
 .link-box {
   flex: 1; min-width: 0; height: 38px; padding: 0 12px; border-radius: 9px; background: var(--input-bg);
   font-family: var(--mono); font-size: 12px; display: flex; align-items: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
@@ -711,7 +717,7 @@ svg { display: block; flex-shrink: 0; }
    Host bridge (wry on Windows → window.ipc, WebKitGTK on Linux → messageHandlers)
    ======================================================================== */
 const DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001";
-const APP_VERSION = "0.4.0";
+const APP_VERSION = "0.5.0";
 const RELEASE_REPO = "shahriar-ahmed-seam/Portal-drop";
 const TEMP_TIMERS = new Map([[300, "5 minutes"], [600, "10 minutes"], [3600, "1 hour"], [86400, "24 hours"]]);
 const MAX_CLIPBOARD_IMAGE = 16 * 1024 * 1024;
@@ -1440,6 +1446,7 @@ function renderDrawer() {
     box.appendChild(b);
   };
   add("qr", state.status.paired ? "Pair a new phone" : "Pair Android device", showPair);
+  add("phone", "Offline sharing", showOfflineSharing);
   add("edit", "New chat", newChat);
   add("search", "Search messages", showMessageSearch);
   add("sidebar", state.prefs.sidebarCollapsed ? "Show chat list" : "Hide chat list", toggleSidebar);
@@ -1925,19 +1932,195 @@ function drawQr(canvas, text) {
   grid.forEach((row, y) => row.forEach((v, x) => { if (v !== light) ctx.fillRect(x * scale, y * scale, scale, scale); }));
   return true;
 }
-function showPair() {
-  ipc("pair").then((data) => {
-    const body = el("div");
-    const wrap = el("div", "qr-wrap"); const canvas = el("canvas"); wrap.appendChild(canvas); body.appendChild(wrap);
-    if (!drawQr(canvas, data.qr)) wrap.remove();
-    body.appendChild(el("ol", "steps", "<li>Open <b>Portal Drop</b> on your Android phone.</li><li>Tap <b>Scan QR code</b> and point it at this screen.</li><li>Keep both devices on the same Wi‑Fi.</li>"));
+function addressOptions(select, rows, preferred = "") {
+  select.replaceChildren();
+  if (!rows.length) select.append(new Option("Automatic address", ""));
+  for (const row of rows) {
+    select.append(new Option(`${row.address} · ${row.interface}`, row.address));
+  }
+  const current = rows.find((row) => row.address === preferred) || rows.find((row) => row.preferred);
+  if (current) select.value = current.address;
+}
+
+async function showPair(preferred) {
+  const body = el("div");
+  const addressRow = el("div", "pair-address");
+  const select = el("select", "field");
+  select.setAttribute("aria-label", "Desktop address");
+  const renew = el("button", "pill-btn", "Generate code");
+  const content = el("div");
+  content.setAttribute("aria-live", "polite");
+  addressRow.append(select, renew);
+  body.append(addressRow, content);
+  modal({ title: "Pair your phone", body, actions: [{ label: "Done", cls: "solid" }] });
+  state.pairOpen = { wasPaired: !!state.status.paired };
+  renew.disabled = select.disabled = true;
+  addressOptions(select, [], "");
+  const rows = await ipc("lan_addresses").catch(() => []);
+  if (!body.isConnected) return;
+  addressOptions(select, Array.isArray(rows) ? rows : [], preferred);
+  renew.onclick = () => loadInvite();
+  select.onchange = () => loadInvite();
+  await loadInvite();
+
+  async function loadInvite() {
+    renew.disabled = select.disabled = true;
+    content.textContent = "Generating pairing code…";
+    try {
+      const data = await ipc("pair", { address: select.value });
+      if (!body.isConnected) return;
+      content.replaceChildren();
+      renderInvite(data);
+    } catch (error) {
+      if (body.isConnected) content.textContent = error.message;
+    } finally {
+      renew.disabled = select.disabled = false;
+    }
+  }
+
+  function renderInvite(data) {
+    const wrap = el("div", "qr-wrap");
+    const canvas = el("canvas");
+    wrap.append(canvas);
+    if (drawQr(canvas, data.qr)) content.append(wrap);
+    content.append(el("ol", "steps", "<li>Connect both devices to the same Wi-Fi or hotspot.</li><li>Open <b>Portal Drop</b> on Android and scan the QR code or paste the link.</li>"));
     const linkRow = el("div", "link-row", `<div class="link-box" title="${esc(data.link)}">${esc(data.link)}</div>`);
     const cp = el("button", "pill-btn", "Copy link"); cp.onclick = () => copyText({ text: data.link });
-    linkRow.appendChild(cp); body.appendChild(linkRow);
-    body.appendChild(el("div", "meta2", `<p style="margin-top:10px;font-size:12.5px;color:var(--muted)">This code works once and expires in 10 minutes.</p>`));
-    modal({ title: "Pair your phone", body, actions: [{ label: "Done", cls: "solid" }] });
-    state.pairOpen = { wasPaired: !!state.status.paired };
-  }).catch((e) => toast(e.message));
+    linkRow.append(cp);
+    content.append(linkRow, el("p", "offline-section", "This code works once and expires in 10 minutes."));
+  }
+}
+
+function showOfflineSharing() {
+  const body = el("div");
+  body.append(el("p", "set-intro", "Join the same hotspot on both devices. Portal Drop uses the local Wi-Fi link for messages and files."));
+  if (HOST === "windows") {
+    body.append(el("p", "offline-section", "Start a hotspot on Android, then join it from Windows Wi-Fi settings."));
+    const settings = el("button", "pill-btn", "Open Wi-Fi settings");
+    settings.onclick = () => ipc("wifi_settings").catch((error) => toast(error.message));
+    body.append(settings);
+  }
+  const hostTools = el("div", "offline-section");
+  const addressSection = el("div", "offline-section");
+  const status = el("p");
+  status.setAttribute("aria-live", "polite");
+  const refreshAddresses = el("button", "pill-btn", "Refresh");
+  refreshAddresses.onclick = () => update();
+  body.append(hostTools, addressSection, status);
+  modal({ title: "Offline sharing", body, wide: true, actions: [{ label: "Done", cls: "solid" }] });
+  update();
+
+  async function update() {
+    refreshAddresses.disabled = true;
+    status.textContent = "Checking local connections…";
+    try {
+      const [rows, snapshot] = await Promise.all([
+        ipc("lan_addresses"),
+        HOST === "linux" ? ipc("hotspot_status") : null,
+      ]);
+      if (!body.isConnected) return;
+      status.textContent = "";
+      if (snapshot) renderHotspot(snapshot);
+      renderAddresses(Array.isArray(rows) ? rows : [], snapshot?.active?.address);
+    } catch (error) {
+      if (body.isConnected) status.textContent = error.message;
+    } finally {
+      refreshAddresses.disabled = false;
+    }
+  }
+
+  function renderAddresses(rows, hotspotAddress) {
+    const label = el("p", null, "On Android, use <b>Connect by address</b> if the paired desktop does not reconnect automatically.");
+    addressSection.replaceChildren(label);
+    if (!rows.length) {
+      addressSection.append(el("p", "offline-section", "Waiting for a local Wi-Fi or Ethernet address."));
+      addressSection.append(refreshAddresses);
+      return;
+    }
+    const select = el("select", "field");
+    select.setAttribute("aria-label", "Desktop address");
+    const matching = rows.find((row) => row.address.split(":")[0] === hotspotAddress);
+    addressOptions(select, rows, matching?.address);
+    const copy = el("button", "pill-btn", "Copy address");
+    copy.onclick = () => copyText({ text: select.value });
+    const buttons = el("div", "path-actions");
+    buttons.append(copy, refreshAddresses);
+    if (state.status.paired && !hotspotAddress) {
+      const announce = el("button", "pill-btn", "Find phone hotspot");
+      announce.title = "Send a discovery hint when this computer joined an Android hotspot";
+      announce.onclick = async () => {
+        announce.disabled = true;
+        try {
+          await ipc("announce_hotspot", { address: select.value });
+          toast("Discovery hint sent. You can also enter the address on Android.");
+        } catch (error) {
+          toast(error.message);
+        } finally {
+          announce.disabled = false;
+        }
+      };
+      buttons.append(announce);
+    } else if (!state.status.paired) {
+      const pair = el("button", "pill-btn solid", "Pair Android");
+      pair.onclick = () => showPair(select.value);
+      buttons.append(pair);
+    }
+    addressSection.append(select, buttons);
+  }
+
+  function renderHotspot(snapshot) {
+    hostTools.replaceChildren();
+    const active = snapshot.active;
+    if (active) {
+      const card = el("div", "path-card");
+      card.append(el("div", "banner-title", "Desktop hotspot is on"));
+      for (const [label, value] of [["Wi-Fi name", active.ssid], ["Password", active.password]]) {
+        const line = el("div");
+        const data = el("span", "offline-value");
+        data.textContent = value;
+        line.append(document.createTextNode(label + " "), data);
+        card.append(line);
+      }
+      const stop = el("button", "pill-btn danger", "Stop hotspot");
+      stop.onclick = () => changeHotspot(stop, "hotspot_stop", {});
+      const actions = el("div", "path-actions");
+      actions.append(stop);
+      card.append(actions);
+      hostTools.append(card);
+    } else if (snapshot.adapters?.length) {
+      const select = el("select", "field");
+      select.setAttribute("aria-label", "Wi-Fi adapter");
+      for (const adapter of snapshot.adapters) select.append(new Option(adapter.interface, adapter.device));
+      const note = el("p", "meta2");
+      const warn = () => {
+        const adapter = snapshot.adapters.find((item) => item.device === select.value);
+        note.textContent = adapter?.connected ? "Starting the hotspot will replace this adapter’s current Wi-Fi connection." : "";
+      };
+      select.onchange = warn;
+      warn();
+      const start = el("button", "pill-btn solid", "Start desktop hotspot");
+      start.onclick = () => changeHotspot(start, "hotspot_start", { device: select.value });
+      hostTools.append(select, note, start);
+    } else if (snapshot.reason) {
+      const note = el("p", "meta2");
+      note.textContent = snapshot.reason + " You can join a phone hotspot in Wi-Fi settings.";
+      hostTools.append(note);
+    }
+  }
+
+  async function changeHotspot(button, action, payload) {
+    button.disabled = refreshAddresses.disabled = true;
+    status.textContent = action === "hotspot_start" ? "Starting the hotspot…" : "Stopping the hotspot…";
+    try {
+      await ipc(action, payload);
+      if (body.isConnected) await update();
+      refresh();
+    } catch (error) {
+      if (body.isConnected) status.textContent = error.message;
+    } finally {
+      button.disabled = refreshAddresses.disabled = false;
+    }
+  }
 }
 
 /* ========================================================================
@@ -2087,7 +2270,7 @@ $("attach").onclick = async () => {
   catch (e) { if (wasTemp && state.chatId === meta.chatId && !state.tempTtl) setTemp(wasTemp); toast(e.message); }
 };
 $("new-chat").onclick = newChat;
-$("onboard-pair").onclick = showPair;
+$("onboard-pair").onclick = () => showPair();
 
 /* ========================================================================
    Drag & drop (paths come from the native host)
@@ -2230,6 +2413,7 @@ const Demo = {
       case "new_chat": { const c = { id: "n" + Date.now(), title: new Date().toISOString().slice(0, 10), created_at: Date.now(), updated_at: Date.now() }; d.chats.push(c); return ok(c); }
       case "pair": return ok({ qr: "", link: "portaldrop://pair?h=192.168.0.10&p=53621&c=demo" });
       case "received_files": return ok({ items: d.rows.filter((r) => r.kind === "file" && r.direction === "received").map((r) => ({ ...r, path: r.path || "/tmp/x" })) });
+      case "lan_addresses": return ok([{ address: "192.168.0.10:53621", interface: "Wi-Fi", preferred: true }]);
       case "delete_messages": d.rows = d.rows.filter((r) => !p.ids.includes(r.id)); return ok({ ok: true });
       case "message_text": return ok({ text: (d.rows.find((r) => r.id === p.id) || {}).text || "" });
       case "get_settings": return ok(this.settings || (this.settings = { message_notify: true, message_sound: true, file_notify: true, file_sound: true, connected_notify: false, connected_sound: false, default_receive_dir: "/home/user/Downloads/Portal Drop", effective_receive_dir: "/home/user/Downloads/Portal Drop" }));

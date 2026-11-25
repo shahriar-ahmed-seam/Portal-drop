@@ -1,11 +1,6 @@
 package app.portaldrop
 
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.InetAddresses
-import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.LinkProperties
 import android.util.Log
 import java.io.BufferedOutputStream
 import java.io.BufferedReader
@@ -14,8 +9,8 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.Proxy
 import java.net.Socket
 import java.net.URI
 import java.security.MessageDigest
@@ -37,29 +32,20 @@ internal class TransferInterruptedException : IOException("The transfer was inte
 internal data class PeerMeta(val os: String?, val name: String?, val protocolVersion: Int)
 
 object PortalClient {
+    internal const val DEFAULT_PORT = 53621
+
     fun pair(context: Context, link: String): Peer {
         val invite = PairingInvite.parse(link)
         val store = PortalStore.get(context)
-        val networks = portalNetworks(context, invite.host)
-        if (networks.isEmpty()) throw IOException("Connect to Wi-Fi to pair with your computer.")
+        val routes = portalRoutes(context, invite.host, allowHotspot = true)
+        if (routes.isEmpty()) throw IOException("Join Wi-Fi or start a hotspot to pair with your computer.")
         var peer = Peer(invite.host, invite.port, invite.fingerprint, store.pairingToken(invite.fingerprint))
-        try {
-            var last: IOException? = null
-            for (network in networks) {
-                try {
-                    val meta = PortalSession(peer, network).pair(invite.code)
-                    peer = peer.copy(os = meta.os, name = meta.name)
-                    last = null
-                    break
-                } catch (error: PortalHttpException) {
-                    throw error
-                } catch (error: IOException) {
-                    last = error
-                } catch (error: SecurityException) {
-                    last = IOException("Android did not allow this network route.", error)
-                }
+        val hosted = try {
+            val (meta, route) = tryRoutes(context, peer, routes) { session ->
+                session.pair(invite.code)
             }
-            last?.let { throw it }
+            peer = peer.copy(os = meta.os, name = meta.name)
+            route is PortalRoute.Hosted
         } catch (error: PortalHttpException) {
             throw IOException(
                 when (error.status) {
@@ -75,49 +61,70 @@ object PortalClient {
             throw IOException("Could not reach your computer. Check that both devices are on the same network.", error)
         }
         store.savePeer(peer)
+        if (hosted) store.updateHotspotEndpoint(peer, peer.host, peer.port)
+        TransferService.hotspotChanged()
         return peer
     }
-}
 
-internal fun isPortalNetwork(capabilities: NetworkCapabilities?): Boolean =
-    capabilities?.let {
-        it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-            (it.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                it.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
-    } ?: false
-
-internal fun LinkProperties?.hasLocalRoute(address: InetAddress): Boolean =
-    this?.routes?.any { route ->
-        !route.isDefaultRoute && !route.hasGateway() && route.destination.contains(address)
-    } == true
-
-internal fun portalNetworks(context: Context, host: String): List<Network> {
-    val manager = context.getSystemService(ConnectivityManager::class.java)
-    val active = manager.activeNetwork
-    @Suppress("DEPRECATION")
-    val local = manager.allNetworks.filter { isPortalNetwork(manager.getNetworkCapabilities(it)) }
-    val activeCapabilities = active?.let(manager::getNetworkCapabilities)
-    return buildList {
-        if (active != null && isPortalNetwork(activeCapabilities)) add(active)
-        addAll(local)
-        // Only try the system VPN route to a host that is on a directly attached LAN.
-        if (active != null && activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true &&
-            stillOnLocalSubnet(manager, local, host)) add(active)
-    }.distinct()
-}
-
-private fun stillOnLocalSubnet(manager: ConnectivityManager, networks: List<Network>, host: String): Boolean {
-    val address = try {
-        InetAddresses.parseNumericAddress(host.removePrefix("[").removeSuffix("]"))
-    } catch (_: IllegalArgumentException) {
-        return false
+    fun reconnect(context: Context, peer: Peer, address: String) {
+        val parts = address.trim().split(':', limit = 2)
+        val host = (portalAddress(parts.first()) as? Inet4Address)?.hostAddress
+        val port = if (parts.size == 1) DEFAULT_PORT else parts[1].toIntOrNull()
+        require(host != null && port != null && port in 1..65535) {
+            "Enter the computer's IPv4 address and optional port."
+        }
+        val candidate = peer.copy(host = host, port = port)
+        val routes = portalRoutes(context, candidate.host, allowHotspot = true, requireLocal = true)
+        if (routes.isEmpty()) throw IOException("Join the same Wi-Fi or hotspot as your computer.")
+        val (_, route) = try {
+            tryRoutes(context, candidate, routes) { it.verify() }
+        } catch (error: PortalHttpException) {
+            if (error.status == 401 || error.status == 403) {
+                throw IOException("The desktop no longer accepts this pairing.", error)
+            }
+            throw IOException("The computer did not accept the connection. Check its service.", error)
+        } catch (error: javax.net.ssl.SSLException) {
+            throw IOException("This address did not match your paired computer.", error)
+        } catch (error: IOException) {
+            throw IOException("Could not reach your paired computer at this address.", error)
+        }
+        val store = PortalStore.get(context)
+        val current = store.peer()
+        check(current?.fingerprint == peer.fingerprint && current?.token == peer.token) {
+            "The active paired computer has changed."
+        }
+        if (route is PortalRoute.Hosted) {
+            store.updateHotspotEndpoint(peer, candidate.host, port)
+        } else {
+            store.updateEndpoint(peer, candidate.host, port)
+        }
+        TransferService.hotspotChanged()
     }
-    if (address.isLoopbackAddress || address.isMulticastAddress || address.isAnyLocalAddress) return false
-    return networks.any { manager.getLinkProperties(it).hasLocalRoute(address) }
-}
 
-internal fun localRoute(context: Context, network: Network): Boolean =
-    isPortalNetwork(context.getSystemService(ConnectivityManager::class.java).getNetworkCapabilities(network))
+    private fun <T> tryRoutes(
+        context: Context,
+        peer: Peer,
+        routes: List<PortalRoute>,
+        attempt: (PortalSession) -> T,
+    ): Pair<T, PortalRoute> {
+        var last: IOException? = null
+        for (route in routes) {
+            val session = PortalSession(context, peer, route)
+            try {
+                return attempt(session) to route
+            } catch (error: PortalHttpException) {
+                throw error
+            } catch (error: IOException) {
+                if (last !is javax.net.ssl.SSLException) last = error
+            } catch (error: SecurityException) {
+                if (last == null) last = IOException("Android did not allow this network route.", error)
+            } finally {
+                session.cancel()
+            }
+        }
+        throw last ?: IOException("No route to the computer.")
+    }
+}
 
 internal fun InputStream.copyTransfer(
     output: OutputStream,
@@ -135,7 +142,10 @@ internal fun InputStream.copyTransfer(
     }
 }
 
-private class NoDelaySslSocketFactory(private val delegate: SSLSocketFactory) : SSLSocketFactory() {
+private class NoDelaySslSocketFactory(
+    private val delegate: SSLSocketFactory,
+    private val allowSocket: ((Socket) -> Boolean)?,
+) : SSLSocketFactory() {
     override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
     override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
 
@@ -143,21 +153,31 @@ private class NoDelaySslSocketFactory(private val delegate: SSLSocketFactory) : 
         runCatching { tcpNoDelay = true }
     }
 
-    override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket =
-        tune(delegate.createSocket(s, host, port, autoClose))
+    override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket {
+        if (allowSocket?.invoke(s) == false) {
+            runCatching { s.close() }
+            throw IOException("The connection was routed outside the local hotspot.")
+        }
+        return tune(delegate.createSocket(s, host, port, autoClose))
+    }
+    private fun direct(create: () -> Socket): Socket {
+        if (allowSocket != null) throw IOException("The local hotspot route could not be verified.")
+        return tune(create())
+    }
     override fun createSocket(host: String, port: Int): Socket =
-        tune(delegate.createSocket(host, port))
+        direct { delegate.createSocket(host, port) }
     override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
-        tune(delegate.createSocket(host, port, localHost, localPort))
+        direct { delegate.createSocket(host, port, localHost, localPort) }
     override fun createSocket(host: InetAddress, port: Int): Socket =
-        tune(delegate.createSocket(host, port))
+        direct { delegate.createSocket(host, port) }
     override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket =
-        tune(delegate.createSocket(address, port, localAddress, localPort))
+        direct { delegate.createSocket(address, port, localAddress, localPort) }
 }
 
 internal class PortalSession(
+    private val context: Context,
     private val peer: Peer,
-    private val network: Network,
+    private val route: PortalRoute,
     private val onPeerMeta: ((PeerMeta) -> Unit)? = null,
 ) {
     private val activeConnections: MutableSet<HttpsURLConnection> =
@@ -190,6 +210,12 @@ internal class PortalSession(
                 }
             }), null)
         }.socketFactory,
+        if (route is PortalRoute.Hosted) { socket ->
+            socket.inetAddress == portalAddress(peer.host) &&
+                socket.port == peer.port &&
+                !isVpnActive(context) &&
+                route.links.any { it.owns(socket) }
+        } else null,
     )
 
     fun cancel() {
@@ -220,6 +246,15 @@ internal class PortalSession(
             .put("device_name", localDeviceName)
         return jsonRequest("POST", "/v1/pair", body, 204, authenticated = false) { http ->
             extractMeta(http)
+        }
+    }
+
+    fun verify() {
+        try {
+            request("GET", "/v1/info", expectedStatus = 200) { }
+        } catch (error: PortalHttpException) {
+            if (error.status != 404 && error.status != 405) throw error
+            request("GET", "/v1/outbox", expectedStatus = 200) { }
         }
     }
 
@@ -324,7 +359,7 @@ internal class PortalSession(
     fun streamEvents(onReady: () -> Unit, onSync: () -> Unit) {
         if (cancelled) return
         val url = URI("https", null, peer.host, peer.port, "/v1/events", null, null).toURL()
-        val http = network.openConnection(url, Proxy.NO_PROXY) as HttpsURLConnection
+        val http = route.open(context, url)
         eventConnection.set(http)
         try {
             if (cancelled) return
@@ -390,7 +425,7 @@ internal class PortalSession(
         if (cancelled) throw IOException("The connection is paused.")
         if (transferKey != null && transferKey in interruptedTransfers) throw TransferInterruptedException()
         val url = URI("https", null, peer.host, peer.port, path, query, null).toURL()
-        val http = network.openConnection(url, Proxy.NO_PROXY) as HttpsURLConnection
+        val http = route.open(context, url)
         activeConnections.add(http)
         if (transferKey != null) transferConnections[transferKey] = http
         var failed = true

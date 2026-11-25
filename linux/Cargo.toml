@@ -1,6 +1,6 @@
 [package]
 name = "portal-drop"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -16,6 +16,7 @@ fs2 = "0.4"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"
 hex = "0.4"
+if-addrs = "0.15"
 mdns-sd = { version = "0.22", default-features = false }
 qrcode = { version = "0.14", default-features = false }
 rcgen = "0.14"
@@ -27,6 +28,9 @@ subtle = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [profile.release]
 strip = "symbols"

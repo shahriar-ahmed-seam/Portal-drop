@@ -635,7 +635,23 @@ class PortalStore private constructor(private val app: Context) :
     internal fun updateEndpoint(original: Peer, host: String, port: Int) {
         val current = rememberedPeer(original.fingerprint) ?: return
         if (current.token != original.token || (current.host == host && current.port == port)) return
-        updateRememberedPeer(current.copy(host = host, port = port))
+        updateRememberedPeer(current.copy(host = host, port = port), previousEndpoint = current)
+    }
+
+    internal fun previousPeer(original: Peer): Peer? = readEndpoint(original, "previous_endpoint")
+
+    internal fun hotspotPeer(original: Peer): Peer? = readEndpoint(original, "hotspot_endpoint")
+
+    private fun readEndpoint(original: Peer, key: String): Peer? {
+        val endpoint = settings.getString("${key}_${original.fingerprint}", null) ?: return null
+        val port = endpoint.substringAfterLast(':').toIntOrNull() ?: return null
+        return original.copy(host = endpoint.substringBeforeLast(':'), port = port)
+    }
+
+    @Synchronized
+    internal fun updateHotspotEndpoint(original: Peer, host: String, port: Int) {
+        if (rememberedPeer(original.fingerprint)?.token != original.token) return
+        settings.edit().putString("hotspot_endpoint_${original.fingerprint}", "$host:$port").apply()
     }
 
     @Synchronized
@@ -650,9 +666,12 @@ class PortalStore private constructor(private val app: Context) :
         return true
     }
 
-    private fun updateRememberedPeer(updated: Peer) {
+    private fun updateRememberedPeer(updated: Peer, previousEndpoint: Peer? = null) {
         val peers = rememberedPeers().map { if (it.fingerprint == updated.fingerprint) updated else it }
         val editor = settings.edit().writeRememberedPeers(peers)
+        if (previousEndpoint != null) editor.putString(
+            "previous_endpoint_${updated.fingerprint}", "${previousEndpoint.host}:${previousEndpoint.port}",
+        )
         if (peer()?.fingerprint == updated.fingerprint) editor.writeActivePeer(updated)
         editor.apply()
     }
@@ -668,6 +687,7 @@ class PortalStore private constructor(private val app: Context) :
         val remaining = peers.filterNot { it.fingerprint == fingerprint }
         if (remaining.size == peers.size) return false
         val editor = settings.edit().writeRememberedPeers(remaining)
+            .remove("hotspot_endpoint_$fingerprint").remove("previous_endpoint_$fingerprint")
         if (peer()?.fingerprint == fingerprint) {
             editor.writeActivePeer(remaining.firstOrNull())
             if (remaining.isEmpty()) editor.putBoolean("background_enabled", false)
