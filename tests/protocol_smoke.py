@@ -154,7 +154,8 @@ def smoke(desktop):
     desktop.request("POST", "/v1/pair", authorized=False, payload={**pair, "token": secrets.token_hex(32)}, code=403)
     desktop.request("GET", "/v1/events", authorized=False, code=401)
     desktop.request("GET", "/v1/outbox", extra_headers={"Authorization": f"Bearer {secrets.token_hex(32)}"}, code=401)
-    assert "connected_local_ips" not in json.loads(desktop.cli("status", "--json"))
+    status = json.loads(desktop.cli("status", "--json"))
+    assert "connected_local_ips" not in status and "connected_local_routes" not in status
 
     now = int(time.time() * 1000)
     message = {"id": str(uuid.uuid4()), "kind": "text", "ts": now, "text": "From Android ✓"}
@@ -339,6 +340,8 @@ def v3_smoke(desktop):
     sse_conn.close()
     reader.join(timeout=2)
 
+    hotspot_route_times(desktop)
+
     out = desktop.request("GET", "/v1/outbox", version=3)
     assert len(out) == 1 and out[0]["text"] == "Instant push check"
     desktop.request("POST", f"/v1/outbox/{out[0]['id']}/ack", code=204, version=3)
@@ -483,6 +486,34 @@ def v3_smoke(desktop):
 
     transfer_controls(desktop)
     folders_and_media(desktop)
+
+
+def hotspot_route_times(desktop):
+    def open_events(connection):
+        connection.request("GET", "/v1/events", headers={"Authorization": f"Bearer {desktop.token}"})
+        response = connection.getresponse()
+        assert response.status == 200 and response.readline() == b"event: ready\n"
+        return response
+
+    def started_at():
+        status = json.loads(desktop.cli("status", "--json"))
+        return status.get("connected_local_routes", {}).get("127.0.0.1")
+
+    with closing(desktop.connect()) as old, closing(open_events(old)):
+        previous_time = started_at()
+        assert isinstance(previous_time, int)
+        # Keep an old SSE alive while the same local IP is reused. Its timestamp
+        # must not change until an authenticated stream starts on that address.
+        wait_until(lambda: time.time_ns() // 1_000_000 > previous_time)
+        activation = time.time_ns() // 1_000_000
+        assert started_at() == previous_time < activation
+        with closing(desktop.connect()) as fresh, closing(open_events(fresh)):
+            assert started_at() >= activation
+            status = json.loads(desktop.cli("snapshot"))["status"]
+            assert status["connected_local_routes"]["127.0.0.1"] >= activation
+            assert status["connected_local_ips"] == ["127.0.0.1"]
+        wait_until(lambda: started_at() == previous_time)
+    wait_until(lambda: started_at() is None)
 
 
 def transfer_controls(desktop):

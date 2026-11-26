@@ -1,7 +1,11 @@
 use anyhow::{Result, ensure};
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    net::IpAddr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 pub const PORT: u16 = 53621;
@@ -350,7 +354,9 @@ pub struct StatusInfo {
     pub paired: bool,
     pub connected: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub connected_local_ips: Vec<std::net::IpAddr>,
+    pub connected_local_ips: Vec<IpAddr>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connected_local_routes: BTreeMap<IpAddr, i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_os: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

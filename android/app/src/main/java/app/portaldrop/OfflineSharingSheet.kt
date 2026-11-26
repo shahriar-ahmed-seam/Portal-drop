@@ -41,7 +41,8 @@ internal class OfflineSharingSheet(
     private val supportsPassphrase = OfflineHotspotService.supportsCustomPassphrase()
     private val rings = HotspotRings(context, ui.accent)
     private val hotspotButton = ui.iconAction(
-        R.drawable.ic_portal_hotspot, "Start hotspot", fill = ui.accent, color = ui.onAccent,
+        R.drawable.ic_portal_hotspot, if (supportsPassphrase) "Start hotspot" else "Set up phone hotspot",
+        fill = ui.accent, color = ui.onAccent,
     ) { start() }
     private val hotspotIcon = hotspotButton.getChildAt(0) as ImageView
     private val hotspotTitle = ui.label("", 22, ui.ink, bold = true).apply {
@@ -103,7 +104,8 @@ internal class OfflineSharingSheet(
         val current = Presentation(state, peerName, verified, backgroundEnabled, joiningDesktop)
         if (current == last) return
         last = current
-        val active = state is OfflineHotspotService.State.Active || state == OfflineHotspotService.State.SystemHotspot
+        val system = state as? OfflineHotspotService.State.SystemHotspot
+        val active = state is OfflineHotspotService.State.Active || system != null
         val starting = state == OfflineHotspotService.State.Starting
         val joining = joiningDesktop && !active && !starting
         val participating = active || joining
@@ -125,11 +127,13 @@ internal class OfflineSharingSheet(
         hotspotTitle.text = when {
             connected -> "Paired computer connected"
             joining -> "Joining computer hotspot"
+            system != null -> "Phone hotspot setup"
             active && peerName != null -> "Waiting for your computer"
             active -> "Hotspot ready"
             starting -> "Starting hotspot"
             state is OfflineHotspotService.State.Failed -> "Hotspot unavailable"
-            else -> "Start hotspot"
+            supportsPassphrase -> "Start hotspot"
+            else -> "Set up phone hotspot"
         }
         hotspotDescription.setTextColor(
             if (state is OfflineHotspotService.State.Failed && !joining) ui.errorColor else ui.muted,
@@ -138,12 +142,16 @@ internal class OfflineSharingSheet(
             connected -> peerName.orEmpty()
             joining && peerName != null -> "Join $peerName’s hotspot from Wi-Fi settings."
             joining -> "Join your computer’s hotspot, then open its pairing invite."
-            state == OfflineHotspotService.State.SystemHotspot -> "Turn on your phone’s hotspot in Android settings, then join from your computer."
+            system != null -> listOfNotNull(
+                system.detail,
+                "Turn on Personal hotspot in Android Settings. Choose an open network or your own password if available, then join from your computer.",
+            ).joinToString("\n\n")
             active && peerName != null -> "Join the Wi-Fi network below from $peerName."
             active -> "Join the Wi-Fi network, then scan your computer’s pairing invite."
             starting -> "Getting the Wi-Fi network ready…"
             state is OfflineHotspotService.State.Failed -> state.message
-            else -> "Share files and messages over a local Wi-Fi network."
+            supportsPassphrase -> "Share files and messages over a local Wi-Fi network."
+            else -> "Use the hotspot name and security you set in Android Settings."
         }
         session.removeAllViews()
         if (state is OfflineHotspotService.State.Active) session.addView(networkCard(state))
@@ -154,8 +162,8 @@ internal class OfflineSharingSheet(
                 ui.action("Resume connection") { onResume() }
             }, 4)
         }
-        if (state == OfflineHotspotService.State.SystemHotspot) {
-            session.addWithGap(ui.action("Open Android settings") { onSystemHotspot() }, 4)
+        if (system != null) {
+            session.addWithGap(ui.action("Open hotspot settings") { onSystemHotspot() }, 4)
         }
         if (joining) {
             if (!connected) {
@@ -164,7 +172,7 @@ internal class OfflineSharingSheet(
             session.addWithGap(ui.action("Back to hotspot options") { setJoiningDesktop(false) }, 3)
         }
         if (active) {
-            val label = if (state == OfflineHotspotService.State.SystemHotspot) "End hotspot setup" else "Stop hotspot"
+            val label = if (system != null) "End hotspot setup" else "Stop hotspot"
             session.addWithGap(ui.action(label) { onStop() }.apply { setTextColor(ui.errorColor) }, 3)
         }
         if (dialog.isShowing) sheet.fit()
@@ -201,13 +209,10 @@ internal class OfflineSharingSheet(
             })
             addView(password)
         } else {
-            addWithGap(ui.label(
-                "Android chooses the Wi-Fi security on this phone. You can join with a QR code.",
-                14, ui.ink,
-            ), 4)
+            addWithGap(ui.label("Choose the network name and password in Android Settings.", 14, ui.ink), 4)
         }
         addWithGap(ui.label("Only paired Portal Drop devices can exchange files and messages.", 12, ui.muted), 6)
-        if (!supportsPassphrase) {
+        if (supportsPassphrase) {
             addWithGap(ui.action("Use Android hotspot settings") { onSystemHotspot() }, 4)
         }
     }
@@ -226,6 +231,10 @@ internal class OfflineSharingSheet(
             }, 2)
         }
         addWithGap(ui.label("Only paired Portal Drop devices can exchange files and messages.", 12, ui.muted), 7)
+        addWithGap(ui.label(
+            "Portal Drop controls this local hotspot. Android’s Personal hotspot switch controls a separate network.",
+            12, ui.muted,
+        ), 4)
         addWithGap(ui.row().apply {
             addView(ui.action("Wi-Fi QR code") { showWifiQr(state) }, LinearLayout.LayoutParams(0, WRAP, 1f))
             if (passphrase != null) {
@@ -236,6 +245,10 @@ internal class OfflineSharingSheet(
     }
 
     private fun start() {
+        if (!supportsPassphrase) {
+            onSystemHotspot()
+            return
+        }
         val passphrase = password.text.toString().takeIf { usePassword }
         if (passphrase != null && (passphrase.length !in 8..63 || passphrase.any { it !in ' '..'~' })) {
             password.error = "Use 8–63 printable characters."

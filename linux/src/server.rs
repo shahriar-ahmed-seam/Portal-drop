@@ -1,7 +1,7 @@
 use crate::{
     files::{BUFFER_SIZE, Complete, Files, preview_file, preview_text},
     model::{
-        Chat, DeviceInfo, Item, Kind, Offset, PROTOCOL_VERSION, PairRequest, Receipt,
+        Chat, DeviceInfo, Item, Kind, Offset, PROTOCOL_VERSION, PairRequest, Receipt, StatusInfo,
         TransferCommand, TransferDirection, TransferResponse, TransferState, format_peer_label,
         load_notification_settings, local_name, local_os, now_ms, random_secret, valid_id,
     },
@@ -30,7 +30,7 @@ use futures_util::{StreamExt, stream};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     future::{Ready, ready},
     io::{self, BufRead, BufReader, ErrorKind, Read, Write},
@@ -60,7 +60,7 @@ static HEADER_OS: HeaderName = HeaderName::from_static("x-portal-drop-os");
 static HEADER_NAME: HeaderName = HeaderName::from_static("x-portal-drop-name");
 static HEADER_VERSION: HeaderName = HeaderName::from_static("x-portal-drop-version");
 
-type PeerRoutes = Arc<StdMutex<HashMap<(Peer, IpAddr), usize>>>;
+type PeerRoutes = Arc<StdMutex<HashMap<(Peer, IpAddr, i64), usize>>>;
 
 #[derive(Clone)]
 struct App {
@@ -125,10 +125,21 @@ pub fn local_listen_address(data_dir: &FsPath) -> Option<SocketAddr> {
         .ok()
 }
 
-pub fn local_connected_ips(data_dir: &FsPath) -> Vec<IpAddr> {
-    local_wake_query(data_dir, "addresses", 4096)
-        .and_then(|response| serde_json::from_str(&response).ok())
-        .unwrap_or_default()
+pub fn add_local_route_status(data_dir: &FsPath, status: &mut StatusInfo) {
+    if !status.connected {
+        return;
+    }
+    if let Some(routes) = local_wake_query(data_dir, "routes", 4096)
+        .and_then(|result| serde_json::from_str(&result).ok())
+    {
+        status.connected_local_routes = routes;
+        status.connected_local_ips = status.connected_local_routes.keys().copied().collect();
+    } else {
+        // The command line client may be updated before an older daemon is restarted.
+        status.connected_local_ips = local_wake_query(data_dir, "addresses", 4096)
+            .and_then(|result| serde_json::from_str(&result).ok())
+            .unwrap_or_default();
+    }
 }
 
 fn local_wake_query(data_dir: &FsPath, command: &str, limit: u64) -> Option<String> {
@@ -388,17 +399,24 @@ fn start_local_wake_server(
                         let _ = out.set_write_timeout(Some(Duration::from_millis(250)));
                         let _ = writeln!(out, "{transfer_address}");
                     }
-                } else if let Some(candidate) = trimmed.strip_prefix("addresses ") {
+                } else if let Some((command, candidate)) = trimmed.split_once(' ')
+                    && matches!(command, "addresses" | "routes")
+                {
                     if bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())) {
-                        let ips = store
+                        let routes = store
                             .active_peer()
                             .ok()
                             .flatten()
-                            .map(|peer| connected_ips(&connected_routes, peer))
+                            .map(|peer| connected_route_times(&connected_routes, peer))
                             .unwrap_or_default();
                         let mut out = stream;
                         let _ = out.set_write_timeout(Some(Duration::from_millis(250)));
-                        if let Ok(payload) = serde_json::to_string(&ips) {
+                        let encoded = if command == "addresses" {
+                            serde_json::to_string(&routes.keys().collect::<Vec<_>>())
+                        } else {
+                            serde_json::to_string(&routes)
+                        };
+                        if let Ok(payload) = encoded {
                             let _ = writeln!(out, "{payload}");
                         }
                     }
@@ -661,23 +679,30 @@ async fn info(State(app): State<App>, Authorized(peer): Authorized) -> ApiResult
 
 struct PresenceGuard {
     app: App,
-    route: (Peer, IpAddr),
+    route: (Peer, IpAddr, i64),
 }
 
 fn connected_ips(routes: &PeerRoutes, peer: Peer) -> Vec<IpAddr> {
-    let mut ips: Vec<_> = routes
+    connected_route_times(routes, peer).into_keys().collect()
+}
+
+fn connected_route_times(routes: &PeerRoutes, peer: Peer) -> BTreeMap<IpAddr, i64> {
+    let mut times = BTreeMap::new();
+    for (_, ip, started_at) in routes
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .keys()
-        .filter_map(|(trusted, local_ip)| (*trusted == peer).then_some(*local_ip))
-        .collect();
-    ips.sort_unstable();
-    ips
+        .filter(|(trusted, _, _)| *trusted == peer)
+    {
+        let latest = times.entry(*ip).or_insert(*started_at);
+        *latest = (*latest).max(*started_at);
+    }
+    times
 }
 
 impl PresenceGuard {
-    fn enter(app: App, peer: Peer, local_ip: IpAddr) -> Self {
-        let route = (peer, local_ip);
+    fn enter(app: App, peer: Peer, local_ip: IpAddr, started_at: i64) -> Self {
+        let route = (peer, local_ip, started_at);
         *app.connected_routes
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -749,11 +774,12 @@ async fn events(
     Authorized(peer): Authorized,
     Extension(LocalAddr(address)): Extension<LocalAddr>,
 ) -> ApiResult<Response> {
+    let started_at = now_ms();
     let (tx, rx) = mpsc::channel::<std::io::Result<String>>(16);
     let mut events_rx = app.events_tx.subscribe();
     let producer_app = app.clone();
     tokio::spawn(async move {
-        let _guard = PresenceGuard::enter(producer_app.clone(), peer, address.ip());
+        let _guard = PresenceGuard::enter(producer_app.clone(), peer, address.ip(), started_at);
         let ready = serde_json::to_string(&DeviceInfo {
             os: producer_app.local_os.to_owned(),
             name: producer_app.local_name.clone(),

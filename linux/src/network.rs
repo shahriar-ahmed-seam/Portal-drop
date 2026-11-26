@@ -57,7 +57,7 @@ fn select_addresses(
                 ip.is_link_local(),
                 !ip.is_private(),
             );
-            let can_announce = hotspot_target(&interface).is_some();
+            let can_announce = hotspot_target(&interface, None).is_some();
             Some((
                 rank,
                 LanAddress {
@@ -94,6 +94,7 @@ fn usable_ipv4(ip: Ipv4Addr) -> bool {
 pub fn announce_hotspot(
     data_dir: &Path,
     address: &str,
+    gateway: Option<Ipv4Addr>,
     peer: &Peer,
     fingerprint: &str,
 ) -> Result<()> {
@@ -123,8 +124,15 @@ pub fn announce_hotspot(
                 && !interface.is_p2p()
         })
         .context("the selected Wi-Fi address is unavailable")?;
-    let target = hotspot_target(interface)
+    let target = hotspot_target(interface, gateway)
         .context("choose a local Wi-Fi address, or enter the desktop address on your phone")?;
+    if let Some(gateway) = gateway {
+        ensure!(
+            target.gateway == Some(gateway)
+                && route_uses_source(*source.ip(), (gateway, HOTSPOT_HINT_PORT), false),
+            "the gateway is not on this Wi-Fi link"
+        );
+    }
     send_hotspot_hint(target, listen.port(), peer, Some(fingerprint))
 }
 
@@ -135,14 +143,14 @@ struct HotspotTarget {
     gateway: Option<Ipv4Addr>,
 }
 
-fn hotspot_target(interface: &Interface) -> Option<HotspotTarget> {
+fn hotspot_target(interface: &Interface, gateway: Option<Ipv4Addr>) -> Option<HotspotTarget> {
     let if_addrs::IfAddr::V4(local) = &interface.addr else {
         return None;
     };
     if !interface.is_oper_up() || interface.is_p2p() || !local.ip.is_private() {
         return None;
     }
-    hotspot_target_for_gateway(local, wifi_gateway(interface)?)
+    hotspot_target_for_gateway(local, gateway.or(wifi_gateway(interface)?))
 }
 
 fn hotspot_target_for_gateway(
@@ -248,7 +256,7 @@ impl HotspotDiscovery {
         };
         let targets: std::collections::HashSet<_> = interfaces
             .iter()
-            .filter_map(hotspot_target)
+            .filter_map(|interface| hotspot_target(interface, None))
             .filter(|target| listen.ip().is_unspecified() || listen.ip() == &target.source)
             .collect();
         self.attempts.retain(|target, _| targets.contains(target));
@@ -496,6 +504,13 @@ mod tests {
             hotspot_target_for_gateway(&local, Some(Ipv4Addr::new(192, 168, 7, 1))).unwrap();
         assert_eq!(target.broadcast, Some(Ipv4Addr::new(192, 168, 44, 255)));
         assert_eq!(target.gateway, None);
+        let gateway = Ipv4Addr::new(192, 168, 44, 1);
+        assert_eq!(
+            hotspot_target_for_gateway(&local, Some(gateway))
+                .unwrap()
+                .gateway,
+            Some(gateway)
+        );
     }
 
     #[test]

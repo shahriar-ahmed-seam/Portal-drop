@@ -21,7 +21,7 @@ use serde::Serialize;
 use std::{
     fs::{File, OpenOptions},
     io::{self, IsTerminal, Read, Write},
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
 };
 use store::{HistoryEntry, HistoryQuery, Store, private_directory};
@@ -75,6 +75,9 @@ enum Command {
         /// Desktop Wi-Fi IPv4 address, optionally with its service port
         #[arg(long)]
         address: String,
+        /// The phone's on-link IPv4 gateway from the selected Wi-Fi connection
+        #[arg(long)]
+        gateway: Option<Ipv4Addr>,
     },
     /// Render a Wi-Fi QR code from a WIFI: payload provided on standard input
     WifiQr,
@@ -304,11 +307,17 @@ fn main() -> Result<()> {
             println!("{invite}");
         }
         Command::LanAddresses => print_json(&network::lan_addresses(&data)?)?,
-        Command::AnnounceHotspot { address } => {
+        Command::AnnounceHotspot { address, gateway } => {
             let peer = store
                 .active_peer()?
                 .context("pair your phone before announcing this computer")?;
-            network::announce_hotspot(&data, &address, &peer, &store.identity()?.fingerprint)?;
+            network::announce_hotspot(
+                &data,
+                &address,
+                gateway,
+                &peer,
+                &store.identity()?.fingerprint,
+            )?;
             print_json(&serde_json::json!({ "sent": true }))?;
         }
         Command::WifiQr => {
@@ -331,9 +340,7 @@ fn main() -> Result<()> {
         }
         Command::Status { json } => {
             let mut status = store.status_info()?;
-            if status.connected {
-                status.connected_local_ips = server::local_connected_ips(&data);
-            }
+            server::add_local_route_status(&data, &mut status);
             if json {
                 print_json(&status)?;
             } else {
@@ -590,9 +597,7 @@ fn main() -> Result<()> {
         Command::Snapshot { chat, limit } => {
             let _ = store.purge_expired(&files);
             let mut status = store.status_info()?;
-            if status.connected {
-                status.connected_local_ips = server::local_connected_ips(&data);
-            }
+            server::add_local_route_status(&data, &mut status);
             let chats = store.chats(false)?;
             let target_chat = chat
                 .as_deref()

@@ -752,7 +752,7 @@ svg { display: block; flex-shrink: 0; }
    Host bridge (wry on Windows → window.ipc, WebKitGTK on Linux → messageHandlers)
    ======================================================================== */
 const DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001";
-const APP_VERSION = "0.6.0";
+const APP_VERSION = "0.6.1";
 const RELEASE_REPO = "shahriar-ahmed-seam/Portal-drop";
 const TEMP_TIMERS = new Map([[300, "5 minutes"], [600, "10 minutes"], [3600, "1 hour"], [86400, "24 hours"]]);
 const MAX_CLIPBOARD_IMAGE = 16 * 1024 * 1024;
@@ -2130,12 +2130,18 @@ function showOfflineSharing() {
   let busy = false;
   let polling = false;
   let timer;
+  let scanTimer;
+  let scansRemaining = 0;
   let lookupUntil = 0;
   let announced = "";
   let lastConfig = "";
   let lastPhase = "";
   let selectedEndpoint = "";
   let joinedAddress = "";
+  let joinedGateway;
+  let joinedName = "";
+  let joinedAt = 0;
+  let picker;
   let adapterControl, passwordControl, passwordToggle, findButton;
   let unavailable = "";
 
@@ -2153,28 +2159,31 @@ function showOfflineSharing() {
 
   modal({ title: "Offline sharing", body, wide: true, onClose: () => {
     clearTimeout(timer);
+    clearTimeout(scanTimer);
     document.removeEventListener("portal-status", renderStage);
+    window.removeEventListener("focus", resumeScan);
   } });
   document.addEventListener("portal-status", renderStage);
+  window.addEventListener("focus", resumeScan);
   action.onclick = () => {
     if (mode === "host" || active) changeHotspot();
-    else if (canPickWifi && networks === null && !connected()) scanNetworks();
     else toggleLookup();
   };
   render();
   update();
-  if (mode === "join" && canPickWifi) scanNetworks(false);
+  if (mode === "join" && canPickWifi) beginScan();
 
   function switchMode(next) {
     if (busy || next === mode) return;
     mode = next;
+    clearTimeout(scanTimer);
     lookupUntil = 0;
     selectedEndpoint = "";
     announced = "";
     error.hidden = true;
     render();
     update();
-    if (mode === "join" && canPickWifi && !active && networks === null) scanNetworks(false);
+    if (mode === "join" && canPickWifi && !active) beginScan();
   }
 
   function render() {
@@ -2196,11 +2205,12 @@ function showOfflineSharing() {
     address.disabled = copy.disabled = !addresses.length;
     pair.hidden = state.status.paired;
     pair.disabled = !addresses.length;
-    const configKey = JSON.stringify([mode, active, adapters, unavailable, loading, scanning, networks]);
+    const configKey = JSON.stringify([mode, active, adapters, unavailable, loading]);
     if (configKey !== lastConfig) {
       lastConfig = configKey;
       renderConfiguration();
     }
+    updateWifiPicker();
     renderStage();
   }
 
@@ -2209,8 +2219,13 @@ function showOfflineSharing() {
   }
 
   function connected() {
-    const local = mode === "host" ? active?.address : ipv4(address.value);
-    return !!local && !!state.status.connected && state.status.connected_local_ips?.includes(local);
+    const host = mode === "host";
+    const local = host ? active?.address : joinedAddress || ipv4(selectedEndpoint);
+    const since = host ? active?.activatedAt : joinedAt;
+    if (!local || !state.status.paired || !state.status.connected || (host && (!active.ready || !since))) return false;
+    if (!host && !addresses.some((row) => ipv4(row.address) === local)) return false;
+    const verifiedAt = state.status.connected_local_routes?.[local];
+    return typeof verifiedAt === "number" && verifiedAt >= since;
   }
 
   function renderStage() {
@@ -2232,7 +2247,8 @@ function showOfflineSharing() {
       phase = "waiting";
     } else if (hosting && active) {
       heading = ready ? peerLabel().name + " connected" : paired ? "Waiting for your phone" : "Pair your phone";
-      hint = ready ? "Ready to share over Wi-Fi" : "Join the hotspot in Android Wi-Fi settings.";
+      hint = ready ? "The hotspot stays on when you close this window."
+        : "Join from Android. The hotspot stays on when you close this window.";
       label = "Stop hotspot";
       glyph = ready ? "check" : "wifi";
       phase = ready ? "connected" : "waiting";
@@ -2251,19 +2267,22 @@ function showOfflineSharing() {
       phase = "connected";
       glyph = "check";
     } else {
-      heading = lookup ? "Looking for your paired phone" : "Join your phone’s hotspot";
-      hint = paired ? "Start the hotspot on your phone, then choose it below." : "Join the same Wi-Fi and pair your phone.";
-      label = lookup ? "Stop searching" : "Find paired phone";
-      phase = lookup ? "waiting" : "idle";
+      heading = joinedName ? "Wi-Fi joined" : lookup ? "Looking for your paired phone"
+        : scanning ? "Scanning nearby Wi-Fi" : "Join your phone’s hotspot";
+      hint = joinedName ? lookup ? joinedName + " · Waiting for your paired phone"
+        : "Open Offline sharing on the phone and leave its hotspot on. Then try Find paired phone."
+        : paired ? "Choose the network shown on your phone." : "Join the same Wi-Fi and pair your phone.";
+      label = lookup ? "Stop searching" : joinedName || selectedEndpoint ? "Find paired phone" : "Scan nearby";
+      phase = lookup || scanning ? "waiting" : "idle";
     }
-    action.disabled = busy || loading || scanning || (hosting && !active && !adapters.length)
-      || (!hosting && !paired && !active && networks !== null);
+    action.disabled = busy || loading || scanning || (hosting && !active && !adapters.length);
     action.dataset.phase = phase;
     action.title = label;
     action.setAttribute("aria-label", label);
     if (mode === "join" && findButton) {
       findButton.textContent = label;
-      findButton.disabled = loading || !paired;
+      findButton.disabled = loading || busy || scanning;
+      findButton.hidden = !joinedName && !selectedEndpoint;
     }
     const current = JSON.stringify([phase, heading, hint, glyph]);
     if (current === lastPhase) return;
@@ -2274,6 +2293,7 @@ function showOfflineSharing() {
   }
 
   function renderConfiguration() {
+    picker = null;
     config.replaceChildren();
     if (loading) return;
     if (mode === "join") {
@@ -2297,7 +2317,9 @@ function showOfflineSharing() {
     }
     if (active) {
       const card = el("div", "path-card");
-      const values = [["Wi-Fi name", active.ssid], [active.password ? "Password" : "Security", active.password || "Open"]];
+      const protectedNetwork = active.passwordProtected === true || !!active.password;
+      const values = [["Wi-Fi name", active.ssid], [protectedNetwork ? "Password" : "Security",
+        active.password || (protectedNetwork ? "Use the password you chose" : "Open")]];
       for (const [label, value] of values) {
         const line = el("div", "hotspot-credential");
         const text = el("span");
@@ -2331,7 +2353,9 @@ function showOfflineSharing() {
           if (qrBody.isConnected) qrBody.textContent = issue.message;
         }
       };
-      config.append(card, qr, stop);
+      config.append(card);
+      if (!protectedNetwork || active.password) config.append(qr);
+      config.append(stop);
       return;
     }
     if (!adapters.length) return;
@@ -2371,9 +2395,6 @@ function showOfflineSharing() {
   function renderWifiPicker() {
     const select = el("select", "field");
     select.setAttribute("aria-label", "Phone hotspot network");
-    select.append(new Option(scanning ? "Scanning Wi-Fi…" : "Choose your phone’s hotspot", ""));
-    const choices = Array.isArray(networks) ? networks : [];
-    for (const network of choices) select.append(new Option(network.ssid, network.id));
     const password = el("input", "field");
     password.type = "password";
     password.placeholder = "Wi-Fi password";
@@ -2381,20 +2402,19 @@ function showOfflineSharing() {
     password.maxLength = 63;
     password.autocomplete = "current-password";
     password.hidden = true;
-    const scan = el("button", "pill-btn", scanning ? "Scanning…" : "Scan nearby");
-    scan.disabled = scanning;
+    const scan = el("button", "pill-btn", "Scan nearby");
     scan.onclick = () => scanNetworks();
     const join = el("button", "pill-btn solid", "Join Wi-Fi");
-    join.disabled = true;
+    picker = { select, password, scan, join };
     select.onchange = () => {
-      const network = choices.find((item) => item.id === select.value);
-      password.hidden = !network?.requiresPassword;
+      clearTimeout(scanTimer);
       password.value = "";
-      join.disabled = !network;
+      updateWifiPicker();
       if (!password.hidden) password.focus();
+      scheduleScan();
     };
     join.onclick = () => {
-      const network = choices.find((item) => item.id === select.value);
+      const network = networks?.find((item) => item.id === select.value);
       if (network) joinWifi(network, password);
     };
     password.onkeydown = (event) => { if (event.key === "Enter") join.click(); };
@@ -2403,42 +2423,94 @@ function showOfflineSharing() {
     config.append(select, password, buttons);
   }
 
-  async function scanNetworks(scan = true) {
-    if (scanning || busy || active) return;
+  function updateWifiPicker() {
+    if (!picker) return;
+    const { select, password, scan, join } = picker;
+    const choices = networks || [];
+    const prior = select.value;
+    const signature = JSON.stringify([choices, scanning]);
+    if (select.dataset.options !== signature) {
+      select.dataset.options = signature;
+      select.replaceChildren(new Option(scanning ? "Scanning Wi-Fi…" : "Choose your phone’s hotspot", ""));
+      for (const network of choices) {
+        select.append(new Option(network.ssid + (network.current ? " · On this Wi-Fi" : ""), network.id));
+      }
+      if (choices.some((item) => item.id === prior)) select.value = prior;
+      else if (prior) password.value = "";
+    }
+    const network = choices.find((item) => item.id === select.value);
+    password.hidden = !network?.requiresPassword || !!network.current;
+    password.placeholder = network?.saved ? "Use saved password or enter a new one" : "Wi-Fi password";
+    select.disabled = password.disabled = busy;
+    join.disabled = !network || busy;
+    join.textContent = network?.current ? "Use this Wi-Fi" : "Join Wi-Fi";
+    scan.disabled = scanning || busy;
+    scan.textContent = scanning ? "Scanning…" : "Scan nearby";
+  }
+
+  function beginScan() {
+    scansRemaining = 3;
+    scanNetworks(false, true);
+    scheduleScan();
+  }
+
+  function resumeScan() {
+    if (mode === "join" && canPickWifi && !active && !joinedName && !picker?.select.value) beginScan();
+  }
+
+  function scheduleScan() {
+    clearTimeout(scanTimer);
+    if (!body.isConnected || scanning || busy || mode !== "join" || active ||
+        !scansRemaining || joinedName || picker?.select.value) return;
+    scanTimer = setTimeout(() => {
+      scansRemaining--;
+      scanNetworks(true, true);
+    }, scansRemaining === 3 ? 500 : 9000);
+  }
+
+  async function scanNetworks(scan = true, quiet = false) {
+    if (!body.isConnected || mode !== "join" || scanning || busy || active) return;
+    clearTimeout(scanTimer);
     scanning = true;
-    if (scan) error.hidden = true;
+    if (!quiet) error.hidden = true;
     render();
     try {
-      networks = await ipc("wifi_networks", { scan });
-      if ((!Array.isArray(networks) || !networks.length) && scan) {
+      const result = await ipc("wifi_networks", { scan });
+      networks = Array.isArray(result) ? result : [];
+      if (!networks.length && scan && !quiet) {
         showError("Start the phone hotspot, then scan again or check your Wi-Fi settings.");
       }
     } catch (issue) {
-      networks = [];
-      if (scan) showError(issue.message);
+      if (!quiet) showError(issue.message);
     } finally {
       scanning = false;
       if (body.isConnected) render();
+      scheduleScan();
     }
   }
 
   async function joinWifi(network, input) {
     if (busy || active) return;
-    const password = network.requiresPassword ? input.value : null;
-    if (network.requiresPassword && !/^[ -~]{8,63}$/.test(password)) {
+    const password = network.requiresPassword && !network.current ? input.value || null : null;
+    if (network.requiresPassword && (!network.saved || password !== null) && !/^[ -~]{8,63}$/.test(password || "")) {
       showError("Enter the Wi-Fi password shown on your phone.");
       input.focus();
       return;
     }
     busy = joiningNetwork = true;
+    clearTimeout(scanTimer);
+    const started = Date.now();
     error.hidden = true;
-    renderStage();
+    render();
     try {
       const result = await ipc("wifi_join", { id: network.id, password });
       if (!body.isConnected) return;
       input.value = "";
       selectedEndpoint = "";
       joinedAddress = result.address || "";
+      joinedGateway = result.gateway;
+      joinedName = result.ssid || network.ssid;
+      joinedAt = result.alreadyJoined ? 0 : started;
       lookupUntil = Date.now() + 45000;
       announced = "";
       await refresh();
@@ -2446,7 +2518,10 @@ function showOfflineSharing() {
       showError(issue.message);
     } finally {
       busy = joiningNetwork = false;
-      if (body.isConnected) update();
+      if (body.isConnected) {
+        render();
+        update();
+      }
     }
   }
 
@@ -2456,6 +2531,10 @@ function showOfflineSharing() {
   }
 
   function toggleLookup() {
+    if (!joinedName && !selectedEndpoint) {
+      scanNetworks();
+      return;
+    }
     error.hidden = true;
     if (lookupUntil > Date.now()) lookupUntil = 0;
     else {
@@ -2509,10 +2588,14 @@ function showOfflineSharing() {
       loading = false;
       render();
       if (mode === "join" && lookupUntil > Date.now() && !connected()) {
-        const endpoint = addresses.find((row) => row.address === address.value && row.can_announce);
+        const target = joinedAddress ? addresses.find((row) => ipv4(row.address) === joinedAddress)
+          : addresses.find((row) => row.address === selectedEndpoint || (!canHost && joinedName && row.address === address.value));
+        const endpoint = target?.can_announce ? target : null;
         if (endpoint && endpoint.address !== announced) {
           announced = endpoint.address;
-          await ipc("announce_hotspot", { address: endpoint.address }).catch(() => {});
+          const gateway = ipv4(endpoint.address) === joinedAddress ? joinedGateway : undefined;
+          await ipc("announce_hotspot", { address: endpoint.address, gateway })
+            .catch(() => gateway && ipc("announce_hotspot", { address: endpoint.address }).catch(() => {}));
         }
       }
     } catch (issue) {
@@ -2521,7 +2604,8 @@ function showOfflineSharing() {
       render();
     } finally {
       polling = false;
-      if (body.isConnected && (active || lookupUntil > Date.now())) timer = setTimeout(update, 3200);
+      if (body.isConnected && (active || (mode === "join" && (joinedName || selectedEndpoint)) ||
+          lookupUntil > Date.now())) timer = setTimeout(update, 3200);
     }
   }
 }

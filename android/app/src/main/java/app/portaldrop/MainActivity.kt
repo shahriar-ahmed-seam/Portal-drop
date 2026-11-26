@@ -13,7 +13,6 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Typeface
-import android.location.LocationManager
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
@@ -194,14 +193,13 @@ class MainActivity : ComponentActivity() {
         if (!it) notifyUser("Background connection is on. Allow notifications for message and file alerts.")
     }
 
-    private val hotspotPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+    private val hotspotPermissions = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         val request = pendingHotspotRequest ?: return@registerForActivityResult
         pendingHotspotRequest = null
-        if (hotspotPermissionGranted()) {
+        if (granted) {
             startOfflineHotspot(request.passphrase)
         } else {
-            val permission = if (Build.VERSION.SDK_INT >= 33) "Nearby devices" else "Precise location"
-            notifyUser("Allow $permission for Portal Drop in Android Settings to start a hotspot.")
+            notifyUser("Allow Nearby devices for Portal Drop in Android Settings to start a hotspot.")
         }
     }
 
@@ -1504,7 +1502,11 @@ class MainActivity : ComponentActivity() {
         val connection = buildList {
             add(OptionRow(
                 "Offline sharing", R.drawable.ic_portal_hotspot,
-                detail = if (OfflineHotspotService.isActive()) "Hotspot active" else null,
+                detail = when (OfflineHotspotService.state) {
+                    is OfflineHotspotService.State.Active -> "Local hotspot active"
+                    is OfflineHotspotService.State.SystemHotspot -> "Phone hotspot setup"
+                    else -> null
+                },
                 opensPage = true, act = ::showOfflineHotspot,
             ))
             if (paired) {
@@ -1670,37 +1672,40 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestHotspot(passphrase: String?) {
+        if (store.peer() == null) {
+            notifyUser("Pair your computer before starting hotspot sharing.")
+            return
+        }
+        if (!OfflineHotspotService.supportsCustomPassphrase()) {
+            openSystemHotspot()
+            return
+        }
         if (hotspotPermissionGranted()) {
             startOfflineHotspot(passphrase)
             return
         }
         pendingHotspotRequest = HotspotRequest(passphrase)
-        hotspotPermissions.launch(if (Build.VERSION.SDK_INT >= 33) {
-            arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
-        } else {
-            arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
-        })
+        hotspotPermissions.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
     }
 
     private fun openSystemHotspot() {
+        if (store.peer() == null) {
+            notifyUser("Pair your computer before starting hotspot sharing.")
+            return
+        }
         OfflineHotspotService.useSystemHotspot(this)
-        if (!tryStartActivity(Intent("android.settings.TETHER_SETTINGS")) &&
+        if (!tryStartActivity(Intent("com.android.settings.WIFI_TETHER_SETTINGS")) &&
+            !tryStartActivity(Intent("android.settings.TETHER_SETTINGS")) &&
             !tryStartActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
-        ) notifyUser("Open Hotspot and tethering in Android Settings.")
+        ) notifyUser("Search for Personal hotspot or Hotspot & tethering in Android Settings.")
         renderHotspotDialog()
     }
 
-    private fun hotspotPermissionGranted(): Boolean {
-        val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.NEARBY_WIFI_DEVICES
-        else Manifest.permission.ACCESS_FINE_LOCATION
-        return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
-    }
+    private fun hotspotPermissionGranted(): Boolean =
+        Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
 
     private fun startOfflineHotspot(passphrase: String?) {
-        if (Build.VERSION.SDK_INT < 33 && getSystemService(LocationManager::class.java)?.isLocationEnabled != true) {
-            notifyUser("Turn on Location in Android Settings, then try again.")
-            return
-        }
         OfflineHotspotService.start(this, passphrase)
         renderHotspotDialog()
     }

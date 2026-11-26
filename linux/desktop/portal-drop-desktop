@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import pwd
 import secrets
 import shutil
 import socket
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
@@ -170,6 +172,11 @@ class LocalHotspot:
     ACCESS_POINT = f"{BUS}.AccessPoint"
     ACTIVE = f"{BUS}.Connection.Active"
     IP4 = f"{BUS}.IP4Config"
+    DHCP4 = f"{BUS}.DHCP4Config"
+    PROFILE = f"{BUS}.Settings.Connection"
+    PROFILE_VOLATILE = 0x04
+    HOTSPOT_OWNER = "app.portaldrop.hotspot-owner"
+    HOTSPOT_ACTIVATED_AT = "app.portaldrop.hotspot-activated-at"
     WIFI = 2
     WIFI_AP = 0x40
     WIFI_RSN = 0x20
@@ -187,6 +194,8 @@ class LocalHotspot:
         self.lock = threading.Lock()
         self.active = None
         self.bus = None
+        self.uid = os.getuid()
+        self.profile_permission = f"user:{pwd.getpwuid(self.uid).pw_name}:"
 
     def call(self, path, interface, method, parameters=None, interactive=False):
         if self.bus is None or self.bus.is_closed():
@@ -253,11 +262,13 @@ class LocalHotspot:
                     pending.pop(path)
 
         networks = {}
-        for path, device, _wireless in devices:
+        for path, device, wireless in devices:
             try:
-                points = self.call(path, self.WIRELESS, "GetAccessPoints")[0]
+                points = self.call(path, self.WIRELESS, "GetAllAccessPoints")[0]
             except GLib.Error:
                 continue
+            profiles = self.saved_profiles(device.get("AvailableConnections", []))
+            current_point = wireless.get("ActiveAccessPoint")
             for point in points:
                 try:
                     ap = self.properties(point, self.ACCESS_POINT)
@@ -279,77 +290,137 @@ class LocalHotspot:
                     continue
                 key = (ssid, security)
                 strength = ap.get("Strength", 0)
-                if key in networks and networks[key]["strength"] >= strength:
+                current = device.get("ActiveConnection") if point == current_point else None
+                if current == "/":
+                    current = None
+                previous = networks.get(key)
+                if previous is not None and (bool(previous["current"]), previous["strength"]) >= (bool(current), strength):
                     continue
-                networks[key] = {"id": point, "device": path, "interface": device["Interface"],
-                                 "ssid": ssid.decode("utf-8", errors="replace"), "raw": ssid,
-                                 "security": security, "strength": strength,
-                                 "requiresPassword": security in ("wpa-psk", "sae")}
+                networks[key] = {
+                    "id": f"{ssid.hex()}:{security or 'open'}",
+                    "accessPoint": point, "device": path, "interface": device["Interface"],
+                    "ssid": ssid.decode("utf-8", errors="replace").replace("\0", "�"), "raw": ssid,
+                    "security": security, "strength": strength, "current": current, "profile": profiles.get(key),
+                    "requiresPassword": security in ("wpa-psk", "sae"),
+                }
         return sorted(networks.values(), key=lambda network: (
             not network["ssid"].startswith("Portal Drop"), -network["strength"], network["ssid"],
         ))
 
     def networks(self, scan=False):
         with self.lock:
-            return [{key: item[key] for key in ("id", "ssid", "requiresPassword")}
-                    for item in self.nearby(scan)]
+            return [{
+                "id": item["id"], "ssid": item["ssid"], "requiresPassword": item["requiresPassword"],
+                "saved": bool(item["profile"] or item["current"]), "current": bool(item["current"]),
+            } for item in self.nearby(scan)]
 
-    def activate(self, settings, device_path, access_point="/", host=False):
+    def saved_profiles(self, paths):
+        profiles = {}
+        for path in paths:
+            try:
+                settings = self.call(path, self.PROFILE, "GetSettings")[0]
+            except GLib.Error:
+                continue
+            wireless = settings.get("802-11-wireless", {})
+            if not wireless.get("ssid") or wireless.get("mode", "infrastructure") != "infrastructure":
+                continue
+            security = settings.get("802-11-wireless-security", {}).get("key-mgmt")
+            profiles.setdefault((bytes(wireless["ssid"]), security), path)
+        return profiles
+
+    def activate(self, settings, device_path, access_point="/"):
         variant = GLib.Variant
+        # NetworkManager keeps the link up when the window closes and drops
+        # the in-memory profile on disconnect.
         options = {"persist": variant("s", "volatile")}
-        if host:
-            options["bind-activation"] = variant("s", "dbus-client")
         _, path, _ = self.call(
             self.ROOT, self.BUS, "AddAndActivateConnection2",
             variant("(a{sa{sv}}ooa{sv})", (settings, device_path, access_point, options)), interactive=True,
         )
         return path
 
-    def join(self, access_point, password):
+    def join(self, network_id, password):
         with self.lock:
             if self.info():
                 raise RuntimeError("Stop the desktop hotspot before joining your phone.")
-            network = next((item for item in self.nearby() if item["id"] == access_point), None)
+            network = next((item for item in self.nearby() if item["id"] == network_id), None)
             if network is None:
                 raise RuntimeError("This network is no longer visible. Scan again.")
-            if network["requiresPassword"]:
-                self.validate_password(password)
             service_ctl("start")
-            variant = GLib.Variant
-            settings = {
-                "connection": {
-                    "id": variant("s", network["ssid"]), "type": variant("s", "802-11-wireless"),
-                    "autoconnect": variant("b", False),
-                },
-                "802-11-wireless": {"ssid": variant("ay", network["raw"]), "mode": variant("s", "infrastructure")},
-                "ipv4": {"method": variant("s", "auto"), "never-default": variant("b", True)},
-                "ipv6": {"method": variant("s", "disabled")},
-            }
-            if network["security"]:
-                security = {"key-mgmt": variant("s", network["security"])}
-                if network["requiresPassword"]:
-                    security["psk"] = variant("s", password)
-                settings["802-11-wireless-security"] = security
+            current = network["current"]
+            if current:
+                state, address = self.connection_ipv4(current)
+                if state == self.ACTIVATED and address:
+                    return self.join_result(network, current, address, already_joined=True)
             try:
-                path = self.activate(settings, network["device"], access_point)
+                if network["profile"] and password is None:
+                    path = self.call(
+                        self.ROOT, self.BUS, "ActivateConnection",
+                        GLib.Variant("(ooo)", (network["profile"], network["device"], network["accessPoint"])),
+                        interactive=True,
+                    )[0]
+                else:
+                    path = self.start_join(network, password)
             except GLib.Error as error:
                 raise RuntimeError("Wi-Fi could not connect. Check the network and password.") from error
+
             deadline = time.monotonic() + 22
             while time.monotonic() < deadline:
                 try:
                     state, address = self.connection_ipv4(path)
                 except GLib.Error:
-                    break
+                    state, address = None, None
                 if state == self.ACTIVATED and address:
-                    return {"ssid": network["ssid"], "interface": network["interface"], "address": address}
-                if state not in (self.ACTIVATING, self.ACTIVATED):
+                    return self.join_result(network, path, address)
+                if state in (3, 4):
                     break
                 time.sleep(0.25)
             try:
                 self.deactivate_path(path)
             except GLib.Error:
                 pass
-            raise RuntimeError("The hotspot did not assign a Wi-Fi address. Check its password and try again.")
+            raise RuntimeError("Wi-Fi did not connect with an IPv4 address. Try joining in Wi-Fi settings.")
+
+    def start_join(self, network, password):
+        if network["requiresPassword"]:
+            self.validate_password(password)
+        variant = GLib.Variant
+        settings = {
+            "connection": {
+                "id": variant("s", network["ssid"]), "type": variant("s", "802-11-wireless"),
+                "autoconnect": variant("b", False),
+            },
+            "802-11-wireless": {"ssid": variant("ay", network["raw"]), "mode": variant("s", "infrastructure")},
+            "ipv4": {"method": variant("s", "auto")},
+            "ipv6": {"method": variant("s", "disabled")},
+        }
+        if network["security"]:
+            security = {"key-mgmt": variant("s", network["security"])}
+            if network["requiresPassword"]:
+                security["psk"] = variant("s", password)
+            settings["802-11-wireless-security"] = security
+        return self.activate(settings, network["device"], network["accessPoint"])
+
+    def join_result(self, network, path, address, already_joined=False):
+        result = {"ssid": network["ssid"], "interface": network["interface"], "address": address,
+                  "alreadyJoined": already_joined}
+        try:
+            active = self.properties(path, self.ACTIVE)
+            ip_config = active.get("Ip4Config")
+            if ip_config and ip_config != "/":
+                gateway = self.properties(ip_config, self.IP4).get("Gateway")
+                if gateway:
+                    result["gateway"] = gateway
+                    return result
+            dhcp = active.get("Dhcp4Config")
+            if dhcp and dhcp != "/":
+                options = self.properties(dhcp, self.DHCP4).get("Options", {})
+                routers = str(options.get("routers") or options.get("dhcp_server_identifier") or "").split()
+                if routers:
+                    result["gateway"] = routers[0]
+        except GLib.Error:
+            pass
+        return result
 
     @staticmethod
     def validate_password(password):
@@ -360,35 +431,88 @@ class LocalHotspot:
 
     def connection_ipv4(self, path):
         active = self.properties(path, self.ACTIVE)
+        return active.get("State"), self.active_address(active)
+
+    def active_address(self, active):
         ip_config = active.get("Ip4Config")
         addresses = self.properties(ip_config, self.IP4).get("AddressData", []) if ip_config and ip_config != "/" else []
-        address = next((row["address"] for row in addresses if row.get("address")), None)
-        return active.get("State"), address
+        return next((row["address"] for row in addresses if row.get("address")), None)
+
+    def recover_active(self):
+        paths = self.properties(self.ROOT, self.BUS).get("ActiveConnections", [])
+        for path in paths:
+            try:
+                active = self.properties(path, self.ACTIVE)
+                if active.get("Type") != "802-11-wireless" or active.get("State") not in (self.ACTIVATING, self.ACTIVATED):
+                    continue
+                profile = active.get("Connection")
+                if not profile or profile == "/":
+                    continue
+                if not self.properties(profile, self.PROFILE).get("Flags", 0) & self.PROFILE_VOLATILE:
+                    continue
+                settings = self.call(profile, self.PROFILE, "GetSettings")[0]
+                connection = settings.get("connection", {})
+                wireless = settings.get("802-11-wireless", {})
+                marker = settings.get("user", {}).get("data", {})
+                if (connection.get("permissions") != [self.profile_permission]
+                        or wireless.get("mode") != "ap"
+                        or marker.get(self.HOTSPOT_OWNER) != str(self.uid)):
+                    continue
+                activated_at = int(marker.get(self.HOTSPOT_ACTIVATED_AT, 0))
+                ssid = bytes(wireless.get("ssid", [])).decode("utf-8", errors="replace")
+                connection_uuid = active.get("Uuid")
+                if not ssid or not connection_uuid or activated_at <= 0:
+                    continue
+                devices = active.get("Devices", [])
+                interface = self.properties(devices[0], self.DEVICE).get("Interface") if devices else None
+            except (GLib.Error, ValueError, TypeError):
+                # Active profiles can disappear as the adapter changes state.
+                continue
+
+            security = "802-11-wireless-security"
+            protected = settings.get(security, {}).get("key-mgmt") == "wpa-psk"
+            password = None
+            if protected:
+                try:
+                    secrets_reply = self.call(profile, self.PROFILE, "GetSecrets", GLib.Variant("(s)", (security,)))[0]
+                    password = secrets_reply.get(security, {}).get("psk") or None
+                except GLib.Error:
+                    # Keep control of the hotspot when secrets aren't available to this session.
+                    pass
+            return path, connection_uuid, {
+                "ssid": ssid, "password": password, "passwordProtected": protected,
+                "interface": interface, "activatedAt": activated_at,
+            }
+        return None
 
     def info(self):
         if self.active is None:
-            return None
-        path, config = self.active
+            self.active = self.recover_active()
+            if self.active is None:
+                return None
+        path, connection_uuid, config = self.active
         try:
-            state, address = self.connection_ipv4(path)
+            active = self.properties(path, self.ACTIVE)
         except GLib.Error as error:
             # NetworkManager removes the active object on disconnect.
             if Gio.DBusError.get_remote_error(error) not in (
                 "org.freedesktop.DBus.Error.UnknownObject", "org.freedesktop.DBus.Error.UnknownMethod",
             ):
                 raise
-            state, address = None, None
-        if state not in (self.ACTIVATING, self.ACTIVATED):
+            active = {}
+        state = active.get("State")
+        if active.get("Uuid") != connection_uuid or state not in (self.ACTIVATING, self.ACTIVATED):
             self.active = None
             return None
+        address = self.active_address(active)
         return {**config, "address": address, "ready": bool(address and state == self.ACTIVATED)}
 
     def status(self):
         with self.lock:
-            hotspot = self.info()
-            if hotspot:
-                return {"active": hotspot, "adapters": []}
             try:
+                hotspot = self.info()
+                if hotspot:
+                    return {"active": hotspot, "adapters": []}
                 adapters = self.adapters()
             except GLib.Error:
                 return {"active": None, "adapters": [], "reason": "NetworkManager is unavailable."}
@@ -409,10 +533,13 @@ class LocalHotspot:
                     raise RuntimeError("This Wi-Fi adapter cannot start a password-protected hotspot.")
             service_ctl("start")
             ssid = f"Portal Drop {secrets.token_hex(3).upper()}"
+            connection_uuid = str(uuid.uuid4())
+            activated_at = time.time_ns() // 1_000_000
             variant = GLib.Variant
             settings = {
                 "connection": {
                     "id": variant("s", ssid), "type": variant("s", "802-11-wireless"),
+                    "uuid": variant("s", connection_uuid), "permissions": variant("as", [self.profile_permission]),
                     "autoconnect": variant("b", False),
                 },
                 "802-11-wireless": {
@@ -421,6 +548,9 @@ class LocalHotspot:
                 },
                 "ipv4": {"method": variant("s", "shared"), "never-default": variant("b", True)},
                 "ipv6": {"method": variant("s", "disabled")},
+                "user": {"data": variant("a{ss}", {
+                    self.HOTSPOT_OWNER: str(self.uid), self.HOTSPOT_ACTIVATED_AT: str(activated_at),
+                })},
             }
             if password is not None:
                 settings["802-11-wireless-security"] = {
@@ -428,10 +558,13 @@ class LocalHotspot:
                     "psk": variant("s", password),
                 }
             try:
-                path = self.activate(settings, device_path, host=True)
+                path = self.activate(settings, device_path)
             except GLib.Error as error:
                 raise RuntimeError("NetworkManager could not start the hotspot. Check the adapter and Wi-Fi permissions.") from error
-            self.active = (path, {"ssid": ssid, "password": password, "interface": adapter["interface"]})
+            self.active = (path, connection_uuid, {
+                "ssid": ssid, "password": password, "passwordProtected": password is not None,
+                "interface": adapter["interface"], "activatedAt": activated_at,
+            })
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 hotspot = self.info()
@@ -445,7 +578,9 @@ class LocalHotspot:
 
     def deactivate(self):
         if self.active is not None:
-            self.deactivate_path(self.active[0])
+            path, connection_uuid, _config = self.active
+            if self.properties(path, self.ACTIVE).get("Uuid") == connection_uuid:
+                self.deactivate_path(path)
             self.active = None
 
     def deactivate_path(self, path):
@@ -1333,7 +1468,10 @@ class PortalWindow(Gtk.ApplicationWindow):
         if action == "wifi_join":
             return self.hotspot.join(payload.get("id"), payload.get("password"))
         if action == "announce_hotspot":
-            return get_json("announce-hotspot", "--address", str(payload.get("address") or ""))
+            args = ["announce-hotspot", "--address", str(payload.get("address") or "")]
+            if payload.get("gateway"):
+                args.extend(["--gateway", str(payload["gateway"])])
+            return get_json(*args)
         if action == "hotspot_status":
             return self.hotspot.status()
         if action == "hotspot_qr":
@@ -1343,6 +1481,8 @@ class PortalWindow(Gtk.ApplicationWindow):
             special = {ord(character): "\\" + character for character in '\\;,":'}
             ssid = active["ssid"].translate(special)
             password = active["password"]
+            if active["passwordProtected"] and not password:
+                raise RuntimeError("Use the password you chose when starting the hotspot.")
             payload = (f'WIFI:T:WPA;S:{ssid};P:{password.translate(special)};;'
                        if password else f'WIFI:T:nopass;S:{ssid};;')
             return json.loads(run_cli("wifi-qr", data=payload))

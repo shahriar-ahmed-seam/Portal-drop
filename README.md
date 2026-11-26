@@ -172,11 +172,11 @@ Open **Offline sharing** on both devices. Start a hotspot on one device and join
 
 | Hotspot host | How to join |
 | --- | --- |
-| Android | Choose **Host hotspot** on the phone. On the desktop choose **Join phone**, select the Wi-Fi network shown on Android, and tap **Join Wi-Fi**. Use the desktop's Wi-Fi settings if the system blocks app-managed scanning or joining. |
-| Linux | Choose **Host hotspot** and start it on a NetworkManager Wi-Fi adapter. On Android, choose **Join hotspot** and join the displayed Wi-Fi network, or scan the desktop's Wi-Fi QR code. Keep the desktop app open or in the tray while hosting. Starting the hotspot can replace that adapter's current Wi-Fi connection. |
+| Android | Choose **Host hotspot** on the phone. On the desktop choose **Join phone**, select the hotspot, and tap **Join Wi-Fi**. On Linux, you can also select a Wi-Fi connection you already joined in system settings and choose **Use this Wi-Fi**. |
+| Linux | Choose **Host hotspot** and start it on a NetworkManager Wi-Fi adapter. On Android, choose **Join hotspot** and join the displayed Wi-Fi network, or scan the desktop's Wi-Fi QR code. Closing Portal Drop leaves the hotspot running. Reopen **Offline sharing** and choose **Stop hotspot** to turn it off. Starting the hotspot can replace that adapter's current Wi-Fi connection. |
 | Windows system hotspot | Start it in Windows Settings if your adapter and OS support this setup, then join that network on Android. |
 
-Linux can host an open hotspot or use a password you choose. Portal Drop can request an open hotspot or a custom password on Android API 36.1 and up. On older Android versions, use the generated Wi-Fi QR code or the phone's system hotspot settings for the options your phone supports.
+Linux can host an open hotspot or use a password you choose. Portal Drop can request an open hotspot or a custom password on Android API 36.1 and up. On older Android versions, **Host hotspot** opens the phone's hotspot settings. Choose open Wi-Fi if the phone offers it, or set a password you can reuse.
 
 Anyone in range can join an open Wi-Fi hotspot. Portal Drop still requires the saved pairing and verifies the encrypted connection before showing **Connected** or sharing chats and files. If discovery is blocked, open **Connection help** on the desktop and enter its hotspot address under **Connect by address** on Android.
 

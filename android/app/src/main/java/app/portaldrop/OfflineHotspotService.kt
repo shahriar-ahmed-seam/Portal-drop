@@ -20,13 +20,15 @@ internal class OfflineHotspotService : Service() {
         data object Off : State
         data object Starting : State
         class Active(val ssid: String, val passphrase: String?) : State
-        data object SystemHotspot : State
+        data class SystemHotspot(val detail: String? = null) : State
         data class Failed(val message: String) : State
     }
 
     private val main = Handler(Looper.getMainLooper())
     private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var requested = false
+    private var expectedPassphrase: String? = null
+    private var systemHotspot = false
     private var stopping = false
     private var failure: String? = null
     private val timeout = Runnable {
@@ -53,29 +55,24 @@ internal class OfflineHotspotService : Service() {
                 NOTIFICATION_ID, notification("Starting your offline hotspot…"),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
             )
-            if (action == ACTION_SYSTEM) {
-                update(this, State.SystemHotspot)
-                notifications.notify(NOTIFICATION_ID, notification("Join your phone’s hotspot from your computer.", system = true))
+            if (action == ACTION_SYSTEM || Build.VERSION.SDK_INT < 36 ||
+                Build.VERSION.SDK_INT_FULL < Build.VERSION_CODES_FULL.BAKLAVA_1
+            ) {
+                enterSystemHotspot()
                 return START_NOT_STICKY
             }
             val wifi = applicationContext.getSystemService(WifiManager::class.java)
             if (wifi == null) {
                 fail("This device has no Wi-Fi adapter available.")
             } else {
-                if (Build.VERSION.SDK_INT >= 36) {
-                    val config = SoftApConfiguration.Builder()
-                    val passphrase = intent?.getStringExtra(EXTRA_PASSPHRASE)
-                    if (Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1) {
-                        config.setPassphrase(
-                            passphrase,
-                            if (passphrase == null) SoftApConfiguration.SECURITY_TYPE_OPEN
-                            else SoftApConfiguration.SECURITY_TYPE_WPA2_PSK,
-                        )
-                    }
-                    wifi.startLocalOnlyHotspotWithConfiguration(config.build(), mainExecutor, callback)
-                } else {
-                    wifi.startLocalOnlyHotspot(callback, main)
-                }
+                val passphrase = intent?.getStringExtra(EXTRA_PASSPHRASE)
+                expectedPassphrase = passphrase
+                val config = SoftApConfiguration.Builder().setPassphrase(
+                    passphrase,
+                    if (passphrase == null) SoftApConfiguration.SECURITY_TYPE_OPEN
+                    else SoftApConfiguration.SECURITY_TYPE_WPA2_PSK,
+                )
+                wifi.startLocalOnlyHotspotWithConfiguration(config.build(), mainExecutor, callback)
                 main.postDelayed(timeout, START_TIMEOUT_MS)
             }
         } catch (_: SecurityException) {
@@ -89,14 +86,14 @@ internal class OfflineHotspotService : Service() {
     private val callback = object : WifiManager.LocalOnlyHotspotCallback() {
         override fun onStarted(available: WifiManager.LocalOnlyHotspotReservation) {
             main.removeCallbacks(timeout)
-            if (stopping) {
+            if (stopping || systemHotspot) {
                 runCatching { available.close() }
                 return
             }
             reservation = available
             val credentials = runCatching { credentials(available) }.getOrNull()
-            if (credentials == null) {
-                fail("Android did not provide the hotspot’s Wi-Fi details. Try starting it again.")
+            if (credentials == null || credentials.passphrase != expectedPassphrase) {
+                enterSystemHotspot("Android didn’t apply the selected Wi-Fi security.")
                 return
             }
             update(this@OfflineHotspotService, credentials)
@@ -105,11 +102,11 @@ internal class OfflineHotspotService : Service() {
         }
 
         override fun onStopped() {
-            if (!stopping) fail("Android stopped the hotspot. Start it again to reconnect.")
+            if (!stopping && !systemHotspot) fail("Android stopped the hotspot. Start it again to reconnect.")
         }
 
         override fun onFailed(reason: Int) {
-            if (stopping) return
+            if (stopping || systemHotspot) return
             fail(when (reason) {
                 ERROR_INCOMPATIBLE_MODE -> "Disconnect from your current Wi-Fi network or use the hotspot in Android Settings."
                 ERROR_NO_CHANNEL -> "Android could not find a Wi-Fi channel. Try again in a different location."
@@ -119,23 +116,27 @@ internal class OfflineHotspotService : Service() {
         }
     }
 
+    private fun enterSystemHotspot(detail: String? = null) {
+        systemHotspot = true
+        runCatching { reservation?.close() }
+        reservation = null
+        expectedPassphrase = null
+        update(this, State.SystemHotspot(detail))
+        getSystemService(NotificationManager::class.java).notify(
+            NOTIFICATION_ID, notification("Turn on Personal hotspot in Android Settings.", system = true),
+        )
+    }
+
     @Suppress("DEPRECATION")
     private fun credentials(reservation: WifiManager.LocalOnlyHotspotReservation): State.Active? {
-        val (ssid, passphrase) = if (Build.VERSION.SDK_INT >= 30) {
-            val config = reservation.softApConfiguration
-            val password = config.passphrase
-            if (password.isNullOrBlank() && config.securityType != SoftApConfiguration.SECURITY_TYPE_OPEN) return null
-            config.ssid to password
-        } else {
-            val wifi = reservation.wifiConfiguration ?: return null
-            val password = wifi.preSharedKey.cleanWifiValue()?.takeIf { it.isNotBlank() } ?: return null
-            wifi.SSID.cleanWifiValue() to password
-        }
+        if (Build.VERSION.SDK_INT < 30) return null
+        val config = reservation.softApConfiguration
+        val ssid = config.ssid
+        val passphrase = config.passphrase
+        if (passphrase.isNullOrBlank() && config.securityType != SoftApConfiguration.SECURITY_TYPE_OPEN) return null
         if (ssid.isNullOrBlank() || ssid == WifiManager.UNKNOWN_SSID) return null
         return State.Active(ssid, passphrase)
     }
-
-    private fun String?.cleanWifiValue(): String? = this?.removeSurrounding("\"")
 
     private fun fail(message: String) {
         stopping = true
@@ -199,8 +200,8 @@ internal class OfflineHotspotService : Service() {
 
         fun start(context: Context, passphrase: String? = null) {
             if (state is State.Starting || isActive()) return
-            if (passphrase != null && !supportsCustomPassphrase()) {
-                update(context, State.Failed("Use Android Settings to set a hotspot password on this phone."))
+            if (!supportsCustomPassphrase()) {
+                useSystemHotspot(context)
                 return
             }
             if (passphrase != null && !passphrase.isValidHotspotPassphrase()) {
@@ -226,10 +227,13 @@ internal class OfflineHotspotService : Service() {
                         .setAction(action)
                         .putExtra(EXTRA_PASSPHRASE, passphrase),
                 )
-                if (store.backgroundEnabled()) runCatching { TransferService.start(context) }
             } catch (_: RuntimeException) {
                 update(context, State.Failed("Open Portal Drop and try starting the hotspot again."))
+                return
             }
+            // Hosting is an explicit request to connect, including when background
+            // transfers were previously paused.
+            runCatching { TransferService.start(context) }
         }
 
         fun stop(context: Context) {
