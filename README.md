@@ -168,15 +168,17 @@ adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 
 ### Offline sharing over a Wi-Fi hotspot
 
-Portal Drop needs a local IP connection. Messages and files can move over a hotspot with the router off and mobile data disabled.
+Open **Offline sharing** on both devices. Start a hotspot on one device and join it from the other. Messages and files can move over this link with the router unplugged and mobile data disabled.
 
 | Hotspot host | How to join |
 | --- | --- |
-| Android | Open **Offline hotspot** in Portal Drop on Android. Join the Wi-Fi network shown there from a Linux or Windows desktop. You can also use an existing Android system hotspot if your phone allows it with mobile data off. |
-| Linux | Open **Offline sharing** on the desktop and start a hotspot on an adapter supported by NetworkManager. Join the Wi-Fi network shown there from Android. Starting the hotspot can replace the adapter's current Wi-Fi connection. Keep Portal Drop open or in the tray while hosting. |
-| Windows | Join an Android hotspot in Windows Wi-Fi settings. A Windows-hosted hotspot created in system settings can also be used when the OS and adapter let it run. |
+| Android | Choose **Host hotspot** on the phone. On the desktop choose **Join phone**, select the Wi-Fi network shown on Android, and tap **Join Wi-Fi**. Use the desktop's Wi-Fi settings if the system blocks app-managed scanning or joining. |
+| Linux | Choose **Host hotspot** and start it on a NetworkManager Wi-Fi adapter. On Android, choose **Join hotspot** and join the displayed Wi-Fi network, or scan the desktop's Wi-Fi QR code. Keep the desktop app open or in the tray while hosting. Starting the hotspot can replace that adapter's current Wi-Fi connection. |
+| Windows system hotspot | Start it in Windows Settings if your adapter and OS support this setup, then join that network on Android. |
 
-Portal Drop tries to rediscover the paired desktop when the network changes. If it stays offline, open **Offline sharing** on the desktop and copy the address for the hotspot adapter. On Android, open **Connect by address** and enter it. On a hotspot started inside Portal Drop for Android, **Find phone hotspot** on the desktop can also send a discovery hint to the phone. The app checks the desktop certificate and existing pairing before adopting a new address.
+Linux can host an open hotspot or use a password you choose. Portal Drop can request an open hotspot or a custom password on Android API 36.1 and up. On older Android versions, use the generated Wi-Fi QR code or the phone's system hotspot settings for the options your phone supports.
+
+Anyone in range can join an open Wi-Fi hotspot. Portal Drop still requires the saved pairing and verifies the encrypted connection before showing **Connected** or sharing chats and files. If discovery is blocked, open **Connection help** on the desktop and enter its hotspot address under **Connect by address** on Android.
 
 For a first-time pairing, choose the hotspot adapter’s address in the desktop pairing dialog before scanning the QR code. If Windows Firewall blocks the connection, check the profile and allow Portal Drop on the trusted hotspot network. Transfer speed depends on the hotspot adapter, band, and signal.
 

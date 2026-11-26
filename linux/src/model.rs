@@ -349,6 +349,8 @@ pub struct DeviceInfo {
 pub struct StatusInfo {
     pub paired: bool,
     pub connected: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected_local_ips: Vec<std::net::IpAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_os: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

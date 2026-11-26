@@ -20,7 +20,7 @@ use qrcode::{QrCode, render::unicode};
 use serde::Serialize;
 use std::{
     fs::{File, OpenOptions},
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     net::SocketAddr,
     path::PathBuf,
 };
@@ -70,12 +70,14 @@ enum Command {
     },
     /// List the desktop's reachable local address candidates as JSON
     LanAddresses,
-    /// Send a one-time discovery hint to the selected Wi-Fi adapter's gateway
+    /// Send a discovery hint on the selected Wi-Fi adapter
     AnnounceHotspot {
         /// Desktop Wi-Fi IPv4 address, optionally with its service port
         #[arg(long)]
         address: String,
     },
+    /// Render a Wi-Fi QR code from a WIFI: payload provided on standard input
+    WifiQr,
     /// Revoke the current Android device and cancel unused invitations
     Unpair,
     /// Show whether an Android device is paired and connected
@@ -303,12 +305,24 @@ fn main() -> Result<()> {
         }
         Command::LanAddresses => print_json(&network::lan_addresses(&data)?)?,
         Command::AnnounceHotspot { address } => {
-            ensure!(
-                store.active_peer()?.is_some(),
-                "pair your phone before announcing this computer"
-            );
-            network::announce_hotspot(&data, &address, &store.identity()?.fingerprint)?;
+            let peer = store
+                .active_peer()?
+                .context("pair your phone before announcing this computer")?;
+            network::announce_hotspot(&data, &address, &peer, &store.identity()?.fingerprint)?;
             print_json(&serde_json::json!({ "sent": true }))?;
+        }
+        Command::WifiQr => {
+            let mut data = String::new();
+            io::stdin().lock().take(513).read_to_string(&mut data)?;
+            let payload = data.trim_end_matches(['\r', '\n']);
+            ensure!(
+                data.len() <= 512 && payload.starts_with("WIFI:") && payload.ends_with(";;"),
+                "invalid Wi-Fi QR payload"
+            );
+            let qr = QrCode::new(payload.as_bytes())?
+                .render::<unicode::Dense1x2>()
+                .build();
+            print_json(&serde_json::json!({ "qr": qr }))?;
         }
         Command::Unpair => {
             store.unpair()?;
@@ -316,7 +330,10 @@ fn main() -> Result<()> {
             println!("Android device unpaired.");
         }
         Command::Status { json } => {
-            let status = store.status_info()?;
+            let mut status = store.status_info()?;
+            if status.connected {
+                status.connected_local_ips = server::local_connected_ips(&data);
+            }
             if json {
                 print_json(&status)?;
             } else {
@@ -572,7 +589,10 @@ fn main() -> Result<()> {
         }
         Command::Snapshot { chat, limit } => {
             let _ = store.purge_expired(&files);
-            let status = store.status_info()?;
+            let mut status = store.status_info()?;
+            if status.connected {
+                status.connected_local_ips = server::local_connected_ips(&data);
+            }
             let chats = store.chats(false)?;
             let target_chat = chat
                 .as_deref()

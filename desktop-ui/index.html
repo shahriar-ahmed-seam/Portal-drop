@@ -236,7 +236,8 @@ svg { display: block; flex-shrink: 0; }
 .drawer-item svg { color: var(--muted); }
 .drawer-item:hover { background: var(--side-hover); }
 .drawer-item.danger, .drawer-item.danger svg { color: var(--danger); }
-.drawer-sep { height: 1px; background: var(--line); margin: 6px 6px; }
+.drawer-group + .drawer-group { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 5px; }
+.drawer-item .group-arrow { margin-left: auto; }
 .theme-switch { display: flex; gap: 6px; padding: 6px 14px 12px; }
 .theme-opt {
   flex: 1; padding: 8px 4px; border-radius: 10px; font-size: 12.5px; font-weight: 600; color: var(--text-2);
@@ -246,6 +247,10 @@ svg { display: block; flex-shrink: 0; }
 .theme-opt.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .drawer-label { padding: 10px 16px 4px; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
 .drawer-foot { padding: 12px 20px 16px; font-size: 12px; color: var(--muted); }
+.settings-group + .settings-group { margin-top: 16px; }
+.settings-group h3 { margin: 0 0 5px 8px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.settings-group .drawer-item { padding: 9px; gap: 12px; }
+.settings-group .theme-switch { padding: 5px 0; }
 
 /* ============================ Chat pane ============================ */
 .chat { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--wall-2); }
@@ -522,6 +527,36 @@ svg { display: block; flex-shrink: 0; }
 .offline-section .field { margin: 6px 0; }
 .offline-section .path-card { margin-top: 8px; }
 .offline-value { font-family: var(--mono); overflow-wrap: anywhere; }
+.hotspot-mode { display: flex; gap: 4px; padding: 4px; border-radius: 12px; background: var(--input-bg); }
+.hotspot-mode button { flex: 1; min-height: 36px; padding: 4px 12px; border-radius: 9px; font-size: 13px; color: var(--text-2); }
+.hotspot-mode button[aria-pressed="true"] { background: var(--panel); color: var(--text); font-weight: 650; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+.hotspot-stage { position: relative; display: grid; justify-items: center; gap: 4px; padding: 20px 8px 18px; text-align: center; }
+.hotspot-action {
+  position: relative; isolation: isolate; display: grid; place-items: center; width: 92px; height: 92px; margin: 14px 0 12px;
+  border-radius: 50%; background: var(--accent); color: var(--on-accent); box-shadow: 0 6px 20px var(--accent-soft);
+}
+.hotspot-action:hover { background: var(--accent-hover); }
+.hotspot-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 7px; }
+.hotspot-action[data-phase="waiting"]::before, .hotspot-action[data-phase="waiting"]::after {
+  position: absolute; z-index: -1; inset: -2px; border: 1px solid var(--accent); border-radius: 50%;
+  content: ""; pointer-events: none; animation: hotspot-pulse 2.1s ease-out infinite;
+}
+.hotspot-action[data-phase="waiting"]::after { animation-delay: .7s; }
+.hotspot-action[data-phase="connected"] { box-shadow: 0 0 0 7px var(--accent-soft); }
+@keyframes hotspot-pulse { from { opacity: .65; transform: scale(1); } to { opacity: 0; transform: scale(1.52); } }
+@media (prefers-reduced-motion: reduce) { .hotspot-action::before, .hotspot-action::after { animation: none !important; } }
+.hotspot-stage h3 { max-width: 100%; margin: 8px 0 0; color: var(--text); font-size: 18px; overflow-wrap: anywhere; }
+.hotspot-stage p { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+.hotspot-config { border-top: 1px solid var(--line); padding: 12px 0 0; }
+.hotspot-config label:not(.checkline) { display: block; margin-top: 8px; font-size: 13px; font-weight: 600; }
+.hotspot-config [hidden] { display: none; }
+.hotspot-config .checkline { margin-top: 8px; }
+.hotspot-config .pill-btn { padding-inline: 10px; }
+.hotspot-error { padding: 8px 10px; color: var(--text); background: var(--danger-soft); border-radius: 8px; }
+.hotspot-detail { margin: 10px 0; }
+.hotspot-detail summary { cursor: pointer; color: var(--muted); }
+.hotspot-credential { display: flex; align-items: center; justify-content: space-between; gap: 10px; overflow-wrap: anywhere; }
+.hotspot-credential span { min-width: 0; }
 .pair-address { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .pair-address .field { flex: 1 1 210px; }
 .link-box {
@@ -717,7 +752,7 @@ svg { display: block; flex-shrink: 0; }
    Host bridge (wry on Windows → window.ipc, WebKitGTK on Linux → messageHandlers)
    ======================================================================== */
 const DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001";
-const APP_VERSION = "0.5.0";
+const APP_VERSION = "0.6.0";
 const RELEASE_REPO = "shahriar-ahmed-seam/Portal-drop";
 const TEMP_TIMERS = new Map([[300, "5 minutes"], [600, "10 minutes"], [3600, "1 hour"], [86400, "24 hours"]]);
 const MAX_CLIPBOARD_IMAGE = 16 * 1024 * 1024;
@@ -768,6 +803,9 @@ const ICONS = {
   open: '<path d="M14 4.5h5.5V10M19.5 4.5 11 13M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/>',
   qr: '<rect x="4" y="4" width="6" height="6" rx="1.2"/><rect x="14" y="4" width="6" height="6" rx="1.2"/><rect x="4" y="14" width="6" height="6" rx="1.2"/><path d="M14 14h2.5v2.5H14zM17.5 17.5H20V20h-2.5zM14 19h1.5M19 14h1"/>',
   phone: '<rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M11 17.8h2"/>',
+  wifi: '<path d="M3 8a14 14 0 0 1 18 0M6 11.5a9.5 9.5 0 0 1 12 0M9 15a5 5 0 0 1 6 0"/><circle cx="12" cy="19" r=".7" fill="currentColor"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M10 3h4l.6 2.6 2 .9 2.3-1.4 2.8 2.8-1.4 2.3.9 2 2.6.6v4l-2.6.6-.9 2 1.4 2.3-2.8 2.8-2.3-1.4-2 .9-.6 2.6h-4l-.6-2.6-2-.9-2.3 1.4-2.8-2.8 1.4-2.3-.9-2-2.6-.6v-4l2.6-.6.9-2-1.4-2.3L5 5.1l2.3 1.4 2-.9z" transform="translate(2 1) scale(.83)"/>',
+  next: '<path d="m9 6 6 6-6 6"/>',
   pause: '<rect x="7" y="5.5" width="3.4" height="13" rx="1"/><rect x="13.6" y="5.5" width="3.4" height="13" rx="1"/>',
   play: '<path d="M8 5.5v13l10.5-6.5z"/>',
   history: '<path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9"/><path d="M4.5 4.5V9H9M12 8.5v4l2.8 1.7"/>',
@@ -1439,46 +1477,95 @@ $("chat-more").onclick = () => {
    ======================================================================== */
 function renderDrawer() {
   const box = $("drawer-items");
-  box.innerHTML = "";
-  const add = (ic, label, run, danger) => {
-    const b = el("button", "drawer-item" + (danger ? " danger" : ""), `${icon(ic, 21)}<span>${esc(label)}</span>`);
-    b.onclick = () => { closeDrawer(); run(); };
-    box.appendChild(b);
-  };
-  add("qr", state.status.paired ? "Pair a new phone" : "Pair Android device", showPair);
-  add("phone", "Offline sharing", showOfflineSharing);
-  add("edit", "New chat", newChat);
-  add("search", "Search messages", showMessageSearch);
-  add("sidebar", state.prefs.sidebarCollapsed ? "Show chat list" : "Hide chat list", toggleSidebar);
-  add("bell", "Notifications & sounds", showNotificationSettings);
-  add("folder", "Save location", showSaveFolderSettings);
-  add("image", "Shared media", () => showSharedMedia());
-  add("open", "Open save folder", () => ipc("open_receive_folder").catch((e) => toast(e.message)));
-  add(state.serviceActive ? "pause" : "play", state.serviceActive ? "Pause background service" : "Resume background service",
-    () => ipc(state.serviceActive ? "pause_service" : "resume_service").then(refresh).catch((e) => toast(e.message)));
-  box.appendChild(el("div", "drawer-sep"));
-  box.appendChild(el("div", "drawer-label", "Appearance"));
+  const groups = [
+    ["Chats", [["edit", "New chat", newChat], ["search", "Search messages", showMessageSearch],
+      ["image", "Shared media", () => showSharedMedia()]]],
+    ["Connection", [["wifi", "Offline sharing", showOfflineSharing],
+      ["phone", state.status.paired ? "Paired device" : "Pair Android", showDeviceSettings, { submenu: true }]]],
+    ["", [["settings", "Settings", showAppSettings, { submenu: true }]]],
+  ];
+  box.replaceChildren();
+  for (const [label, items] of groups) {
+    const group = el("section", "drawer-group");
+    if (label) group.append(el("h2", "drawer-label", esc(label)));
+    for (const [glyph, title, run, options] of items) {
+      group.append(settingAction(glyph, title, () => { closeDrawer(); run(); }, options));
+    }
+    box.append(group);
+  }
+}
+function settingAction(glyph, title, run, { danger = false, submenu = false } = {}) {
+  const button = el("button", "drawer-item" + (danger ? " danger" : ""),
+    `${icon(glyph, 21)}<span>${esc(title)}</span>${submenu ? `<span class="group-arrow">${icon("next", 15)}</span>` : ""}`);
+  button.onclick = run;
+  return button;
+}
+function settingsGroup(title, ...entries) {
+  const section = el("section", "settings-group");
+  section.append(el("h3", null, esc(title)), ...entries);
+  return section;
+}
+function showDeviceSettings() {
+  const body = el("div");
+  if (state.status.paired) {
+    const summary = el("div", "path-card");
+    const name = el("b");
+    name.textContent = peerLabel().name;
+    summary.append(name, el("div", "meta2", state.status.connected ? "Connected" : "Waiting for connection"));
+    body.append(summary);
+  } else {
+    body.append(settingAction("qr", "Pair Android device", () => showPair(), { submenu: true }));
+  }
+  body.append(settingsGroup("Background connection",
+    settingAction(state.serviceActive ? "pause" : "play",
+      state.serviceActive ? "Pause background connection" : "Resume background connection", async () => {
+        try {
+          await ipc(state.serviceActive ? "pause_service" : "resume_service");
+          closeModal();
+          refresh();
+        } catch (error) { toast(error.message); }
+      })));
+  if (state.status.paired) body.append(settingsGroup("Manage pairing",
+    settingAction("unlink", "Unpair phone", confirmUnpair, { danger: true })));
+  modal({ title: "Paired device", body });
+}
+function showAppSettings() {
+  const body = el("div");
   const sw = el("div", "theme-switch");
   for (const [k, ic, lab] of [["light", "sun", "Light"], ["dark", "moon", "Dark"], ["system", "monitor", "System"]]) {
     const b = el("button", "theme-opt" + (state.prefs.theme === k ? " on" : ""), `${icon(ic, 18)}${lab}`);
-    b.onclick = () => setThemePref(k);
+    b.setAttribute("aria-pressed", String(state.prefs.theme === k));
+    b.onclick = () => {
+      setThemePref(k);
+      for (const option of sw.children) {
+        option.setAttribute("aria-pressed", String(option === b));
+        option.classList.toggle("on", option === b);
+      }
+    };
     sw.appendChild(b);
   }
-  box.appendChild(sw);
-  box.appendChild(el("div", "drawer-sep"));
-  add("broom", "Clear received-files list", confirmClearHistory);
-  add("history", "Check for updates", checkForUpdates);
-  if (state.status.paired) add("unlink", "Unpair phone", confirmUnpair, true);
+  const appearance = settingsGroup("Appearance", sw, settingAction("sidebar",
+    state.prefs.sidebarCollapsed ? "Show chat list" : "Hide chat list", () => { toggleSidebar(); showAppSettings(); }));
   if (state.trayAvailable) {
-    add("monitor", state.prefs.minimizeToTray ? "Close normally" : "Minimize to tray on close", async () => {
+    appearance.append(settingAction("monitor", state.prefs.minimizeToTray ? "Close normally" : "Minimize to tray on close", async () => {
       const prefs = { ...state.prefs, minimizeToTray: !state.prefs.minimizeToTray };
       try {
         await ipc("set_prefs", { prefs });
         state.prefs = prefs;
-        toast(prefs.minimizeToTray ? "Closing the window will keep Portal Drop in the tray." : "Closing the window will exit the chat app.");
+        showAppSettings();
       } catch (error) { toast(error.message); }
-    });
+    }));
   }
+  body.append(
+    settingsGroup("Notifications", settingAction("bell", "Notifications & sounds", showNotificationSettings, { submenu: true })),
+    appearance,
+    settingsGroup("Storage",
+      settingAction("folder", "Save location", showSaveFolderSettings, { submenu: true }),
+      settingAction("open", "Open save folder", () => ipc("open_receive_folder").catch((e) => toast(e.message))),
+      settingAction("broom", "Clear received-files list", confirmClearHistory)),
+    settingsGroup("About", settingAction("history", "Check for updates", checkForUpdates)),
+  );
+  modal({ title: "Settings", body });
 }
 function openDrawer() { renderDrawer(); $("drawer").classList.add("show"); $("scrim").classList.add("show"); }
 function closeDrawer() { $("drawer").classList.remove("show"); $("scrim").classList.remove("show"); }
@@ -1489,12 +1576,16 @@ $("scrim").onclick = closeDrawer;
    Modals
    ======================================================================== */
 let openModalEl = null;
+let modalCleanup = null;
 function closeModal() {
   if (openModalEl) {
     releaseMedia(openModalEl);
     openModalEl.remove();
     openModalEl = null;
     state.pairOpen = null;
+    const cleanup = modalCleanup;
+    modalCleanup = null;
+    cleanup?.();
   }
 }
 function modal({ title, body, actions = [], wide = false, onClose }) {
@@ -1502,7 +1593,8 @@ function modal({ title, body, actions = [], wide = false, onClose }) {
   const scrim = el("div", "modal-scrim");
   const box = el("div", "modal" + (wide ? " wide" : ""));
   const head = el("div", "modal-head", `<h2>${esc(title)}</h2>`);
-  const x = el("button", "icon-btn sm", icon("close", 18)); x.onclick = () => { closeModal(); onClose && onClose(); };
+  const x = el("button", "icon-btn sm", icon("close", 18)); x.onclick = closeModal;
+  x.setAttribute("aria-label", "Close");
   head.appendChild(x);
   const bodyBox = el("div", "modal-body scroll");
   if (typeof body === "string") bodyBox.innerHTML = body; else bodyBox.appendChild(body);
@@ -1517,9 +1609,10 @@ function modal({ title, body, actions = [], wide = false, onClose }) {
     box.appendChild(act);
   }
   scrim.appendChild(box);
-  scrim.addEventListener("mousedown", (e) => { if (e.target === scrim) { closeModal(); onClose && onClose(); } });
+  scrim.addEventListener("mousedown", (e) => { if (e.target === scrim) closeModal(); });
   document.body.appendChild(scrim);
   openModalEl = scrim;
+  modalCleanup = onClose;
   return box;
 }
 function promptText({ title, label, value = "", okLabel = "Save", onSubmit }) {
@@ -1992,133 +2085,443 @@ async function showPair(preferred) {
 }
 
 function showOfflineSharing() {
+  const canHost = HOST === "linux";
+  const canPickWifi = HOST === "linux" || HOST === "windows";
   const body = el("div");
-  body.append(el("p", "set-intro", "Join the same hotspot on both devices. Portal Drop uses the local Wi-Fi link for messages and files."));
-  if (HOST === "windows") {
-    body.append(el("p", "offline-section", "Start a hotspot on Android, then join it from Windows Wi-Fi settings."));
-    const settings = el("button", "pill-btn", "Open Wi-Fi settings");
-    settings.onclick = () => ipc("wifi_settings").catch((error) => toast(error.message));
-    body.append(settings);
-  }
-  const hostTools = el("div", "offline-section");
-  const addressSection = el("div", "offline-section");
-  const status = el("p");
-  status.setAttribute("aria-live", "polite");
-  const refreshAddresses = el("button", "pill-btn", "Refresh");
-  refreshAddresses.onclick = () => update();
-  body.append(hostTools, addressSection, status);
-  modal({ title: "Offline sharing", body, wide: true, actions: [{ label: "Done", cls: "solid" }] });
+  const modes = el("div", "hotspot-mode");
+  const hostTab = el("button", null, "Host hotspot");
+  const joinTab = el("button", null, "Join phone");
+  modes.append(hostTab, joinTab);
+  if (canHost) body.append(modes);
+
+  const stage = el("div", "hotspot-stage");
+  const action = el("button", "hotspot-action");
+  const title = el("h3");
+  const description = el("p");
+  const stateLabel = el("div");
+  stateLabel.setAttribute("role", "status");
+  stateLabel.append(title, description);
+  stage.append(action, stateLabel);
+  const config = el("div", "hotspot-config");
+  const error = el("p", "hotspot-error");
+  error.setAttribute("role", "alert");
+  error.hidden = true;
+  const help = el("details", "hotspot-detail");
+  const address = el("select", "field");
+  address.setAttribute("aria-label", "Desktop address");
+  const copy = el("button", "pill-btn", "Copy address");
+  const retry = el("button", "pill-btn", "Refresh");
+  const pair = el("button", "pill-btn", "Pair Android");
+  const helpActions = el("div", "path-actions");
+  helpActions.append(copy, retry, pair);
+  help.append(el("summary", null, "Connection help"),
+    el("p", null, "If the devices stay offline, choose the hotspot adapter and enter its address under Connect by address on Android."),
+    address, helpActions);
+  body.append(stage, error, config, help);
+
+  let mode = canHost ? "host" : "join";
+  let adapters = [];
+  let active = null;
+  let addresses = [];
+  let networks = null;
+  let scanning = false;
+  let joiningNetwork = false;
+  let loading = true;
+  let busy = false;
+  let polling = false;
+  let timer;
+  let lookupUntil = 0;
+  let announced = "";
+  let lastConfig = "";
+  let lastPhase = "";
+  let selectedEndpoint = "";
+  let joinedAddress = "";
+  let adapterControl, passwordControl, passwordToggle, findButton;
+  let unavailable = "";
+
+  hostTab.onclick = () => switchMode("host");
+  joinTab.onclick = () => switchMode("join");
+  copy.onclick = () => copyText({ text: address.value });
+  pair.onclick = () => showPair(address.value);
+  retry.onclick = () => update();
+  address.onchange = () => {
+    selectedEndpoint = address.value;
+    announced = "";
+    if (mode === "join" && lookupUntil > Date.now()) update();
+    renderStage();
+  };
+
+  modal({ title: "Offline sharing", body, wide: true, onClose: () => {
+    clearTimeout(timer);
+    document.removeEventListener("portal-status", renderStage);
+  } });
+  document.addEventListener("portal-status", renderStage);
+  action.onclick = () => {
+    if (mode === "host" || active) changeHotspot();
+    else if (canPickWifi && networks === null && !connected()) scanNetworks();
+    else toggleLookup();
+  };
+  render();
   update();
+  if (mode === "join" && canPickWifi) scanNetworks(false);
 
-  async function update() {
-    refreshAddresses.disabled = true;
-    status.textContent = "Checking local connections…";
-    try {
-      const [rows, snapshot] = await Promise.all([
-        ipc("lan_addresses"),
-        HOST === "linux" ? ipc("hotspot_status") : null,
-      ]);
-      if (!body.isConnected) return;
-      status.textContent = "";
-      if (snapshot) renderHotspot(snapshot);
-      renderAddresses(Array.isArray(rows) ? rows : [], snapshot?.active?.address);
-    } catch (error) {
-      if (body.isConnected) status.textContent = error.message;
-    } finally {
-      refreshAddresses.disabled = false;
-    }
+  function switchMode(next) {
+    if (busy || next === mode) return;
+    mode = next;
+    lookupUntil = 0;
+    selectedEndpoint = "";
+    announced = "";
+    error.hidden = true;
+    render();
+    update();
+    if (mode === "join" && canPickWifi && !active && networks === null) scanNetworks(false);
   }
 
-  function renderAddresses(rows, hotspotAddress) {
-    const label = el("p", null, "On Android, use <b>Connect by address</b> if the paired desktop does not reconnect automatically.");
-    addressSection.replaceChildren(label);
-    if (!rows.length) {
-      addressSection.append(el("p", "offline-section", "Waiting for a local Wi-Fi or Ethernet address."));
-      addressSection.append(refreshAddresses);
+  function render() {
+    hostTab.setAttribute("aria-pressed", String(mode === "host"));
+    joinTab.setAttribute("aria-pressed", String(mode === "join"));
+    hostTab.disabled = joinTab.disabled = busy;
+    const matching = mode === "host"
+      ? addresses.find((row) => ipv4(row.address) === active?.address)
+      : addresses.find((row) => row.address === selectedEndpoint)
+        || addresses.find((row) => ipv4(row.address) === joinedAddress)
+        || addresses.find((row) => row.can_announce && row.preferred)
+        || addresses.find((row) => row.can_announce);
+    const options = JSON.stringify([addresses, matching?.address]);
+    if (address.dataset.options !== options) {
+      address.dataset.options = options;
+      addressOptions(address, addresses, matching?.address);
+      if (!addresses.length) address.options[0].textContent = "Waiting for a local address";
+    }
+    address.disabled = copy.disabled = !addresses.length;
+    pair.hidden = state.status.paired;
+    pair.disabled = !addresses.length;
+    const configKey = JSON.stringify([mode, active, adapters, unavailable, loading, scanning, networks]);
+    if (configKey !== lastConfig) {
+      lastConfig = configKey;
+      renderConfiguration();
+    }
+    renderStage();
+  }
+
+  function ipv4(endpoint) {
+    return endpoint?.split(":")[0];
+  }
+
+  function connected() {
+    const local = mode === "host" ? active?.address : ipv4(address.value);
+    return !!local && !!state.status.connected && state.status.connected_local_ips?.includes(local);
+  }
+
+  function renderStage() {
+    const lookup = lookupUntil > Date.now();
+    const paired = !!state.status.paired;
+    const hosting = mode === "host";
+    const ready = connected();
+    if (ready && !hosting) lookupUntil = 0;
+    let phase = "idle", heading, hint, label, glyph = "wifi";
+    if (loading) {
+      heading = "Checking Wi-Fi";
+      hint = "";
+      label = heading;
+      phase = "waiting";
+    } else if (busy) {
+      heading = joiningNetwork ? "Joining Wi-Fi" : active ? "Stopping hotspot" : "Starting hotspot";
+      hint = "";
+      label = heading;
+      phase = "waiting";
+    } else if (hosting && active) {
+      heading = ready ? peerLabel().name + " connected" : paired ? "Waiting for your phone" : "Pair your phone";
+      hint = ready ? "Ready to share over Wi-Fi" : "Join the hotspot in Android Wi-Fi settings.";
+      label = "Stop hotspot";
+      glyph = ready ? "check" : "wifi";
+      phase = ready ? "connected" : "waiting";
+    } else if (hosting) {
+      heading = "Start a hotspot";
+      hint = unavailable || "Tap the Wi-Fi button, then join the hotspot from Android.";
+      label = "Start hotspot";
+    } else if (active) {
+      heading = "Desktop hotspot is on";
+      hint = "Stop it to join the hotspot on your phone.";
+      label = "Stop hotspot";
+    } else if (ready) {
+      heading = peerLabel().name + " connected";
+      hint = "Ready to share over Wi-Fi";
+      label = "Check connection";
+      phase = "connected";
+      glyph = "check";
+    } else {
+      heading = lookup ? "Looking for your paired phone" : "Join your phone’s hotspot";
+      hint = paired ? "Start the hotspot on your phone, then choose it below." : "Join the same Wi-Fi and pair your phone.";
+      label = lookup ? "Stop searching" : "Find paired phone";
+      phase = lookup ? "waiting" : "idle";
+    }
+    action.disabled = busy || loading || scanning || (hosting && !active && !adapters.length)
+      || (!hosting && !paired && !active && networks !== null);
+    action.dataset.phase = phase;
+    action.title = label;
+    action.setAttribute("aria-label", label);
+    if (mode === "join" && findButton) {
+      findButton.textContent = label;
+      findButton.disabled = loading || !paired;
+    }
+    const current = JSON.stringify([phase, heading, hint, glyph]);
+    if (current === lastPhase) return;
+    lastPhase = current;
+    title.textContent = heading;
+    description.textContent = hint;
+    action.innerHTML = icon(glyph, 40, 1.7);
+  }
+
+  function renderConfiguration() {
+    config.replaceChildren();
+    if (loading) return;
+    if (mode === "join") {
+      if (active) {
+        const stop = el("button", "pill-btn danger", "Stop desktop hotspot");
+        stop.onclick = changeHotspot;
+        config.append(stop);
+        return;
+      }
+      if (canPickWifi) renderWifiPicker();
+      if (HOST === "windows" || HOST === "linux") {
+        const settings = el("button", "pill-btn", "Open Wi-Fi settings");
+        settings.onclick = () => ipc("wifi_settings").catch((issue) => showError(issue.message));
+        findButton = el("button", "pill-btn solid", "Find paired phone");
+        findButton.onclick = toggleLookup;
+        const buttons = el("div", "path-actions");
+        buttons.append(settings, findButton);
+        config.append(buttons);
+      }
       return;
     }
-    const select = el("select", "field");
-    select.setAttribute("aria-label", "Desktop address");
-    const matching = rows.find((row) => row.address.split(":")[0] === hotspotAddress);
-    addressOptions(select, rows, matching?.address);
-    const copy = el("button", "pill-btn", "Copy address");
-    copy.onclick = () => copyText({ text: select.value });
-    const buttons = el("div", "path-actions");
-    buttons.append(copy, refreshAddresses);
-    if (state.status.paired && !hotspotAddress) {
-      const announce = el("button", "pill-btn", "Find phone hotspot");
-      announce.title = "Send a discovery hint when this computer joined an Android hotspot";
-      announce.onclick = async () => {
-        announce.disabled = true;
-        try {
-          await ipc("announce_hotspot", { address: select.value });
-          toast("Discovery hint sent. You can also enter the address on Android.");
-        } catch (error) {
-          toast(error.message);
-        } finally {
-          announce.disabled = false;
-        }
-      };
-      buttons.append(announce);
-    } else if (!state.status.paired) {
-      const pair = el("button", "pill-btn solid", "Pair Android");
-      pair.onclick = () => showPair(select.value);
-      buttons.append(pair);
-    }
-    addressSection.append(select, buttons);
-  }
-
-  function renderHotspot(snapshot) {
-    hostTools.replaceChildren();
-    const active = snapshot.active;
     if (active) {
       const card = el("div", "path-card");
-      card.append(el("div", "banner-title", "Desktop hotspot is on"));
-      for (const [label, value] of [["Wi-Fi name", active.ssid], ["Password", active.password]]) {
-        const line = el("div");
-        const data = el("span", "offline-value");
-        data.textContent = value;
-        line.append(document.createTextNode(label + " "), data);
+      const values = [["Wi-Fi name", active.ssid], [active.password ? "Password" : "Security", active.password || "Open"]];
+      for (const [label, value] of values) {
+        const line = el("div", "hotspot-credential");
+        const text = el("span");
+        const detail = el("span", "offline-value");
+        detail.textContent = value;
+        text.append(document.createTextNode(label + " "), detail);
+        line.append(text);
+        if (label === "Wi-Fi name" || active.password) {
+          const btn = el("button", "pill-btn", label === "Wi-Fi name" ? "Copy name" : "Copy password");
+          btn.onclick = () => copyText({ text: value });
+          line.append(btn);
+        }
         card.append(line);
       }
       const stop = el("button", "pill-btn danger", "Stop hotspot");
-      stop.onclick = () => changeHotspot(stop, "hotspot_stop", {});
-      const actions = el("div", "path-actions");
-      actions.append(stop);
-      card.append(actions);
-      hostTools.append(card);
-    } else if (snapshot.adapters?.length) {
-      const select = el("select", "field");
-      select.setAttribute("aria-label", "Wi-Fi adapter");
-      for (const adapter of snapshot.adapters) select.append(new Option(adapter.interface, adapter.device));
-      const note = el("p", "meta2");
-      const warn = () => {
-        const adapter = snapshot.adapters.find((item) => item.device === select.value);
-        note.textContent = adapter?.connected ? "Starting the hotspot will replace this adapter’s current Wi-Fi connection." : "";
+      stop.onclick = changeHotspot;
+      const qr = el("details", "hotspot-detail");
+      const qrBody = el("div", "qr-wrap");
+      qr.append(el("summary", null, "Wi-Fi QR code"), qrBody);
+      qr.ontoggle = async () => {
+        if (!qr.open || qrBody.hasChildNodes()) return;
+        qrBody.textContent = "Generating Wi-Fi QR code…";
+        try {
+          const { qr: code } = await ipc("hotspot_qr");
+          const canvas = el("canvas");
+          canvas.setAttribute("aria-label", "Scan to join this Wi-Fi network");
+          qrBody.replaceChildren();
+          if (drawQr(canvas, code)) qrBody.append(canvas);
+          else qrBody.textContent = "The Wi-Fi QR code is unavailable.";
+        } catch (issue) {
+          if (qrBody.isConnected) qrBody.textContent = issue.message;
+        }
       };
-      select.onchange = warn;
-      warn();
-      const start = el("button", "pill-btn solid", "Start desktop hotspot");
-      start.onclick = () => changeHotspot(start, "hotspot_start", { device: select.value });
-      hostTools.append(select, note, start);
-    } else if (snapshot.reason) {
-      const note = el("p", "meta2");
-      note.textContent = snapshot.reason + " You can join a phone hotspot in Wi-Fi settings.";
-      hostTools.append(note);
+      config.append(card, qr, stop);
+      return;
+    }
+    if (!adapters.length) return;
+    adapterControl = el("select", "field");
+    adapterControl.id = "offline-adapter";
+    for (const adapter of adapters) adapterControl.append(new Option(adapter.interface, adapter.device));
+    const adapterLabel = el("label", null, "Wi-Fi adapter");
+    adapterLabel.htmlFor = adapterControl.id;
+    adapterLabel.hidden = adapterControl.hidden = adapters.length === 1;
+    passwordToggle = el("input");
+    passwordToggle.type = "checkbox";
+    const passwordLabel = el("label", "checkline");
+    passwordLabel.append(passwordToggle, document.createTextNode("Require a Wi-Fi password"));
+    passwordControl = el("input", "field");
+    passwordControl.type = "password";
+    passwordControl.maxLength = 63;
+    passwordControl.placeholder = "Choose a password (8–63 characters)";
+    passwordControl.setAttribute("aria-label", "Hotspot password");
+    passwordControl.autocomplete = "new-password";
+    passwordControl.hidden = true;
+    const warning = el("p", "meta2");
+    const access = el("p", "meta2");
+    const updateOptions = () => {
+      const adapter = adapters.find((item) => item.device === adapterControl.value);
+      passwordToggle.disabled = adapter?.supportsPassword === false;
+      if (passwordToggle.disabled) passwordToggle.checked = false;
+      passwordControl.hidden = !passwordToggle.checked;
+      access.textContent = passwordToggle.checked ? "Portal Drop shares with your paired device."
+        : "Anyone nearby can join open Wi-Fi. Portal Drop shares with your paired device.";
+      warning.textContent = adapter?.connected ? "Starting the hotspot replaces this adapter’s current Wi-Fi connection." : "";
+    };
+    adapterControl.onchange = passwordToggle.onchange = updateOptions;
+    updateOptions();
+    config.append(adapterLabel, adapterControl, passwordLabel, passwordControl, access, warning);
+  }
+
+  function renderWifiPicker() {
+    const select = el("select", "field");
+    select.setAttribute("aria-label", "Phone hotspot network");
+    select.append(new Option(scanning ? "Scanning Wi-Fi…" : "Choose your phone’s hotspot", ""));
+    const choices = Array.isArray(networks) ? networks : [];
+    for (const network of choices) select.append(new Option(network.ssid, network.id));
+    const password = el("input", "field");
+    password.type = "password";
+    password.placeholder = "Wi-Fi password";
+    password.setAttribute("aria-label", "Wi-Fi password");
+    password.maxLength = 63;
+    password.autocomplete = "current-password";
+    password.hidden = true;
+    const scan = el("button", "pill-btn", scanning ? "Scanning…" : "Scan nearby");
+    scan.disabled = scanning;
+    scan.onclick = () => scanNetworks();
+    const join = el("button", "pill-btn solid", "Join Wi-Fi");
+    join.disabled = true;
+    select.onchange = () => {
+      const network = choices.find((item) => item.id === select.value);
+      password.hidden = !network?.requiresPassword;
+      password.value = "";
+      join.disabled = !network;
+      if (!password.hidden) password.focus();
+    };
+    join.onclick = () => {
+      const network = choices.find((item) => item.id === select.value);
+      if (network) joinWifi(network, password);
+    };
+    password.onkeydown = (event) => { if (event.key === "Enter") join.click(); };
+    const buttons = el("div", "path-actions");
+    buttons.append(scan, join);
+    config.append(select, password, buttons);
+  }
+
+  async function scanNetworks(scan = true) {
+    if (scanning || busy || active) return;
+    scanning = true;
+    if (scan) error.hidden = true;
+    render();
+    try {
+      networks = await ipc("wifi_networks", { scan });
+      if ((!Array.isArray(networks) || !networks.length) && scan) {
+        showError("Start the phone hotspot, then scan again or check your Wi-Fi settings.");
+      }
+    } catch (issue) {
+      networks = [];
+      if (scan) showError(issue.message);
+    } finally {
+      scanning = false;
+      if (body.isConnected) render();
     }
   }
 
-  async function changeHotspot(button, action, payload) {
-    button.disabled = refreshAddresses.disabled = true;
-    status.textContent = action === "hotspot_start" ? "Starting the hotspot…" : "Stopping the hotspot…";
+  async function joinWifi(network, input) {
+    if (busy || active) return;
+    const password = network.requiresPassword ? input.value : null;
+    if (network.requiresPassword && !/^[ -~]{8,63}$/.test(password)) {
+      showError("Enter the Wi-Fi password shown on your phone.");
+      input.focus();
+      return;
+    }
+    busy = joiningNetwork = true;
+    error.hidden = true;
+    renderStage();
     try {
-      await ipc(action, payload);
-      if (body.isConnected) await update();
-      refresh();
-    } catch (error) {
-      if (body.isConnected) status.textContent = error.message;
+      const result = await ipc("wifi_join", { id: network.id, password });
+      if (!body.isConnected) return;
+      input.value = "";
+      selectedEndpoint = "";
+      joinedAddress = result.address || "";
+      lookupUntil = Date.now() + 45000;
+      announced = "";
+      await refresh();
+    } catch (issue) {
+      showError(issue.message);
     } finally {
-      button.disabled = refreshAddresses.disabled = false;
+      busy = joiningNetwork = false;
+      if (body.isConnected) update();
+    }
+  }
+
+  function showError(message) {
+    error.textContent = message;
+    error.hidden = false;
+  }
+
+  function toggleLookup() {
+    error.hidden = true;
+    if (lookupUntil > Date.now()) lookupUntil = 0;
+    else {
+      lookupUntil = Date.now() + 45000;
+      announced = "";
+    }
+    renderStage();
+    update();
+  }
+
+  async function changeHotspot() {
+    if (busy) return;
+    const password = !active && passwordToggle?.checked ? passwordControl.value : null;
+    if (password !== null && !/^[ -~]{8,63}$/.test(password)) {
+      showError("Choose a Wi-Fi password with 8–63 printable characters.");
+      passwordControl.focus();
+      return;
+    }
+    error.hidden = true;
+    busy = true;
+    renderStage();
+    try {
+      if (active) await ipc("hotspot_stop");
+      else {
+        active = await ipc("hotspot_start", { device: adapterControl.value, password });
+        adapterControl = passwordToggle = passwordControl = null;
+      }
+      await refresh();
+    } catch (issue) {
+      showError(issue.message);
+    } finally {
+      busy = false;
+      if (body.isConnected) update();
+    }
+  }
+
+  async function update() {
+    if (polling || !body.isConnected) return;
+    clearTimeout(timer);
+    polling = true;
+    try {
+      const [rows, snapshot] = await Promise.all([
+        ipc("lan_addresses"),
+        canHost ? ipc("hotspot_status") : null,
+      ]);
+      if (!body.isConnected) return;
+      addresses = Array.isArray(rows) ? rows : [];
+      active = snapshot?.active || null;
+      adapters = snapshot?.adapters || [];
+      unavailable = snapshot?.reason || "";
+      loading = false;
+      render();
+      if (mode === "join" && lookupUntil > Date.now() && !connected()) {
+        const endpoint = addresses.find((row) => row.address === address.value && row.can_announce);
+        if (endpoint && endpoint.address !== announced) {
+          announced = endpoint.address;
+          await ipc("announce_hotspot", { address: endpoint.address }).catch(() => {});
+        }
+      }
+    } catch (issue) {
+      loading = false;
+      showError(issue.message);
+      render();
+    } finally {
+      polling = false;
+      if (body.isConnected && (active || lookupUntil > Date.now())) timer = setTimeout(update, 3200);
     }
   }
 }
@@ -2321,6 +2724,7 @@ async function refresh() {
     state.progress = new Map((snap.progress || []).map((p) => [p.id, p]));
     state.loaded = true;
     renderStatus(); renderHead(); renderChats(); renderSelection(); renderMessages();
+    document.dispatchEvent(new Event("portal-status"));
     if (state.pairOpen && !state.pairOpen.wasPaired && state.status.paired) { closeModal(); toast(`Paired with ${peerLabel().name}`); }
     else if (!wasPaired && state.status.paired && state.pairOpen) { closeModal(); }
     if ($("drawer").classList.contains("show")) renderDrawer();

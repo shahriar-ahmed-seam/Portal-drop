@@ -5,12 +5,13 @@ use crate::{
         TransferCommand, TransferDirection, TransferResponse, TransferState, format_peer_label,
         load_notification_settings, local_name, local_os, now_ms, random_secret, valid_id,
     },
+    network::HotspotDiscovery,
     sound::{self, SoundKind},
     store::{Incoming, Peer, Progress, Store, private_directory},
 };
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State},
     http::{
@@ -22,7 +23,7 @@ use axum::{
     routing::{get, post, put},
 };
 use axum_server::{
-    accept::NoDelayAcceptor,
+    accept::{Accept, LocalAddr, LocalAddrAcceptor, LocalAddrService},
     tls_rustls::{RustlsAcceptor, RustlsConfig},
 };
 use futures_util::{StreamExt, stream};
@@ -31,8 +32,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, ErrorKind, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    future::{Ready, ready},
+    io::{self, BufRead, BufReader, ErrorKind, Read, Write},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
@@ -58,6 +60,8 @@ static HEADER_OS: HeaderName = HeaderName::from_static("x-portal-drop-os");
 static HEADER_NAME: HeaderName = HeaderName::from_static("x-portal-drop-name");
 static HEADER_VERSION: HeaderName = HeaderName::from_static("x-portal-drop-version");
 
+type PeerRoutes = Arc<StdMutex<HashMap<(Peer, IpAddr), usize>>>;
+
 #[derive(Clone)]
 struct App {
     store: Store,
@@ -66,6 +70,7 @@ struct App {
     desktop_helper: Option<PathBuf>,
     events_tx: broadcast::Sender<&'static str>,
     connected_clients: Arc<AtomicUsize>,
+    connected_routes: PeerRoutes,
     last_disconnect: Arc<StdMutex<Option<Instant>>>,
     local_os: &'static str,
     local_name: String,
@@ -114,17 +119,46 @@ fn connect_local_wake(data_dir: &FsPath) -> Option<(TcpStream, WakeConfig)> {
 }
 
 pub fn local_listen_address(data_dir: &FsPath) -> Option<SocketAddr> {
+    local_wake_query(data_dir, "listen", 80)?
+        .trim()
+        .parse()
+        .ok()
+}
+
+pub fn local_connected_ips(data_dir: &FsPath) -> Vec<IpAddr> {
+    local_wake_query(data_dir, "addresses", 4096)
+        .and_then(|response| serde_json::from_str(&response).ok())
+        .unwrap_or_default()
+}
+
+fn local_wake_query(data_dir: &FsPath, command: &str, limit: u64) -> Option<String> {
     let (mut stream, config) = connect_local_wake(data_dir)?;
     let timeout = Some(Duration::from_millis(250));
     stream.set_read_timeout(timeout).ok()?;
     stream.set_write_timeout(timeout).ok()?;
-    writeln!(stream, "listen {}", config.token).ok()?;
+    writeln!(stream, "{command} {}", config.token).ok()?;
     let mut response = String::new();
     BufReader::new(stream)
-        .take(80)
+        .take(limit)
         .read_line(&mut response)
         .ok()?;
-    response.trim().parse().ok()
+    Some(response)
+}
+
+#[derive(Clone)]
+struct TransferAcceptor;
+
+impl<S> Accept<tokio::net::TcpStream, S> for TransferAcceptor {
+    type Stream = tokio::net::TcpStream;
+    type Service = LocalAddrService<S>;
+    type Future = Ready<io::Result<(Self::Stream, Self::Service)>>;
+
+    fn accept(&self, stream: Self::Stream, service: S) -> Self::Future {
+        match stream.set_nodelay(true) {
+            Ok(()) => LocalAddrAcceptor::new().accept(stream, service),
+            Err(error) => ready(Err(error)),
+        }
+    }
 }
 
 pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: bool) -> Result<()> {
@@ -140,7 +174,14 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
 
     let (events_tx, _) = broadcast::channel::<&'static str>(64);
     let wake_path = files.data_dir().join("wake.json");
-    let _wake_guard = start_local_wake_server(&wake_path, events_tx.clone(), address);
+    let connected_routes = PeerRoutes::default();
+    let _wake_guard = start_local_wake_server(
+        &wake_path,
+        events_tx.clone(),
+        address,
+        connected_routes.clone(),
+        store.clone(),
+    );
 
     let app_state = App {
         store: store.clone(),
@@ -149,6 +190,7 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
         desktop_helper: desktop_helper(),
         events_tx: events_tx.clone(),
         connected_clients: Arc::new(AtomicUsize::new(0)),
+        connected_routes: connected_routes.clone(),
         last_disconnect: Arc::new(StdMutex::new(None)),
         local_os: local_os(),
         local_name: local_name(),
@@ -197,6 +239,36 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
         }
     });
 
+    if discover
+        && let SocketAddr::V4(address) = address
+        && !address.ip().is_loopback()
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut discovery = HotspotDiscovery::default();
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let store = store.clone();
+                let routes = connected_routes.clone();
+                let Ok(next) = tokio::task::spawn_blocking(move || {
+                    let peer = store.active_peer().ok().flatten();
+                    let connected = peer
+                        .map(|peer| connected_ips(&routes, peer))
+                        .unwrap_or_default();
+                    discovery.retry(address, peer, &connected);
+                    discovery
+                })
+                .await
+                else {
+                    break;
+                };
+                discovery = next;
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/v1/pair", post(pair))
         .route("/v1/info", get(info))
@@ -216,7 +288,7 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
         .with_state(app_state.clone());
 
     let handle = axum_server::Handle::new();
-    let acceptor = RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new());
+    let acceptor = RustlsAcceptor::new(tls).acceptor(TransferAcceptor);
     let mut server = axum_server::from_tcp(listener)?
         .acceptor(acceptor)
         .handle(handle.clone());
@@ -269,6 +341,8 @@ fn start_local_wake_server(
     wake_path: &FsPath,
     events_tx: broadcast::Sender<&'static str>,
     transfer_address: SocketAddr,
+    connected_routes: PeerRoutes,
+    store: Store,
 ) -> Option<WakeGuard> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let port = listener.local_addr().ok()?.port();
@@ -294,9 +368,11 @@ fn start_local_wake_server(
             let _ = stream.set_nodelay(true);
             let expected = token.clone();
             let tx = events_tx.clone();
+            let connected_routes = connected_routes.clone();
+            let store = store.clone();
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                let mut reader = BufReader::new(&stream);
+                let mut reader = BufReader::new(&stream).take(160);
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_err() {
                     return;
@@ -311,6 +387,20 @@ fn start_local_wake_server(
                         let mut out = stream;
                         let _ = out.set_write_timeout(Some(Duration::from_millis(250)));
                         let _ = writeln!(out, "{transfer_address}");
+                    }
+                } else if let Some(candidate) = trimmed.strip_prefix("addresses ") {
+                    if bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())) {
+                        let ips = store
+                            .active_peer()
+                            .ok()
+                            .flatten()
+                            .map(|peer| connected_ips(&connected_routes, peer))
+                            .unwrap_or_default();
+                        let mut out = stream;
+                        let _ = out.set_write_timeout(Some(Duration::from_millis(250)));
+                        if let Ok(payload) = serde_json::to_string(&ips) {
+                            let _ = writeln!(out, "{payload}");
+                        }
                     }
                 } else if let Some(candidate) = trimmed.strip_prefix("watch ") {
                     if !bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())) {
@@ -571,12 +661,31 @@ async fn info(State(app): State<App>, Authorized(peer): Authorized) -> ApiResult
 
 struct PresenceGuard {
     app: App,
+    route: (Peer, IpAddr),
+}
+
+fn connected_ips(routes: &PeerRoutes, peer: Peer) -> Vec<IpAddr> {
+    let mut ips: Vec<_> = routes
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .keys()
+        .filter_map(|(trusted, local_ip)| (*trusted == peer).then_some(*local_ip))
+        .collect();
+    ips.sort_unstable();
+    ips
 }
 
 impl PresenceGuard {
-    fn enter(app: App) -> Self {
+    fn enter(app: App, peer: Peer, local_ip: IpAddr) -> Self {
+        let route = (peer, local_ip);
+        *app.connected_routes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(route)
+            .or_default() += 1;
         let previous = app.connected_clients.fetch_add(1, Ordering::SeqCst);
         let _ = app.store.set_connected(true);
+        let _ = app.events_tx.send("presence");
         if previous == 0 {
             let should_notify = {
                 let guard = app
@@ -588,17 +697,31 @@ impl PresenceGuard {
                     Some(when) => when.elapsed() >= CONNECT_SOUND_DEBOUNCE,
                 }
             };
-            let _ = app.events_tx.send("presence");
             if should_notify {
                 notify_connected(&app);
             }
         }
-        Self { app }
+        Self { app, route }
     }
 }
 
 impl Drop for PresenceGuard {
     fn drop(&mut self) {
+        {
+            let mut routes = self
+                .app
+                .connected_routes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let count = routes
+                .get_mut(&self.route)
+                .expect("presence route is registered");
+            *count -= 1;
+            if *count == 0 {
+                routes.remove(&self.route);
+            }
+        }
+        let _ = self.app.events_tx.send("presence");
         let previous = self.app.connected_clients.fetch_sub(1, Ordering::SeqCst);
         if previous <= 1 {
             {
@@ -621,12 +744,16 @@ impl Drop for PresenceGuard {
     }
 }
 
-async fn events(State(app): State<App>, Authorized(peer): Authorized) -> ApiResult<Response> {
+async fn events(
+    State(app): State<App>,
+    Authorized(peer): Authorized,
+    Extension(LocalAddr(address)): Extension<LocalAddr>,
+) -> ApiResult<Response> {
     let (tx, rx) = mpsc::channel::<std::io::Result<String>>(16);
     let mut events_rx = app.events_tx.subscribe();
     let producer_app = app.clone();
     tokio::spawn(async move {
-        let _guard = PresenceGuard::enter(producer_app.clone());
+        let _guard = PresenceGuard::enter(producer_app.clone(), peer, address.ip());
         let ready = serde_json::to_string(&DeviceInfo {
             os: producer_app.local_os.to_owned(),
             name: producer_app.local_name.clone(),

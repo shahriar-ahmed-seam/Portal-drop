@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, bail, ensure};
 use if_addrs::{Interface, get_if_addrs};
+use ring::hmac;
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     path::Path,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{model::PORT, server::local_listen_address};
+use crate::{model::PORT, server::local_listen_address, store::Peer};
 
 const HOTSPOT_HINT_PORT: u16 = 53622;
 
@@ -15,6 +18,7 @@ pub struct LanAddress {
     address: SocketAddrV4,
     interface: String,
     preferred: bool,
+    can_announce: bool,
 }
 
 pub fn lan_addresses(data_dir: &Path) -> Result<Vec<LanAddress>> {
@@ -53,12 +57,14 @@ fn select_addresses(
                 ip.is_link_local(),
                 !ip.is_private(),
             );
+            let can_announce = hotspot_target(&interface).is_some();
             Some((
                 rank,
                 LanAddress {
                     address: SocketAddrV4::new(ip, listen.port()),
                     interface: interface.name,
                     preferred: false,
+                    can_announce,
                 },
             ))
         })
@@ -85,7 +91,12 @@ fn usable_ipv4(ip: Ipv4Addr) -> bool {
     first > 0 && first < 224 && !ip.is_loopback()
 }
 
-pub fn announce_hotspot(data_dir: &Path, address: &str, fingerprint: &str) -> Result<()> {
+pub fn announce_hotspot(
+    data_dir: &Path,
+    address: &str,
+    peer: &Peer,
+    fingerprint: &str,
+) -> Result<()> {
     let listen = local_listen_address(data_dir).context("start the Portal Drop service first")?;
     let source = address
         .parse::<SocketAddrV4>()
@@ -112,46 +123,160 @@ pub fn announce_hotspot(data_dir: &Path, address: &str, fingerprint: &str) -> Re
                 && !interface.is_p2p()
         })
         .context("the selected Wi-Fi address is unavailable")?;
-    let if_addrs::IfAddr::V4(local) = &interface.addr else {
-        unreachable!("selected an IPv4 interface")
-    };
-    let gateway = wifi_gateway(interface).context(
-        "no local hotspot gateway found for this address. Enter the desktop address on your phone instead.",
-    )?;
-    ensure!(
-        gateway.is_private()
-            && gateway != local.ip
-            && (1..=31).contains(&local.prefixlen)
-            && (u32::from(gateway) ^ u32::from(local.ip)).leading_zeros()
-                >= u32::from(local.prefixlen),
-        "the hotspot gateway is outside the selected link"
-    );
+    let target = hotspot_target(interface)
+        .context("choose a local Wi-Fi address, or enter the desktop address on your phone")?;
+    send_hotspot_hint(target, listen.port(), peer, Some(fingerprint))
+}
 
-    let destination = (gateway, HOTSPOT_HINT_PORT);
-    // Resolve the route without emitting traffic before sending on the selected source.
-    let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    route.connect(destination)?;
-    ensure!(
-        route.local_addr()?.ip() == IpAddr::V4(*source.ip()),
-        "the system routes this gateway through a different interface"
-    );
-    let socket = UdpSocket::bind((*source.ip(), 0))?;
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct HotspotTarget {
+    source: Ipv4Addr,
+    broadcast: Option<Ipv4Addr>,
+    gateway: Option<Ipv4Addr>,
+}
+
+fn hotspot_target(interface: &Interface) -> Option<HotspotTarget> {
+    let if_addrs::IfAddr::V4(local) = &interface.addr else {
+        return None;
+    };
+    if !interface.is_oper_up() || interface.is_p2p() || !local.ip.is_private() {
+        return None;
+    }
+    hotspot_target_for_gateway(local, wifi_gateway(interface)?)
+}
+
+fn hotspot_target_for_gateway(
+    local: &if_addrs::Ifv4Addr,
+    gateway: Option<Ipv4Addr>,
+) -> Option<HotspotTarget> {
+    if !(1..=31).contains(&local.prefixlen) {
+        return None;
+    }
+    let ip = u32::from(local.ip);
+    let mask = u32::from(local.netmask);
+    let gateway = gateway.filter(|gateway| {
+        gateway.is_private() && *gateway != local.ip && (u32::from(*gateway) & mask) == (ip & mask)
+    });
+    let broadcast = (8..=30)
+        .contains(&local.prefixlen)
+        .then(|| Ipv4Addr::from(ip | !mask));
+    if broadcast.is_none() && gateway.is_none() {
+        return None;
+    }
+    Some(HotspotTarget {
+        source: local.ip,
+        broadcast,
+        gateway,
+    })
+}
+
+fn hotspot_hint(peer: &Peer, source: Ipv4Addr, port: u16, seconds: u64) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, peer);
+    let signed = format!("PORTALDROP-HOTSPOT/2 {source} {port} {seconds}");
+    let signature = hmac::sign(&key, signed.as_bytes());
+    format!(
+        "PORTALDROP-HOTSPOT/2 {port} {seconds} {}\n",
+        hex::encode(signature.as_ref())
+    )
+}
+
+fn send_hotspot_hint(
+    target: HotspotTarget,
+    port: u16,
+    peer: &Peer,
+    legacy_fingerprint: Option<&str>,
+) -> Result<()> {
+    let socket = UdpSocket::bind((target.source, 0))?;
     socket.set_ttl(1)?;
-    socket.send_to(
-        format!("PORTALDROP-HOTSPOT/1 {fingerprint} {}\n", listen.port()).as_bytes(),
-        destination,
-    )?;
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let hint = hotspot_hint(peer, target.source, port, seconds);
+    let mut sent = false;
+    if let Some(gateway) = target.gateway {
+        let destination = (gateway, HOTSPOT_HINT_PORT);
+        if route_uses_source(target.source, destination, false) {
+            sent = socket.send_to(hint.as_bytes(), destination).is_ok();
+            if let Some(fingerprint) = legacy_fingerprint {
+                let legacy = format!("PORTALDROP-HOTSPOT/1 {fingerprint} {port}\n");
+                sent |= socket.send_to(legacy.as_bytes(), destination).is_ok();
+            }
+        }
+    }
+    if let Some(broadcast) = target.broadcast
+        && socket.set_broadcast(true).is_ok()
+        && route_uses_source(target.source, (broadcast, HOTSPOT_HINT_PORT), true)
+    {
+        sent |= socket
+            .send_to(hint.as_bytes(), (broadcast, HOTSPOT_HINT_PORT))
+            .is_ok();
+    }
+    ensure!(
+        sent,
+        "could not announce on this Wi-Fi link. Enter the desktop address on your phone."
+    );
     Ok(())
 }
 
+fn route_uses_source(source: Ipv4Addr, destination: (Ipv4Addr, u16), broadcast: bool) -> bool {
+    // Ask the kernel which link it would pick without emitting traffic.
+    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|route| {
+            if broadcast {
+                route.set_broadcast(true)?;
+            }
+            route.connect(destination)?;
+            route.local_addr()
+        })
+        .is_ok_and(|address| address.ip() == IpAddr::V4(source))
+}
+
+#[derive(Default)]
+pub struct HotspotDiscovery {
+    // None records an authenticated route, so a later disconnect gets a fresh retry budget.
+    attempts: HashMap<HotspotTarget, Option<(u8, Instant)>>,
+    peer: Option<Peer>,
+}
+
+impl HotspotDiscovery {
+    pub fn retry(&mut self, listen: SocketAddrV4, peer: Option<Peer>, connected: &[IpAddr]) {
+        if self.peer != peer {
+            self.attempts.clear();
+            self.peer = peer;
+        }
+        let Some(peer) = peer else { return };
+        let Ok(interfaces) = get_if_addrs() else {
+            return;
+        };
+        let targets: std::collections::HashSet<_> = interfaces
+            .iter()
+            .filter_map(hotspot_target)
+            .filter(|target| listen.ip().is_unspecified() || listen.ip() == &target.source)
+            .collect();
+        self.attempts.retain(|target, _| targets.contains(target));
+        let now = Instant::now();
+        for target in targets {
+            let progress = self.attempts.entry(target).or_default();
+            if connected.contains(&IpAddr::V4(target.source)) {
+                *progress = None;
+                continue;
+            }
+            let (count, next) = progress.get_or_insert((0, now));
+            if *count < 4 && now >= *next {
+                let _ = send_hotspot_hint(target, listen.port(), &peer, None);
+                *count += 1;
+                *next = now + Duration::from_secs(u64::from(*count) * 2);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn wifi_gateway(interface: &Interface) -> Option<Ipv4Addr> {
+fn wifi_gateway(interface: &Interface) -> Option<Option<Ipv4Addr>> {
     let device = Path::new("/sys/class/net").join(&interface.name);
     if !device.join("phy80211").exists() && !device.join("wireless").exists() {
         return None;
     }
-    let table = std::fs::read_to_string("/proc/net/route").ok()?;
-    table
+    let table = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let gateway = table
         .lines()
         .skip(1)
         .filter_map(|line| {
@@ -172,11 +297,12 @@ fn wifi_gateway(interface: &Interface) -> Option<Ipv4Addr> {
             Some((metric, Ipv4Addr::from(gateway.to_le_bytes())))
         })
         .min_by_key(|(metric, _)| *metric)
-        .map(|(_, gateway)| gateway)
+        .map(|(_, gateway)| gateway);
+    Some(gateway)
 }
 
 #[cfg(windows)]
-fn wifi_gateway(interface: &Interface) -> Option<Ipv4Addr> {
+fn wifi_gateway(interface: &Interface) -> Option<Option<Ipv4Addr>> {
     use std::{mem::MaybeUninit, ptr};
     use windows_sys::Win32::{
         Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS},
@@ -227,9 +353,12 @@ fn wifi_gateway(interface: &Interface) -> Option<Ipv4Addr> {
                         && (*address.lpSockaddr).sa_family == AF_INET
                     {
                         let address = &*address.lpSockaddr.cast::<SOCKADDR_IN>();
-                        return Some(Ipv4Addr::from(address.sin_addr.S_un.S_addr.to_ne_bytes()));
+                        return Some(Some(Ipv4Addr::from(
+                            address.sin_addr.S_un.S_addr.to_ne_bytes(),
+                        )));
                     }
                 }
+                return Some(None);
             }
         }
         return None;
@@ -238,7 +367,7 @@ fn wifi_gateway(interface: &Interface) -> Option<Ipv4Addr> {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn wifi_gateway(_interface: &Interface) -> Option<Ipv4Addr> {
+fn wifi_gateway(_interface: &Interface) -> Option<Option<Ipv4Addr>> {
     None
 }
 
@@ -353,5 +482,29 @@ mod tests {
         let endpoints = select_addresses(SocketAddrV4::new(wired, 42621), interfaces, Some(wifi));
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].address, SocketAddrV4::new(wired, 42621));
+    }
+
+    #[test]
+    fn hotspot_hint_is_available_without_a_gateway() {
+        let local = Ifv4Addr {
+            ip: Ipv4Addr::new(192, 168, 44, 7),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            prefixlen: 24,
+            broadcast: None,
+        };
+        let target =
+            hotspot_target_for_gateway(&local, Some(Ipv4Addr::new(192, 168, 7, 1))).unwrap();
+        assert_eq!(target.broadcast, Some(Ipv4Addr::new(192, 168, 44, 255)));
+        assert_eq!(target.gateway, None);
+    }
+
+    #[test]
+    fn hotspot_hint_matches_android_wire_format() {
+        use sha2::{Digest, Sha256};
+        let peer = Sha256::digest("21".repeat(32).as_bytes()).into();
+        assert_eq!(
+            hotspot_hint(&peer, Ipv4Addr::new(192, 168, 44, 7), 53621, 1_750_000_000),
+            "PORTALDROP-HOTSPOT/2 53621 1750000000 2e2998ac86512087f90974a0fdb158ff9bbe6d653a84dec03c23f7b824eb47e0\n"
+        );
     }
 }

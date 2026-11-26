@@ -152,6 +152,9 @@ def smoke(desktop):
 
     desktop.request("POST", "/v1/pair", authorized=False, payload=pair, code=204)
     desktop.request("POST", "/v1/pair", authorized=False, payload={**pair, "token": secrets.token_hex(32)}, code=403)
+    desktop.request("GET", "/v1/events", authorized=False, code=401)
+    desktop.request("GET", "/v1/outbox", extra_headers={"Authorization": f"Bearer {secrets.token_hex(32)}"}, code=401)
+    assert "connected_local_ips" not in json.loads(desktop.cli("status", "--json"))
 
     now = int(time.time() * 1000)
     message = {"id": str(uuid.uuid4()), "kind": "text", "ts": now, "text": "From Android ✓"}
@@ -326,6 +329,7 @@ def v3_smoke(desktop):
 
     status = json.loads(desktop.cli("status", "--json"))
     assert status["paired"] and status["connected"] and status["peer_name"] == "SmokePixel", status
+    assert status["connected_local_ips"] == ["127.0.0.1"], status
 
     t0 = time.monotonic()
     desktop.cli("send-text", "Instant push check")

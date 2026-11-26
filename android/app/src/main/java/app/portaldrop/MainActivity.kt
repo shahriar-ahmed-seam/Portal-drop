@@ -60,6 +60,7 @@ class MainActivity : ComponentActivity() {
     private enum class Page { CHAT, CHATS, RECEIVED, MEDIA }
 
     private data class Draft(val text: String, val reply: ChatItem?)
+    private data class HotspotRequest(val passphrase: String?)
 
     private lateinit var root: LinearLayout
     private lateinit var content: FrameLayout
@@ -94,7 +95,8 @@ class MainActivity : ComponentActivity() {
     private var sharedMedia: SharedMediaView? = null
     private var replyArea: LinearLayout? = null
     private var attachmentReview: AlertDialog? = null
-    private var hotspotDialog: AlertDialog? = null
+    private var hotspotSheet: OfflineSharingSheet? = null
+    private var pendingHotspotRequest: HotspotRequest? = null
     private var reconnecting = false
 
     private var page = Page.CHAT
@@ -153,7 +155,8 @@ class MainActivity : ComponentActivity() {
 
     private val updates = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == OfflineHotspotService.ACTION_UPDATE) renderHotspotDialog() else refresh()
+            if (intent.action == TransferService.ACTION_UPDATE) refresh()
+            renderHotspotDialog()
         }
     }
 
@@ -192,8 +195,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private val hotspotPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        val request = pendingHotspotRequest ?: return@registerForActivityResult
+        pendingHotspotRequest = null
         if (hotspotPermissionGranted()) {
-            startOfflineHotspot()
+            startOfflineHotspot(request.passphrase)
         } else {
             val permission = if (Build.VERSION.SDK_INT >= 33) "Nearby devices" else "Precise location"
             notifyUser("Allow $permission for Portal Drop in Android Settings to start a hotspot.")
@@ -252,7 +257,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        hotspotDialog?.dismiss()
+        hotspotSheet?.dialog?.dismiss()
         searchWorker.shutdownNow()
         mediaWorker.shutdownNow()
         updateWorker.shutdownNow()
@@ -308,7 +313,7 @@ class MainActivity : ComponentActivity() {
         heading.addView(headerTitle)
         heading.addView(status)
         normalToolbar.addView(heading, LinearLayout.LayoutParams(0, WRAP, 1f))
-        menu = ui.iconAction(R.drawable.ic_chat_more, "Chat options") { showMenu(it) }
+        menu = ui.iconAction(R.drawable.ic_chat_more, "Chat options") { showMenu() }
         normalToolbar.addView(menu, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
         root.addView(normalToolbar, LinearLayout.LayoutParams(MATCH, WRAP))
 
@@ -1477,64 +1482,100 @@ class MainActivity : ComponentActivity() {
         dialog.show()
     }
 
-    private fun showMenu(anchor: View) {
-        PopupMenu(this, anchor).apply {
-            if (store.peer() != null && !addingComputer) {
-                if (page == Page.CHAT || page == Page.RECEIVED) {
-                    if (messages?.visibleItems().orEmpty().isNotEmpty()) {
-                        menu.add(0, MENU_SELECT, 0, "Select messages")
-                    }
+    private fun showMenu() {
+        val paired = store.peer() != null && !addingComputer
+        val chat = buildList {
+            if (paired) {
+                add(OptionRow("Search messages", R.drawable.ic_chat_search, act = ::showMessageSearch))
+                if (page == Page.CHAT) {
+                    add(OptionRow("Shared media", R.drawable.ic_media_photo) { switchPage(Page.MEDIA) })
+                    add(OptionRow("Send folder", R.drawable.ic_chat_upload, enabled = !stagingFiles, act = ::pickFolder))
+                }
+                if (page != Page.RECEIVED) {
+                    add(OptionRow("Received files", R.drawable.ic_chat_download) { switchPage(Page.RECEIVED) })
                 }
                 if (page == Page.CHAT) {
-                    menu.add(0, MENU_RENAME, 1, "Rename chat")
-                    if (store.chats().size > 1) menu.add(0, MENU_DELETE_CHAT, 2, "Delete chat")
-                    menu.add(0, MENU_MEDIA, 3, "Shared Media")
-                    menu.add(0, MENU_SEND_FOLDER, 3, "Send folder").isEnabled = !stagingFiles
-                    menu.add(0, MENU_RECEIVED, 4, "Received files")
+                    add(OptionRow("Manage chat", R.drawable.ic_chat_more, opensPage = true, act = ::showChatOptions))
+                } else if (page == Page.RECEIVED && canSelectVisibleMessages()) {
+                    add(OptionRow("Select messages", R.drawable.ic_chat_check) { enterSelection() })
                 }
-                menu.add(0, MENU_NOTIFICATIONS, 4, "Notifications & sounds")
-                menu.add(0, MENU_SEARCH, 4, "Search messages")
-                menu.add(0, MENU_SAVE_LOCATION, 5, "Save location")
-                menu.add(0, MENU_PAUSE, 6, if (store.backgroundEnabled()) "Pause connection" else "Resume connection")
-                menu.add(0, MENU_RECONNECT, 6, "Connect by address").isEnabled = !reconnecting
-                menu.add(0, MENU_FORGET, 7, "Forget this computer")
-                menu.add(0, MENU_COMPUTERS, 7, "Paired computers").isEnabled = canSwitchDesktop()
-            } else if (addingComputer) {
-                menu.add(0, MENU_CANCEL_PAIR, 7, "Cancel pairing").isEnabled = !pairing
             }
-            val hotspot = if (OfflineHotspotService.isActive()) "Offline hotspot · on" else "Offline hotspot"
-            menu.add(0, MENU_OFFLINE_HOTSPOT, 8, hotspot)
-            menu.add(0, MENU_CHECK_UPDATES, 9, "Check for updates").isEnabled = !checkingForUpdates
-            setOnMenuItemClickListener { item ->
-                when (item.itemId) {
-                    MENU_SELECT -> enterSelection()
-                    MENU_RENAME -> currentChat()?.let(::renameChat)
-                    MENU_DELETE_CHAT -> currentChat()?.let(::confirmDeleteChat)
-                    MENU_MEDIA -> switchPage(Page.MEDIA)
-                    MENU_SEND_FOLDER -> pickFolder()
-                    MENU_RECEIVED -> switchPage(Page.RECEIVED)
-                    MENU_SEARCH -> showMessageSearch()
-                    MENU_NOTIFICATIONS -> showNotificationSettings()
-                    MENU_CHECK_UPDATES -> checkForUpdates()
-                    MENU_SAVE_LOCATION -> showSaveLocationSettings()
-                    MENU_RECONNECT -> showReconnectByAddress()
-                    MENU_OFFLINE_HOTSPOT -> showOfflineHotspot()
-                    MENU_PAUSE -> {
-                        if (store.backgroundEnabled()) TransferService.pause(this@MainActivity)
-                        else enableBackground()
-                        refresh()
-                    }
-                    MENU_FORGET -> forgetComputer()
-                    MENU_COMPUTERS -> showPairedComputers()
-                    MENU_CANCEL_PAIR -> {
-                        addingComputer = false
-                        refresh()
-                    }
-                }
-                true
-            }
-            show()
         }
+        val connection = buildList {
+            add(OptionRow(
+                "Offline sharing", R.drawable.ic_portal_hotspot,
+                detail = if (OfflineHotspotService.isActive()) "Hotspot active" else null,
+                opensPage = true, act = ::showOfflineHotspot,
+            ))
+            if (paired) {
+                add(OptionRow("Devices and connection", R.drawable.ic_portal_devices, opensPage = true, act = ::showConnectionOptions))
+            } else if (addingComputer) {
+                add(OptionRow("Cancel pairing", R.drawable.ic_chat_close, enabled = !pairing) {
+                    addingComputer = false
+                    refresh()
+                })
+            }
+        }
+        showGroupedOptions(this, ui, "Options", listOf(
+            OptionSection("Chat", chat),
+            OptionSection("Connection", connection),
+            OptionSection("App", listOf(
+                OptionRow("Settings", R.drawable.ic_portal_settings, opensPage = true, act = ::showAppSettings),
+            )),
+        ))
+    }
+
+    private fun canSelectVisibleMessages(): Boolean = messages?.visibleItems().orEmpty().isNotEmpty()
+
+    private fun showChatOptions() {
+        val actions = buildList {
+            if (canSelectVisibleMessages()) {
+                add(OptionRow("Select messages", R.drawable.ic_chat_check) { enterSelection() })
+            }
+            if (page == Page.CHAT) {
+                add(OptionRow("Rename chat", R.drawable.ic_chat_chat) { currentChat()?.let(::renameChat) })
+                if (store.chats().size > 1) {
+                    add(OptionRow("Delete chat", R.drawable.ic_chat_trash, destructive = true) {
+                        currentChat()?.let(::confirmDeleteChat)
+                    })
+                }
+            }
+        }
+        showGroupedOptions(this, ui, "Manage chat", listOf(OptionSection("Actions", actions)))
+    }
+
+    private fun showConnectionOptions() {
+        if (store.peer() == null) return
+        val enabled = store.backgroundEnabled()
+        showGroupedOptions(this, ui, "Devices and connection", listOf(
+            OptionSection("Paired devices", listOf(
+                OptionRow("Paired computers", R.drawable.ic_portal_devices, opensPage = true,
+                    enabled = canSwitchDesktop(), act = ::showPairedComputers),
+                OptionRow("Forget this computer", R.drawable.ic_chat_trash, destructive = true,
+                    enabled = canSwitchDesktop(), act = ::forgetComputer),
+            )),
+            OptionSection("Connection", listOf(
+                OptionRow("Connect by address", R.drawable.ic_media_link, enabled = !reconnecting,
+                    act = ::showReconnectByAddress),
+                OptionRow(if (enabled) "Pause connection" else "Resume connection", R.drawable.ic_portal_hotspot) {
+                    if (store.backgroundEnabled()) TransferService.pause(this) else enableBackground()
+                    refresh()
+                },
+            )),
+        ))
+    }
+
+    private fun showAppSettings() {
+        showGroupedOptions(this, ui, "Settings", listOf(
+            OptionSection("Preferences", listOf(
+                OptionRow("Notifications & sounds", R.drawable.ic_portal_settings, act = ::showNotificationSettings),
+                OptionRow("Save location", R.drawable.ic_chat_file, act = ::showSaveLocationSettings),
+            )),
+            OptionSection("Updates", listOf(
+                OptionRow("Check for updates", R.drawable.ic_chat_download, enabled = !checkingForUpdates,
+                    act = ::checkForUpdates),
+            )),
+        ))
     }
 
     private fun showReconnectByAddress() {
@@ -1596,46 +1637,57 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showOfflineHotspot() {
-        if (hotspotDialog?.isShowing == true) return
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("Offline hotspot")
-            .setMessage("")
-            .setNegativeButton("Close", null)
-            .setPositiveButton("Start hotspot", null)
-            .show()
-        hotspotDialog = dialog
-        dialog.setOnDismissListener { hotspotDialog = null }
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-            when (OfflineHotspotService.state) {
-                is OfflineHotspotService.State.Active -> OfflineHotspotService.stop(this)
-                OfflineHotspotService.State.Starting -> Unit
-                else -> {
-                    if (hotspotPermissionGranted()) startOfflineHotspot()
-                    else hotspotPermissions.launch(if (Build.VERSION.SDK_INT >= 33) {
-                        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
-                    } else {
-                        arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
-                    })
+        if (hotspotSheet?.dialog?.isShowing == true) return
+        val sheet = OfflineSharingSheet(
+            this,
+            ui,
+            onStart = ::requestHotspot,
+            onStop = { OfflineHotspotService.stop(this) },
+            onSystemHotspot = ::openSystemHotspot,
+            onJoinNetwork = {
+                if (!tryStartActivity(Intent(Settings.ACTION_WIFI_SETTINGS))) {
+                    notifyUser("Open Wi-Fi settings and join your computer’s hotspot.")
                 }
-            }
-        }
+            },
+            onResume = ::enableBackground,
+            onConnectByAddress = ::showReconnectByAddress,
+        )
+        hotspotSheet = sheet
+        sheet.dialog.setOnDismissListener { if (hotspotSheet === sheet) hotspotSheet = null }
         renderHotspotDialog()
+        sheet.show()
     }
 
     private fun renderHotspotDialog() {
-        val dialog = hotspotDialog ?: return
-        val state = OfflineHotspotService.state
-        dialog.setMessage(when (state) {
-            OfflineHotspotService.State.Off -> "Create a local Wi-Fi network your computer can join. File transfers work with mobile data off."
-            OfflineHotspotService.State.Starting -> "Starting the hotspot…"
-            is OfflineHotspotService.State.Active ->
-                "Join this Wi-Fi network from your computer.\n\nWi-Fi name\n${state.ssid}\n\nPassword\n${state.passphrase}"
-            is OfflineHotspotService.State.Failed -> state.message
-        })
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).apply {
-            isEnabled = state !is OfflineHotspotService.State.Starting
-            text = if (state is OfflineHotspotService.State.Active) "Stop hotspot" else "Start hotspot"
+        val sheet = hotspotSheet ?: return
+        val peer = store.peer()
+        sheet.render(
+            OfflineHotspotService.state,
+            peer?.name ?: peer?.platformLabel(),
+            TransferService.hotspotPeerConnected(),
+            store.backgroundEnabled(),
+        )
+    }
+
+    private fun requestHotspot(passphrase: String?) {
+        if (hotspotPermissionGranted()) {
+            startOfflineHotspot(passphrase)
+            return
         }
+        pendingHotspotRequest = HotspotRequest(passphrase)
+        hotspotPermissions.launch(if (Build.VERSION.SDK_INT >= 33) {
+            arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
+        } else {
+            arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+        })
+    }
+
+    private fun openSystemHotspot() {
+        OfflineHotspotService.useSystemHotspot(this)
+        if (!tryStartActivity(Intent("android.settings.TETHER_SETTINGS")) &&
+            !tryStartActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
+        ) notifyUser("Open Hotspot and tethering in Android Settings.")
+        renderHotspotDialog()
     }
 
     private fun hotspotPermissionGranted(): Boolean {
@@ -1644,12 +1696,12 @@ class MainActivity : ComponentActivity() {
         return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun startOfflineHotspot() {
+    private fun startOfflineHotspot(passphrase: String?) {
         if (Build.VERSION.SDK_INT < 33 && getSystemService(LocationManager::class.java)?.isLocationEnabled != true) {
             notifyUser("Turn on Location in Android Settings, then try again.")
             return
         }
-        OfflineHotspotService.start(this)
+        OfflineHotspotService.start(this, passphrase)
         renderHotspotDialog()
     }
 
@@ -2277,22 +2329,6 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         val TEMP_TIMERS = linkedMapOf(300L to "5 minutes", TEMP_MESSAGE_TTL_SEC to "10 minutes", 3600L to "1 hour", 86400L to "24 hours")
-        const val MENU_SELECT = 1
-        const val MENU_RENAME = 2
-        const val MENU_DELETE_CHAT = 3
-        const val MENU_RECEIVED = 4
-        const val MENU_PAUSE = 5
-        const val MENU_FORGET = 6
-        const val MENU_NOTIFICATIONS = 7
-        const val MENU_SAVE_LOCATION = 8
-        const val MENU_SEARCH = 9
-        const val MENU_MEDIA = 10
-        const val MENU_CHECK_UPDATES = 11
-        const val MENU_SEND_FOLDER = 12
-        const val MENU_COMPUTERS = 13
-        const val MENU_CANCEL_PAIR = 14
-        const val MENU_RECONNECT = 15
-        const val MENU_OFFLINE_HOTSPOT = 16
         const val CHAT_MENU_RENAME = 1
         const val CHAT_MENU_DELETE = 2
         const val MESSAGE_REPLY = 1

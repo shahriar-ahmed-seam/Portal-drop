@@ -155,7 +155,7 @@ jobs:
       - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
         if: steps.debug.outputs.enabled == 'true' || steps.signing.outputs.enabled == 'true'
         with:
-          packages: platform-tools platforms;android-36 build-tools;36.0.0
+          packages: platform-tools platforms;android-36.1 build-tools;36.0.0
       - name: Build Android debug APK
         if: steps.debug.outputs.enabled == 'true'
         run: |

@@ -296,6 +296,7 @@ impl Store {
         Ok(StatusInfo {
             paired,
             connected: paired && connected != 0 && fresh,
+            connected_local_ips: Vec::new(),
             peer_os: if paired { peer_os } else { None },
             peer_name: if paired { peer_name } else { None },
             local_os: local_os().to_owned(),

@@ -23,14 +23,18 @@ val releaseKeyPassword = signingProp("keyPassword", "PORTAL_KEY_PASSWORD")
 
 android {
     namespace = "app.portaldrop"
-    compileSdk = 36
+    compileSdk {
+        version = release(36) {
+            minorApiLevel = 1
+        }
+    }
 
     defaultConfig {
         applicationId = "app.portaldrop"
         minSdk = 29
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.5.0"
+        versionCode = 8
+        versionName = "0.6.0"
     }
 
     signingConfigs {

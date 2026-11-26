@@ -43,6 +43,20 @@ internal fun PortalRoute.matches(context: Context, host: String): Boolean {
     }
 }
 
+internal fun PortalRoute.Attached.hotspotGateway(context: Context, allowValidated: Boolean = false): String? {
+    val manager = context.getSystemService(ConnectivityManager::class.java)
+    val capabilities = manager.getNetworkCapabilities(network) ?: return null
+    if (!isPortalNetwork(capabilities) || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+        (!allowValidated && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+    ) return null
+    val properties = manager.getLinkProperties(network) ?: return null
+    return properties.routes.asSequence()
+        .filter { it.isDefaultRoute }
+        .mapNotNull { it.gateway as? Inet4Address }
+        .firstOrNull { it.isSiteLocalAddress && properties.hasLocalRoute(it) }
+        ?.hostAddress
+}
+
 internal data class HotspotLink(val name: String, val source: Inet4Address, val prefixLength: Int) {
     private val mask = -1 shl (32 - prefixLength)
     private val subnet = source.asIpv4Number() and mask
@@ -122,7 +136,7 @@ internal fun portalRoutes(
     }
 }
 
-private val downstreamName = Regex("(?:ap_br_)?(?:wlan|wifi|swlan|ap|softap|wifi_br|br)[0-9]+")
+private val downstreamName = Regex("(?:ap_br_)?(?:wlan|wifi|swlan|ap|softap|wifi_br|br)[0-9]+(?:[._-][0-9]+)?")
 
 private fun hotspotLinks(attachedNames: Set<String>): List<HotspotLink> = runCatching {
     NetworkInterface.getNetworkInterfaces()?.toList().orEmpty().flatMap { iface ->

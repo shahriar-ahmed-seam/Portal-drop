@@ -143,6 +143,7 @@ class TransferService : Service() {
         var routeFailures = 0
         var idlePolls = 0
         var activeFingerprint: String? = null
+        val attemptedGateways = mutableSetOf<Pair<PortalRoute.Attached, String>>()
         try {
             while (running) {
                 purgeExpiredAndNotify()
@@ -171,24 +172,32 @@ class TransferService : Service() {
                     routeFailures = 0
                     retryDelay = 1_000L
                     lastDiscovery = -DISCOVERY_INTERVAL_MS
+                    attemptedGateways.clear()
                 }
                 val hostedRoute = routes.filterIsInstance<PortalRoute.Hosted>().firstOrNull()
-                hotspotAnnouncements.update(peer.fingerprint, hostedRoute?.takeIf { hosting }, generation) { host, port ->
+                val protectedHotspot = (OfflineHotspotService.state as? OfflineHotspotService.State.Active)
+                    ?.passphrase != null
+                hotspotAnnouncements.update(peer, hostedRoute?.takeIf { hosting }, generation, protectedHotspot) { host, port, signed ->
                     if (running && hosting && networkGeneration.get() == generation && hostedRoute != null &&
                         OfflineHotspotService.isActive()
                     ) {
-                        enqueueEndpoint(Endpoint(peer.fingerprint, hostedRoute, host, port, generation))
+                        enqueueEndpoint(Endpoint(peer.fingerprint, hostedRoute, host, port, generation, signed))
                         signal()
                     }
                 }
                 if (routes.isEmpty()) {
                     dropLink()
                     markOffline()
-                    await(15_000L)
+                    // A local-only AP can start without notifying ConnectivityManager.
+                    await(if (hosting) HOTSPOT_ROUTE_POLL_MS else 15_000L)
                     continue
                 }
-                val candidate = if (status == Status.CONNECTED) null else discovered.firstOrNull {
-                    it.fingerprint == peer.fingerprint && it.route in routes && it.generation == generation
+                val linked = currentLink
+                val candidate = discovered.firstOrNull {
+                    it.fingerprint == peer.fingerprint && it.route in routes && it.generation == generation &&
+                        (status != Status.CONNECTED || (
+                            it.signedHotspotHint && (linked?.route !is PortalRoute.Hosted || linked.route !in routes)
+                        ))
                 }
                 val route = candidate?.route ?: preferredRoute?.takeIf(routes::contains) ?: routes.first()
                 val cached = when (route) {
@@ -198,7 +207,16 @@ class TransferService : Service() {
                     }
                 }
                 val rememberedEndpoint = if (route is PortalRoute.Hosted) hotspot else peer
-                val endpoint = candidate?.let { peer.copy(host = it.host, port = it.port) } ?: cached ?: peer
+                // Try the hotspot host before the old address on a newly joined Wi-Fi subnet.
+                // The Portal session pins its certificate before sending the pairing token.
+                val gateway = if (!hosting && route is PortalRoute.Attached && candidate == null && cached == null &&
+                    !route.matches(this, peer.host)
+                ) {
+                    route.hotspotGateway(this, allowValidated = true)
+                        ?.takeIf { attemptedGateways.add(route to it) }
+                } else null
+                val endpoint = candidate?.let { peer.copy(host = it.host, port = it.port) }
+                    ?: cached ?: gateway?.let { peer.copy(host = it) } ?: peer
                 val endpointChanged = rememberedEndpoint == null ||
                     endpoint.host != rememberedEndpoint.host || endpoint.port != rememberedEndpoint.port
                 val link = linkFor(endpoint, route)
@@ -208,6 +226,7 @@ class TransferService : Service() {
                     val available = link.session.outbox()
                     authenticated = true
                     if (!running) break
+                    if (candidate != null) discovered.remove(candidate)
                     if (endpointChanged && networkGeneration.get() == generation) {
                         if (route is PortalRoute.Hosted) store.updateHotspotEndpoint(peer, endpoint.host, endpoint.port)
                         else store.updateEndpoint(peer, endpoint.host, endpoint.port)
@@ -216,7 +235,10 @@ class TransferService : Service() {
                     }
                     val freshPeer = store.peer()?.takeIf { it.fingerprint == peer.fingerprint } ?: continue
                     val wasConnected = status == Status.CONNECTED
+                    val newLink = !link.authenticated
+                    link.authenticated = true
                     setStatus(Status.CONNECTED)
+                    if (wasConnected && newLink) publishUpdate(this)
                     if (!wasConnected) {
                         val now = SystemClock.elapsedRealtime()
                         if (now - lastDisconnectedAt >= CONNECT_NOTIFY_DEBOUNCE_MS) {
@@ -263,6 +285,13 @@ class TransferService : Service() {
                     ) {
                         enqueueEndpoint(Endpoint(peer.fingerprint, route, previous.host, previous.port, generation))
                     }
+                    // Many offline Wi-Fi access points are hosted on the desktop itself.
+                    if (!hosting && route is PortalRoute.Attached) {
+                        val gateway = route.hotspotGateway(this)
+                        if (gateway != null && gateway != endpoint.host && attemptedGateways.add(route to gateway)) {
+                            enqueueEndpoint(Endpoint(peer.fingerprint, route, gateway, peer.port, generation))
+                        }
+                    }
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastDiscovery >= DISCOVERY_INTERVAL_MS) {
                         lastDiscovery = now
@@ -294,7 +323,7 @@ class TransferService : Service() {
                         retryDelay = (retryDelay * 2).coerceAtMost(DISCOVERY_INTERVAL_MS)
                     }
                 }
-                await(delay)
+                await(if (hosting && hostedRoute == null) minOf(delay, HOTSPOT_ROUTE_POLL_MS) else delay)
             }
         } finally {
             hotspotAnnouncements.stop()
@@ -394,8 +423,10 @@ class TransferService : Service() {
     }
 
     private fun dropLink() {
-        currentLink?.session?.cancel()
+        val previous = currentLink
         currentLink = null
+        previous?.session?.cancel()
+        if (previous?.authenticated == true && previous.route is PortalRoute.Hosted) publishUpdate(this)
     }
 
     private fun syncChatsSafely(peer: Peer, link: Link, available: List<PortalItem>) {
@@ -1302,6 +1333,7 @@ class TransferService : Service() {
     }
 
     private class Link(val peer: Peer, val route: PortalRoute, val session: PortalSession) {
+        @Volatile var authenticated: Boolean = false
         var supportsChats: Boolean? = null
         var supportsEvents: Boolean? = null
         @Volatile var protocolVersion: Int = 1
@@ -1317,6 +1349,7 @@ class TransferService : Service() {
         val host: String,
         val port: Int,
         val generation: Int,
+        val signedHotspotHint: Boolean = false,
     )
 
     companion object {
@@ -1347,6 +1380,7 @@ class TransferService : Service() {
         private const val TRANSFER_PROTOCOL_VERSION = 4
         private const val FOLDER_PROTOCOL_VERSION = 5
         private const val DISCOVERY_INTERVAL_MS = 30_000L
+        private const val HOTSPOT_ROUTE_POLL_MS = 1_500L
         private const val CONNECT_NOTIFY_DEBOUNCE_MS = 10_000L
 
         private val worker = Executors.newSingleThreadExecutor { task ->
@@ -1407,6 +1441,19 @@ class TransferService : Service() {
 
         internal fun hotspotChanged() {
             instance?.networkChanged()
+        }
+
+        internal fun hotspotPeerConnected(): Boolean {
+            val service = instance ?: return false
+            val link = service.currentLink ?: return false
+            if (!service.running || status != Status.CONNECTED || !link.authenticated ||
+                link.peer.fingerprint != service.store.peer()?.fingerprint
+            ) return false
+            return when (val route = link.route) {
+                is PortalRoute.Hosted -> OfflineHotspotService.isActive()
+                is PortalRoute.Attached -> !OfflineHotspotService.isActive() &&
+                    route.hotspotGateway(service, allowValidated = true) == link.peer.host
+            }
         }
 
         fun control(context: Context, row: ChatItem, action: TransferAction): Boolean {

@@ -22,6 +22,8 @@ use wry::{DragDropEvent, WebViewBuilder, http};
 
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod wifi;
 
 const UI_HTML: &str = include_str!("../../desktop-ui/index.html");
 const ICON_RGBA: &[u8] = include_bytes!("../assets/icon-64.rgba");
@@ -711,6 +713,15 @@ fn dispatch_ipc(
             }
             "lan_addresses" => run_cli(&cli, &["lan-addresses".into()], None)
                 .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string())),
+            "wifi_picker" => Ok(json!({ "available": cfg!(windows) })),
+            #[cfg(windows)]
+            "wifi_networks" => wifi::networks(msg.payload["scan"].as_bool().unwrap_or(false)),
+            #[cfg(windows)]
+            "wifi_join" => wifi::join(
+                msg.payload["id"].as_str().unwrap_or_default(),
+                msg.payload["password"].as_str(),
+            )
+            .inspect(|_| svc.start(&cli, &dir)),
             "announce_hotspot" => {
                 let address = msg.payload["address"].as_str().unwrap_or_default();
                 run_cli(
