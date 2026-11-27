@@ -108,7 +108,7 @@ internal class OfflineSharingSheet(
         val active = state is OfflineHotspotService.State.Active || system != null
         val starting = state == OfflineHotspotService.State.Starting
         val joining = joiningDesktop && !active && !starting
-        val participating = active || joining
+        val participating = active || joining || verified
         val connected = participating && verified
         rings.scanning = starting || (participating && !connected)
         hotspotButton.apply {

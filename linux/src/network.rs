@@ -13,6 +13,15 @@ use crate::{model::PORT, server::local_listen_address, store::Peer};
 
 const HOTSPOT_HINT_PORT: u16 = 53622;
 
+pub fn local_address_available(address: IpAddr) -> bool {
+    let Ok(interfaces) = get_if_addrs() else {
+        return true;
+    };
+    interfaces
+        .iter()
+        .any(|interface| interface.is_oper_up() && interface.ip() == address)
+}
+
 #[derive(Serialize)]
 pub struct LanAddress {
     address: SocketAddrV4,

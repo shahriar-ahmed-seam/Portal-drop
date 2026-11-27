@@ -1,6 +1,7 @@
 package app.portaldrop
 
 import android.os.SystemClock
+import android.util.Log
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -25,20 +26,20 @@ internal class HotspotAnnouncements {
     @Synchronized
     fun update(
         peer: Peer,
-        hosting: Boolean,
         route: PortalRoute.Hosted?,
         generation: Int,
         allowLegacy: Boolean,
         found: (String, Int, Boolean) -> Unit,
     ) {
-        val key = if (hosting) ListenKey(peer.fingerprint, peer.token, route, generation, allowLegacy) else null
+        val key = ListenKey(peer.fingerprint, peer.token, route, generation, allowLegacy)
         if (current == key && listener?.isClosed == false) return
         stop()
-        if (key == null) return
         val socket = runCatching { DatagramSocket(null) }.getOrNull() ?: return
         // Directed broadcast requires a wildcard bind. Signed announcements can also
         // arrive on a hotspot interface that isn't exposed to the app.
-        if (runCatching { socket.bind(InetSocketAddress(PORT)) }.isFailure) {
+        val binding = runCatching { socket.bind(InetSocketAddress(PORT)) }
+        if (binding.isFailure) {
+            Log.w("PortalDrop", "Could not listen for paired hotspot discovery.", binding.exceptionOrNull())
             socket.close()
             return
         }

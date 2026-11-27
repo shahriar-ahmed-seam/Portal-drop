@@ -165,23 +165,22 @@ class TransferService : Service() {
                 )
                 val hostedRoute = knownRoutes.filterIsInstance<PortalRoute.Hosted>().firstOrNull()
                 val hotspotAddress = hotspot?.host?.let(::portalAddress)
-                val activeHosting = hosting && !isVpnActive(this)
+                // System hotspot switches need not notify ConnectivityManager or start our
+                // hotspot UI service. Paired hints still prove the downstream route directly.
                 val routes = buildList {
                     addAll(knownRoutes)
-                    if (activeHosting) {
-                        if (hotspot != null && hostedRoute?.permits(hotspotAddress) != true) {
-                            probeHostedRoute(this@TransferService, hotspot.host, hotspot.port)?.let(::add)
-                        }
-                        discovered.asSequence().filter {
-                            it.signedHotspotHint && it.route is PortalRoute.Hosted &&
-                                it.generation == generation && it.fingerprint == peer.fingerprint
-                        }.mapTo(this) { it.route }
+                    if (hotspot != null && hostedRoute?.permits(hotspotAddress) != true) {
+                        probeHostedRoute(this@TransferService, hotspot.host, hotspot.port)?.let(::add)
                     }
+                    discovered.asSequence().filter {
+                        it.signedHotspotHint && it.route is PortalRoute.Hosted &&
+                            it.generation == generation && it.fingerprint == peer.fingerprint
+                    }.mapTo(this) { it.route }
                 }.distinct().sortedByDescending { it is PortalRoute.Hosted && it.permits(hotspotAddress) }
                 val protectedHotspot = (OfflineHotspotService.state as? OfflineHotspotService.State.Active)
                     ?.passphrase != null
-                hotspotAnnouncements.update(peer, activeHosting, hostedRoute, generation, protectedHotspot) { host, port, signed ->
-                    if (!running || !OfflineHotspotService.isActive() || networkGeneration.get() != generation) {
+                hotspotAnnouncements.update(peer, hostedRoute, generation, protectedHotspot) { host, port, signed ->
+                    if (!running || networkGeneration.get() != generation) {
                         return@update
                     }
                     val route = hostedRoute?.takeIf { it.permits(portalAddress(host)) }
@@ -1468,7 +1467,7 @@ class TransferService : Service() {
                 link.peer.fingerprint != service.store.peer()?.fingerprint
             ) return false
             return when (val route = link.route) {
-                is PortalRoute.Hosted -> OfflineHotspotService.isActive()
+                is PortalRoute.Hosted -> route.permits(portalAddress(link.peer.host))
                 is PortalRoute.Attached -> !OfflineHotspotService.isActive() &&
                     route.hotspotGateway(service, allowValidated = true) == link.peer.host
             }

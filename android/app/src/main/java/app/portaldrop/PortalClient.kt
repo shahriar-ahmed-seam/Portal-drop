@@ -215,7 +215,6 @@ internal class PortalSession(
         if (route is PortalRoute.Hosted) { socket ->
             socket.inetAddress == portalAddress(peer.host) &&
                 socket.port == peer.port &&
-                !isVpnActive(context) &&
                 route.links.any { it.owns(context, socket) }
         } else null,
     )

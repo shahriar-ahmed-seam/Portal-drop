@@ -26,7 +26,7 @@ internal sealed interface PortalRoute {
     fun open(context: Context, url: URL): HttpsURLConnection = when (this) {
         is Attached -> network.openConnection(url, Proxy.NO_PROXY) as HttpsURLConnection
         is Hosted -> {
-            if (!permits(portalAddress(url.host)) || isVpnActive(context)) {
+            if (!permits(portalAddress(url.host))) {
                 throw IOException("The computer is outside the attached hotspot.")
             }
             // Android does not always expose the downstream hotspot as a Network. The TLS
@@ -74,12 +74,11 @@ internal data class HotspotLink(
             (address.asIpv4Number() and mask) == subnet
 
     fun owns(context: Context, socket: Socket): Boolean {
-        if (socket.localAddress != source || !permits(socket.inetAddress)) return false
-        return if (name == null) {
-            OfflineHotspotService.isActive() && isDownstreamProbeSource(context, source)
-        } else {
+        if (socket.localAddress != source || !permits(socket.inetAddress) ||
+            !isDownstreamProbeSource(context, source)
+        ) return false
+        return name == null ||
             runCatching { NetworkInterface.getByInetAddress(source)?.name == name }.getOrDefault(false)
-        }
     }
 }
 
@@ -89,7 +88,6 @@ private fun Inet4Address.asIpv4Number(): Int =
 internal fun Inet4Address.isHotspotAddress(): Boolean = isSiteLocalAddress || isLinkLocalAddress
 
 internal fun probeHostedRoute(context: Context, host: String, port: Int): PortalRoute.Hosted? {
-    if (!OfflineHotspotService.isActive() || isVpnActive(context)) return null
     val address = (portalAddress(host) as? Inet4Address)?.takeIf { it.isHotspotAddress() } ?: return null
     // Some phones keep the AP out of the app's interface list. Connecting a UDP socket
     // selects a route without sending a packet. Restrict this fallback to a single peer
@@ -131,14 +129,6 @@ internal fun LinkProperties?.hasLocalRoute(address: InetAddress): Boolean =
         !route.isDefaultRoute && !route.hasGateway() && route.destination.contains(address)
     } == true
 
-@Suppress("DEPRECATION")
-internal fun isVpnActive(context: Context): Boolean {
-    val manager = context.getSystemService(ConnectivityManager::class.java)
-    return manager.allNetworks.any { network ->
-        manager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-    }
-}
-
 @Suppress("DEPRECATION") // All attached networks can be useful, including no-internet Wi-Fi.
 internal fun portalRoutes(
     context: Context,
@@ -161,7 +151,7 @@ internal fun portalRoutes(
     val previousOnLink = if (previousAddress == null) emptyList() else local.filter {
         it !in onLink && manager.getLinkProperties(it).hasLocalRoute(previousAddress)
     }
-    val hosted = if (allowHotspot && !vpnActive && !isVpnActive(context)) {
+    val hosted = if (allowHotspot) {
         val attachedNames = local.mapNotNull { manager.getLinkProperties(it)?.interfaceName }.toSet()
         hotspotLinks(attachedNames).takeIf { it.isNotEmpty() }?.let { PortalRoute.Hosted(it) }
     } else null

@@ -791,9 +791,18 @@ async fn events(
         }
         let mut keepalive = tokio::time::interval(Duration::from_secs(20));
         keepalive.tick().await; // skip immediate tick
+        let mut route_check = tokio::time::interval(Duration::from_secs(2));
+        route_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 () = tx.closed() => break,
+                _ = route_check.tick() => {
+                    // TCP can stay established for minutes after Wi-Fi loses its address.
+                    // Close the stream so presence and discovery use the current link.
+                    if !crate::network::local_address_available(address.ip()) {
+                        break;
+                    }
+                }
                 _ = keepalive.tick() => {
                     let _ = producer_app.store.touch_last_seen(&peer);
                     if tx.send(Ok(": keepalive\n\n".to_owned())).await.is_err() {
