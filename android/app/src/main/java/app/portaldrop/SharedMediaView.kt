@@ -2,11 +2,13 @@ package app.portaldrop
 
 import android.content.Context
 import android.net.Uri
+import android.os.CancellationSignal
 import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.text.format.DateUtils
 import android.text.format.Formatter
+import android.util.LruCache
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -15,6 +17,7 @@ import android.widget.FrameLayout
 import android.widget.GridView
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.TextView
 import java.io.Reader
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
@@ -37,6 +40,11 @@ internal class SharedMediaView(
     }
 
     private data class Link(val address: String, val uri: Uri, val timestamp: Long)
+    private data class Files(val all: List<ChatItem>, val photos: List<ChatItem>, val videos: List<ChatItem>)
+    private class Load(val isLinks: Boolean) {
+        val signal = CancellationSignal()
+        var future: Future<*>? = null
+    }
 
     private val handler = Handler(Looper.getMainLooper())
     private val labels = mutableMapOf<Tab, View>()
@@ -44,14 +52,20 @@ internal class SharedMediaView(
     private var tab = Tab.PHOTOS
     private var listing: MediaGrid? = null
     private var rows: SharedList? = null
-    private var empty: View? = null
-    private var files: List<ChatItem>? = null
+    private var empty: TextView? = null
+    private var files: Files? = null
     private var links: List<Link>? = null
-    private var lastLinkMessages: List<ChatItem>? = null
-    private var lastLinks = emptyList<Link>()
-    private var task: Future<*>? = null
-    private var loadAgain = false
-    private var revision = 0
+    private val messageLinks = object : LruCache<Long, Set<String>>(2 * 1024 * 1024) {
+        override fun sizeOf(key: Long, value: Set<String>): Int = 96 + value.sumOf { 64 + it.length * 2 }
+    }
+    private var activeLoad: Load? = null
+    private var filesDirty = true
+    private var linksDirty = true
+    private var loadScheduled = false
+    private val loadSelected = Runnable {
+        loadScheduled = false
+        load()
+    }
 
     init {
         orientation = VERTICAL
@@ -63,9 +77,11 @@ internal class SharedMediaView(
         for (option in Tab.entries) {
             val button = ui.action(option.title) {
                 if (tab != option) {
+                    val changedQuery = (tab == Tab.LINKS) != (option == Tab.LINKS)
                     tab = option
+                    if (changedQuery) cancelLoad()
                     showTab()
-                    refresh()
+                    scheduleLoad()
                 }
             }
             labels[option] = button
@@ -83,78 +99,118 @@ internal class SharedMediaView(
     }
 
     override fun onDetachedFromWindow() {
-        revision += 1
-        task?.cancel(true)
-        task = null
-        loadAgain = false
+        cancelLoad()
         super.onDetachedFromWindow()
     }
 
     fun refresh() {
-        if (!isAttachedToWindow) return
-        if (task != null) {
-            loadAgain = true
-            return
+        filesDirty = true
+        linksDirty = true
+        scheduleLoad()
+    }
+
+    private fun cancelLoad() {
+        handler.removeCallbacks(loadSelected)
+        loadScheduled = false
+        activeLoad?.let { request ->
+            if (request.isLinks) linksDirty = true else filesDirty = true
+            request.signal.cancel()
+            request.future?.cancel(true)
         }
-        val requested = tab
-        val request = ++revision
-        task = worker.submit {
+        activeLoad = null
+    }
+
+    private fun scheduleLoad() {
+        val needsLoad = if (tab == Tab.LINKS) linksDirty else filesDirty
+        if (!needsLoad || !isAttachedToWindow || loadScheduled || activeLoad != null) return
+        loadScheduled = true
+        handler.postDelayed(loadSelected, LOAD_DELAY_MS)
+    }
+
+    private fun load() {
+        if (!isAttachedToWindow || worker.isShutdown) return
+        val request = Load(tab == Tab.LINKS)
+        activeLoad = request
+        if (request.isLinks) linksDirty = false else filesDirty = false
+        val previousFiles = files
+        val previousLinks = links
+        request.future = worker.submit {
             val result = runCatching {
-                if (requested == Tab.LINKS) null to readLinks()
-                else store.sharedFiles(chatId) to null
+                if (request.isLinks) null to readLinks(request.signal).takeUnless { it == previousLinks }
+                else readFiles(request.signal, previousFiles) to null
             }
+            if (request.signal.isCanceled) return@submit
             handler.post {
-                if (!isAttachedToWindow || request != revision) return@post
-                task = null
+                if (activeLoad !== request || !isAttachedToWindow) return@post
+                activeLoad = null
                 result.onSuccess { (newFiles, newLinks) ->
                     if (newFiles != null) files = newFiles
                     if (newLinks != null) links = newLinks
                     updateListing()
                 }.onFailure {
-                    if (requested == tab) {
-                        (empty as? android.widget.TextView)?.apply {
-                            text = "Could not load ${tab.title.lowercase()}"
-                            visibility = VISIBLE
-                        }
+                    val hasList = if (request.isLinks) links != null else files != null
+                    if (!hasList) empty?.apply {
+                        text = "Could not load ${tab.title.lowercase()}"
+                        visibility = VISIBLE
                     }
                 }
-                if (loadAgain) {
-                    loadAgain = false
-                    refresh()
-                }
+                scheduleLoad()
             }
         }
     }
 
-    private fun readLinks(): List<Link> {
-        val messages = store.sharedLinkMessages(chatId)
-        if (messages == lastLinkMessages) return lastLinks
-        val unique = linkedMapOf<String, Link>()
-        for (message in messages) {
-            if (Thread.currentThread().isInterrupted) break
-            try {
-                store.openTextReader(message)?.use { reader ->
-                    for (address in webLinks(reader)) {
-                        unique.putIfAbsent(address, Link(address, Uri.parse(address), message.item.ts))
-                    }
-                }
-            } catch (_: java.io.IOException) {
-                // The user can delete or expire a long message while shared links are loading.
+    private fun readFiles(signal: CancellationSignal, previous: Files?): Files? {
+        val all = store.sharedFiles(chatId, signal)
+        if (all == previous?.all) return null
+        val photos = mutableListOf<ChatItem>()
+        val videos = mutableListOf<ChatItem>()
+        for (file in all) {
+            signal.throwIfCanceled()
+            when (file.visualMedia()) {
+                VisualMedia.PHOTO -> photos.add(file)
+                VisualMedia.VIDEO -> videos.add(file)
+                null -> Unit
             }
         }
-        val found = unique.values.toList()
-        if (!Thread.currentThread().isInterrupted) {
-            lastLinkMessages = messages
-            lastLinks = found
+        return Files(all, photos, videos)
+    }
+
+    private fun readLinks(signal: CancellationSignal): List<Link> {
+        val unique = linkedMapOf<String, Link>()
+        var beforeSeq = Long.MAX_VALUE
+        while (true) {
+            signal.throwIfCanceled()
+            val messages = store.sharedLinkMessages(chatId, beforeSeq, signal)
+            if (messages.isEmpty()) break
+            for (message in messages) {
+                signal.throwIfCanceled()
+                try {
+                    val addresses = messageLinks.get(message.seq) ?: store.openTextReader(message)?.use { reader ->
+                        webLinks(reader).also {
+                            signal.throwIfCanceled()
+                            messageLinks.put(message.seq, it)
+                        }
+                    }.orEmpty()
+                    for (address in addresses) {
+                        if (!unique.containsKey(address)) {
+                            unique[address] = Link(address, Uri.parse(address), message.item.ts)
+                        }
+                    }
+                } catch (_: java.io.IOException) {
+                    // The user can delete or expire a long message while shared links are loading.
+                }
+            }
+            beforeSeq = messages.last().seq
         }
-        return found
+        signal.throwIfCanceled()
+        return unique.values.toList()
     }
 
     private fun showTab() {
         labels.forEach { (option, view) ->
             val active = tab == option
             view.isSelected = active
-            (view as android.widget.TextView).setTextColor(if (active) ui.accentText else ui.muted)
+            (view as TextView).setTextColor(if (active) ui.accentText else ui.muted)
             view.background = ui.tapShape(if (active) ui.mint else android.graphics.Color.TRANSPARENT, 13)
         }
         content.removeAllViews()
@@ -170,6 +226,7 @@ internal class SharedMediaView(
                 clipToPadding = false
                 setPadding(ui.dp(7), ui.dp(7), ui.dp(7), ui.dp(14))
                 setSelector(android.R.color.transparent)
+                setRecyclerListener { (it as? MediaThumbnail)?.recycle() }
                 listing = MediaGrid(if (tab == Tab.VIDEOS) VisualMedia.VIDEO else VisualMedia.PHOTO)
                 adapter = listing
                 setOnItemClickListener { _, _, position, _ -> listing?.getItem(position)?.let(openFile) }
@@ -197,15 +254,14 @@ internal class SharedMediaView(
     }
 
     private fun updateListing() {
-        val currentFiles = files.orEmpty()
         val count = when (tab) {
             Tab.PHOTOS, Tab.VIDEOS -> {
-                val visual = if (tab == Tab.VIDEOS) VisualMedia.VIDEO else VisualMedia.PHOTO
-                val matching = currentFiles.filter { it.visualMedia() == visual }
+                val matching = if (tab == Tab.VIDEOS) files?.videos.orEmpty() else files?.photos.orEmpty()
                 listing?.replace(matching)
                 matching.size
             }
             Tab.FILES -> {
+                val currentFiles = files?.all.orEmpty()
                 rows?.replace(currentFiles, emptyList())
                 currentFiles.size
             }
@@ -215,7 +271,7 @@ internal class SharedMediaView(
             }
         }
         val loaded = if (tab == Tab.LINKS) links != null else files != null
-        (empty as? android.widget.TextView)?.apply {
+        empty?.apply {
             text = tab.empty
             visibility = if (loaded && count == 0) VISIBLE else GONE
         }
@@ -225,7 +281,7 @@ internal class SharedMediaView(
         private var items = emptyList<ChatItem>()
 
         fun replace(newItems: List<ChatItem>) {
-            if (items == newItems) return
+            if (items === newItems) return
             items = newItems
             notifyDataSetChanged()
         }
@@ -246,7 +302,7 @@ internal class SharedMediaView(
         private var linkItems = emptyList<Link>()
 
         fun replace(files: List<ChatItem>, links: List<Link>) {
-            if (fileItems == files && linkItems == links) return
+            if (fileItems === files && linkItems === links) return
             fileItems = files
             linkItems = links
             notifyDataSetChanged()
@@ -305,6 +361,10 @@ internal class SharedMediaView(
             }
         }
     }
+
+    private companion object {
+        const val LOAD_DELAY_MS = 180L
+    }
 }
 
 internal fun webLinks(reader: Reader): Set<String> {
@@ -314,7 +374,9 @@ internal fun webLinks(reader: Reader): Set<String> {
     var overflow = false
 
     fun finishToken() {
-        for (match in if (overflow) emptySequence() else WEB_LINK.findAll(token)) {
+        val hasLinkPrefix = token.contains("http", ignoreCase = true) || token.contains("www.", ignoreCase = true)
+        val matches = if (!overflow && hasLinkPrefix) WEB_LINK.findAll(token) else emptySequence()
+        for (match in matches) {
             var address = match.value.trimEnd('.', ',', ':', ';', '!', '?')
             for ((open, close) in BRACKETS) {
                 var excess = address.count { it == close } - address.count { it == open }

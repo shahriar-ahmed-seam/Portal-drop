@@ -3,6 +3,7 @@ package app.portaldrop
 import android.os.SystemClock
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.security.MessageDigest
 import javax.crypto.Mac
@@ -13,7 +14,7 @@ internal class HotspotAnnouncements {
     private data class ListenKey(
         val fingerprint: String,
         val token: String,
-        val route: PortalRoute.Hosted,
+        val route: PortalRoute.Hosted?,
         val generation: Int,
         val allowLegacy: Boolean,
     )
@@ -24,18 +25,19 @@ internal class HotspotAnnouncements {
     @Synchronized
     fun update(
         peer: Peer,
+        hosting: Boolean,
         route: PortalRoute.Hosted?,
         generation: Int,
         allowLegacy: Boolean,
         found: (String, Int, Boolean) -> Unit,
     ) {
-        val key = route?.let { ListenKey(peer.fingerprint, peer.token, it, generation, allowLegacy) }
+        val key = if (hosting) ListenKey(peer.fingerprint, peer.token, route, generation, allowLegacy) else null
         if (current == key && listener?.isClosed == false) return
         stop()
         if (key == null) return
         val socket = runCatching { DatagramSocket(null) }.getOrNull() ?: return
-        // Directed broadcast requires a wildcard bind. The subnet guard and MAC below
-        // restrict which packets may schedule a connection attempt.
+        // Directed broadcast requires a wildcard bind. Signed announcements can also
+        // arrive on a hotspot interface that isn't exposed to the app.
         if (runCatching { socket.bind(InetSocketAddress(PORT)) }.isFailure) {
             socket.close()
             return
@@ -69,13 +71,15 @@ internal class HotspotAnnouncements {
                 packet.length = buffer.size
                 if (runCatching { socket.receive(packet) }.isFailure) break
                 val now = SystemClock.elapsedRealtime()
-                if (now - lastAccepted < 1_000 || !key.route.permits(packet.address)) continue
+                val address = packet.address as? Inet4Address ?: continue
+                if (now - lastAccepted < 1_000 || !address.isHotspotAddress()) continue
                 val payload = String(buffer, packet.offset, packet.length, Charsets.US_ASCII)
-                val host = packet.address.hostAddress ?: continue
+                val host = address.hostAddress ?: continue
                 val signed = payload.startsWith("$PROTOCOL ")
                 val port = when {
                     signed -> authenticatedPort(payload, host, mac)
-                    key.allowLegacy && payload.startsWith(legacyPrefix) && payload.endsWith('\n') ->
+                    key.allowLegacy && key.route?.permits(address) == true &&
+                        payload.startsWith(legacyPrefix) && payload.endsWith('\n') ->
                         parsePort(payload.substring(legacyPrefix.length, payload.lastIndex))
                     else -> null
                 } ?: continue

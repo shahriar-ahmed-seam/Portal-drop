@@ -12,6 +12,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Typeface
 import android.media.AudioAttributes
 import android.media.MediaPlayer
@@ -49,16 +50,24 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.widget.doAfterTextChanged
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import app.portaldrop.TransferService.Status
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import java.io.IOException
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledThreadPoolExecutor
 
 class MainActivity : ComponentActivity() {
     private enum class Page { CHAT, CHATS, RECEIVED, MEDIA }
 
     private data class Draft(val text: String, val reply: ChatItem?)
+    private class ChatDrafts : ViewModel() {
+        val byChat = mutableMapOf<String, Draft>()
+    }
     private data class HotspotRequest(val passphrase: String?)
 
     private lateinit var root: LinearLayout
@@ -106,7 +115,10 @@ class MainActivity : ComponentActivity() {
     private var loadedFrom: Long? = null
     private var earlierThan: Long? = null
     private var chatSearch = ""
-    private val drafts = mutableMapOf<String, Draft>()
+    private val drafts by lazy {
+        val factory = viewModelFactory { initializer { ChatDrafts() } }
+        ViewModelProvider(this, factory)[ChatDrafts::class.java].byChat
+    }
     private var tempTtl: Long? = null
     private var selecting = false
     private val selectedSeqs = linkedSetOf<Long>()
@@ -118,7 +130,7 @@ class MainActivity : ComponentActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private val fileWorker = Executors.newSingleThreadExecutor()
     private val searchWorker = Executors.newSingleThreadExecutor()
-    private val mediaWorker = Executors.newSingleThreadExecutor()
+    private val mediaWorker = ScheduledThreadPoolExecutor(1).apply { removeOnCancelPolicy = true }
     private val updateWorker = Executors.newSingleThreadExecutor()
     private var checkingForUpdates = false
     private var mediaPreviews: MediaPreviews? = null
@@ -126,7 +138,7 @@ class MainActivity : ComponentActivity() {
 
     private val expiryTick = object : Runnable {
         override fun run() {
-            if (store.purgeExpired().isNotEmpty() || page == Page.CHAT || page == Page.MEDIA) {
+            if (store.purgeExpired().isNotEmpty() || page == Page.CHAT) {
                 refresh()
             }
             mainHandler.postDelayed(this, 15_000L)
@@ -154,7 +166,9 @@ class MainActivity : ComponentActivity() {
 
     private val updates = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == TransferService.ACTION_UPDATE) refresh()
+            if (intent.action == TransferService.ACTION_UPDATE &&
+                !(page == Page.MEDIA && intent.getBooleanExtra(TransferService.EXTRA_PROGRESS_ONLY, false))
+            ) refresh()
             renderHotspotDialog()
         }
     }
@@ -203,12 +217,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(newBase)
+        PortalStore.get(newBase).themeMode().nightMode?.let { nightMode ->
+            applyOverrideConfiguration(Configuration().apply { uiMode = nightMode })
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = PortalStore.get(this)
-        page = Page.entries.firstOrNull { it.name == savedInstanceState?.getString("page") } ?: Page.CHAT
+        shownFingerprint = store.peer()?.fingerprint
+        if (savedInstanceState != null && savedInstanceState.getString("peer") == shownFingerprint) {
+            page = Page.entries.firstOrNull { it.name == savedInstanceState.getString("page") } ?: Page.CHAT
+            addingComputer = savedInstanceState.getBoolean("adding_computer")
+            tempTtl = savedInstanceState.getLong("temp_ttl").takeIf { it > 0 }
+        } else {
+            drafts.clear()
+        }
+        shownPeer = shownFingerprint != null && !addingComputer
+        if (shownPeer == true) chatId = store.activeChatId()
         onBackPressedDispatcher.addCallback(this, back)
         buildShell()
+        showPage()
         refresh()
         if (savedInstanceState == null) consumeIntent(intent)
     }
@@ -250,7 +281,11 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        saveDraft()
         outState.putString("page", page.name)
+        outState.putString("peer", shownFingerprint)
+        outState.putBoolean("adding_computer", addingComputer)
+        tempTtl?.let { outState.putLong("temp_ttl", it) }
         super.onSaveInstanceState(outState)
     }
 
@@ -1569,6 +1604,10 @@ class MainActivity : ComponentActivity() {
 
     private fun showAppSettings() {
         showGroupedOptions(this, ui, "Settings", listOf(
+            OptionSection("Appearance", listOf(
+                OptionRow("Theme", R.drawable.ic_portal_theme, detail = store.themeMode().title,
+                    opensPage = true, act = ::showThemeSettings),
+            )),
             OptionSection("Preferences", listOf(
                 OptionRow("Notifications & sounds", R.drawable.ic_portal_settings, act = ::showNotificationSettings),
                 OptionRow("Save location", R.drawable.ic_chat_file, act = ::showSaveLocationSettings),
@@ -1578,6 +1617,23 @@ class MainActivity : ComponentActivity() {
                     act = ::checkForUpdates),
             )),
         ))
+    }
+
+    private fun showThemeSettings() {
+        val current = store.themeMode()
+        val choices = ThemeMode.entries.map { it.title }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Theme")
+            .setSingleChoiceItems(choices, current.ordinal) { dialog, which ->
+                dialog.dismiss()
+                val chosen = ThemeMode.entries[which]
+                if (chosen != current) {
+                    store.setThemeMode(chosen)
+                    recreate()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showReconnectByAddress() {

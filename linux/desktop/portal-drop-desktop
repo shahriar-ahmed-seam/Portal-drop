@@ -145,6 +145,76 @@ def get_json(*args):
     return json.loads(run_cli(*args))
 
 
+def media_thumbnail(message_id):
+    """Decode one bounded, static thumbnail from the local file registered for this message."""
+    try:
+        details = get_json("media-path", message_id)
+        path = Path(details["path"])
+        mime = details["mime"]
+        if not path.is_file():
+            return {}
+        duration = None
+        if mime.startswith("video/"):
+            data, duration = video_thumbnail(path, mime)
+        elif mime.startswith("image/") and path.stat().st_size <= 32 * 1024 * 1024:
+            image_format, width, height = GdkPixbuf.Pixbuf.get_file_info(str(path))
+            if (image_format is None or image_format.get_name() == "svg"
+                    or width <= 0 or height <= 0 or width * height > 24_000_000):
+                return {}
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), min(320, width), min(320, height), True)
+            pixbuf = pixbuf.apply_embedded_orientation()
+            ok, data = pixbuf.save_to_bufferv("jpeg", ["quality"], ["82"])
+            if not ok:
+                return {}
+        else:
+            return {}
+        if not data or len(data) > 256 * 1024:
+            return {}
+        return {"src": "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii"), "duration": duration}
+    except (OSError, ValueError, KeyError, GLib.Error, subprocess.SubprocessError):
+        return {}
+
+
+def video_thumbnail(path, mime):
+    ffmpeg = shutil.which("ffmpeg")
+    container = {
+        "video/mp4": "mov",
+        "video/quicktime": "mov",
+        "video/3gpp": "mov",
+        "video/webm": "matroska",
+        "video/x-matroska": "matroska",
+        "video/x-msvideo": "avi",
+    }.get(mime)
+    if not ffmpeg or not container:
+        return None, None
+    options = ["-f", container, "-protocol_whitelist", "file,pipe",
+               "-probesize", "2000000", "-analyzeduration", "1200000"]
+    result = subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-filter_threads", "1", "-threads", "1",
+         "-max_pixels", "24000000", *options, "-i", str(path), "-map", "0:V:0",
+         "-frames:v", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+         "-threads", "1", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        check=True, timeout=2,
+    )
+    duration = None
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe and result.stdout:
+        try:
+            probe = subprocess.run(
+                [ffprobe, "-v", "error", *options, "-show_entries", "format=duration",
+                 "-of", "default=nw=1:nk=1", str(path)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                check=True, timeout=1,
+            )
+            duration = float(probe.stdout)
+            if not 0 < duration < float("inf"):
+                duration = None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return result.stdout, duration
+
+
 def service_ctl(action):
     subprocess.run(
         ["systemctl", "--user", action, SERVICE],
@@ -1396,6 +1466,8 @@ class PortalWindow(Gtk.ApplicationWindow):
             if payload.get("before") is not None:
                 args.extend(["--before", str(int(payload["before"]))])
             return get_json(*args)
+        if action == "media_thumbnail":
+            return media_thumbnail(str(payload.get("id") or ""))
         if action == "transfer_control":
             return get_json(
                 "transfer-control", str(payload["direction"]), str(payload["id"]), str(payload["action"])

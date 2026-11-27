@@ -397,8 +397,8 @@ svg { display: block; flex-shrink: 0; }
   background: color-mix(in srgb, var(--muted) 15%, transparent);
 }
 .thumb { position: relative; }
-.thumb img, .thumb video { display: block; width: 100%; max-height: 340px; object-fit: cover; }
-.thumb video { width: min(380px, 100%); aspect-ratio: 16 / 9; }
+.bubble .thumb { width: min(320px, 58vw); aspect-ratio: 16 / 9; display: grid; place-items: center; color: var(--accent); }
+.thumb img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: cover; }
 .media-duration { position: absolute; right: 6px; bottom: 6px; padding: 2px 6px; border-radius: 6px; background: #18231e; color: #fff; font-size: 11px; }
 .media-play { position: absolute; left: 8px; bottom: 8px; color: white; background: #18231e; display: grid; place-items: center; border-radius: 50%; width: 26px; height: 26px; }
 .transfer-actions { display: flex; gap: 3px; align-self: flex-start; }
@@ -578,7 +578,6 @@ svg { display: block; flex-shrink: 0; }
 .media-tile { color: var(--text); overflow: hidden; text-align: left; background: var(--input-bg); border-radius: 10px; }
 .media-tile:disabled { cursor: default; }
 .media-tile .thumb { margin: 0; border-radius: 0; aspect-ratio: 1; display: grid; place-items: center; color: var(--accent); }
-.media-tile .thumb img, .media-tile .thumb video { position: absolute; width: 100%; height: 100%; object-fit: cover; }
 .media-title { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 6px 8px; font-size: 12px; }
 .media-more { margin-top: 10px; }
 .path-card { padding: 14px; border-radius: 12px; background: var(--input-bg); border: 1px solid var(--line); }
@@ -752,7 +751,7 @@ svg { display: block; flex-shrink: 0; }
    Host bridge (wry on Windows → window.ipc, WebKitGTK on Linux → messageHandlers)
    ======================================================================== */
 const DEFAULT_CHAT = "00000000-0000-0000-0000-000000000001";
-const APP_VERSION = "0.6.1";
+const APP_VERSION = "0.6.2";
 const RELEASE_REPO = "shahriar-ahmed-seam/Portal-drop";
 const TEMP_TIMERS = new Map([[300, "5 minutes"], [600, "10 minutes"], [3600, "1 hour"], [86400, "24 hours"]]);
 const MAX_CLIPBOARD_IMAGE = 16 * 1024 * 1024;
@@ -908,53 +907,150 @@ function fileKind(name) {
   if (["zip", "rar", "7z", "tar", "gz", "xz", "zst", "apk", "deb", "rpm"].includes(ext)) return "archive";
   return "file";
 }
-const isImageName = (n) => ["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"].includes((String(n || "").split(".").pop() || "").toLowerCase());
+const isImageName = (n) => ["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "heif"].includes((String(n || "").split(".").pop() || "").toLowerCase());
 function fileUrl(r) {
   if (!r.path) return null;
-  if (HOST === "linux") return "file://" + String(r.path).split("/").map(encodeURIComponent).join("/");
   if (HOST === "windows" && window.__PORTAL_FILE_PROTO) return window.__PORTAL_FILE_PROTO + encodeURIComponent(r.id);
   return null;
 }
-const mediaObserver = new IntersectionObserver((entries, observer) => {
+const mediaTasks = new WeakMap();
+const visibleMedia = new Set();
+const posterCache = new Map();
+let activePoster = null;
+const mediaObserver = new IntersectionObserver((entries) => {
   for (const entry of entries) {
-    if (!entry.isIntersecting) continue;
-    observer.unobserve(entry.target);
-    entry.target.src = entry.target.dataset.mediaSrc;
+    const task = mediaTasks.get(entry.target);
+    if (!task) continue;
+    if (entry.isIntersecting) visibleMedia.add(task);
+    else {
+      visibleMedia.delete(task);
+      if (activePoster === task) task.cancel?.abort();
+    }
   }
+  runPosterQueue();
 });
 function releaseMedia(node) {
-  for (const player of node.querySelectorAll("video")) mediaObserver.unobserve(player);
+  for (const thumb of node.querySelectorAll("[data-poster]")) {
+    const task = mediaTasks.get(thumb);
+    if (!task) continue;
+    mediaObserver.unobserve(thumb);
+    visibleMedia.delete(task);
+    mediaTasks.delete(thumb);
+    task.cancel?.abort();
+  }
 }
 function previewMedia(container, r, isTile = false) {
-  const url = fileUrl(r), video = fileKind(r.name) === "video";
-  if (!url || (!video && !isImageName(r.name))) return;
-  if (!video) {
+  const video = fileKind(r.name) === "video";
+  if (!r.path || (!video && !isImageName(r.name)) || (HOST !== "linux" && !fileUrl(r))) return;
+  if (!isTile) container.innerHTML = icon(video ? "video" : "image", 24);
+  container.dataset.poster = "";
+  const task = { container, item: r, video, isTile, key: JSON.stringify([r.id, r.path, r.size]) };
+  mediaTasks.set(container, task);
+  mediaObserver.observe(container);
+}
+async function runPosterQueue() {
+  if (activePoster) return;
+  const gallery = document.querySelector(".modal .media-grid");
+  // Do not decode chat previews hidden behind the modal.
+  const task = [...visibleMedia].find((item) => item.container.isConnected &&
+    (!openModalEl || gallery?.contains(item.container)));
+  if (!task) return;
+  const { container, item, key, video } = task;
+  activePoster = task;
+  task.cancel = new AbortController();
+  try {
+    let poster = posterCache.get(key);
+    if (poster === undefined) {
+      poster = HOST === "linux" ?
+        await ipc("media_thumbnail", { id: item.id }) :
+        await browserPoster(fileUrl(item), video, task.cancel.signal);
+      // A completed native thumbnail can be reused even if its tab was closed.
+      if (!task.cancel.signal.aborted || poster?.src) {
+        posterCache.set(key, poster || {});
+        if (posterCache.size > 64) posterCache.delete(posterCache.keys().next().value);
+      }
+    } else {
+      posterCache.delete(key);
+      posterCache.set(key, poster);
+    }
+    if (!task.cancel.signal.aborted && container.isConnected) showPoster(task, poster);
+  } catch {
+    if (!task.cancel.signal.aborted && container.isConnected) showPoster(task, null);
+  } finally {
+    if (!task.cancel.signal.aborted) {
+      mediaObserver.unobserve(container);
+      visibleMedia.delete(task);
+      mediaTasks.delete(container);
+    }
+    activePoster = null;
+    // Yield between cached posters and let visibility and modal changes take effect.
+    requestAnimationFrame(runPosterQueue);
+  }
+}
+function showPoster({ container, video, isTile }, poster) {
+  if (poster?.src) {
     const image = el("img");
     image.alt = "";
-    image.loading = "lazy";
-    image.onerror = () => isTile ? image.remove() : container.remove();
-    image.src = url;
-    container.append(image);
+    image.src = poster.src;
+    container.replaceChildren(image);
+  } else if (!isTile && !video) {
+    container.remove();
     return;
   }
-  const player = el("video");
-  player.preload = "metadata";
-  player.muted = true;
-  player.playsInline = true;
-  player.dataset.mediaSrc = url + "#t=0.1";
+  if (!video) return;
+  container.append(el("span", "media-play", icon("play", 15)));
+  if (!Number.isFinite(poster?.duration) || poster.duration <= 0) return;
   const duration = el("span", "media-duration");
-  duration.hidden = true;
-  player.onloadedmetadata = () => {
-    if (!Number.isFinite(player.duration) || player.duration <= 0) return;
-    const seconds = Math.floor(player.duration);
-    const mins = Math.floor(seconds / 60);
-    duration.textContent = mins + ":" + String(seconds % 60).padStart(2, "0");
-    duration.hidden = false;
-  };
-  const play = el("span", "media-play", icon("play", 15));
-  player.onerror = () => isTile ? (player.remove(), play.remove(), duration.remove()) : container.remove();
-  container.append(player, play, duration);
-  mediaObserver.observe(player);
+  const seconds = Math.floor(poster.duration);
+  duration.textContent = Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
+  container.append(duration);
+}
+function browserPoster(url, video, signal) {
+  return new Promise((resolve) => {
+    const source = el(video ? "video" : "img");
+    const ready = video ? "loadeddata" : "load";
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", stop);
+      source.removeEventListener(ready, capture);
+      source.removeEventListener("error", stop);
+      if (video) source.pause();
+      source.removeAttribute("src");
+      if (video) source.load();
+      resolve(result);
+    };
+    const stop = () => finish(null);
+    const capture = () => {
+      const width = video ? source.videoWidth : source.naturalWidth;
+      const height = video ? source.videoHeight : source.naturalHeight;
+      const poster = { duration: video ? source.duration : null };
+      if (width && height && width * height <= 24_000_000) {
+        const scale = Math.min(1, 320 / Math.max(width, height));
+        const canvas = el("canvas");
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        try {
+          canvas.getContext("2d").drawImage(source, 0, 0, canvas.width, canvas.height);
+          poster.src = canvas.toDataURL("image/jpeg", 0.80);
+        } catch { /* An unsupported or unreadable preview still has a file icon. */ }
+      }
+      finish(poster);
+    };
+    const timeout = setTimeout(stop, 2200);
+    signal.addEventListener("abort", stop, { once: true });
+    source.addEventListener(ready, capture, { once: true });
+    source.addEventListener("error", stop, { once: true });
+    source.crossOrigin = "anonymous";
+    if (video) {
+      source.preload = "auto";
+      source.muted = true;
+      source.playsInline = true;
+    }
+    source.src = url;
+  });
 }
 function renderRich(text) {
   const parts = String(text || "").split(/```[^\n]*\n?([\s\S]*?)```/g);
@@ -1586,6 +1682,7 @@ function closeModal() {
     const cleanup = modalCleanup;
     modalCleanup = null;
     cleanup?.();
+    requestAnimationFrame(runPosterQueue);
   }
 }
 function modal({ title, body, actions = [], wide = false, onClose }) {
@@ -1735,15 +1832,17 @@ function showMessageSearch() {
   });
   input.focus();
 }
+let sharedMediaRequest = null;
 function showSharedMedia(chatId) {
   const body = el("div"), tabs = el("div", "media-tabs"), list = el("div");
   const more = el("button", "pill-btn media-more", "Load more");
   const status = el("div", "list-empty");
   status.setAttribute("aria-live", "polite");
   body.append(tabs, status, list, more);
-  modal({ title: "Shared media", body, wide: true });
   const choices = [["photos-videos", "Photos & videos"], ["files", "Files"], ["links", "Links"]];
-  let selected, cursor, generation = 0;
+  const pages = new Map();
+  let selected, timer, generation = 0;
+  modal({ title: "Shared media", body, wide: true, onClose: () => clearTimeout(timer) });
 
   for (const [key, title] of choices) {
     const tab = el("button", "pill-btn", esc(title));
@@ -1751,37 +1850,81 @@ function showSharedMedia(chatId) {
     tab.onclick = () => select(key);
     tabs.append(tab);
   }
-  more.onclick = () => load();
+  more.onclick = () => load(selected, generation, pages.has(selected));
   select(choices[0][0]);
 
   function select(tab) {
+    if (tab === selected) return;
+    clearTimeout(timer);
     selected = tab;
-    cursor = null;
-    generation++;
+    const token = ++generation;
     for (const button of tabs.children) button.setAttribute("aria-pressed", String(button.dataset.tab === tab));
     releaseMedia(list);
     list.replaceChildren();
     list.className = tab === "photos-videos" ? "media-grid" : "files-list";
-    load();
+    body.parentElement.scrollTop = 0;
+    const cached = pages.get(tab);
+    if (cached) {
+      append(cached.items, tab);
+      updateStatus(cached.next);
+    } else {
+      showLoading();
+      timer = setTimeout(() => load(tab, token), 150);
+    }
   }
 
-  async function load() {
-    const token = generation, tab = selected;
+  function showLoading() {
     more.hidden = true;
     status.hidden = false;
     status.textContent = "Loading…";
+  }
+
+  function append(items, tab) {
+    const batch = document.createDocumentFragment();
+    for (const item of items) batch.append(tab === "photos-videos" ? mediaTile(item) : mediaRow(item, tab));
+    list.append(batch);
+  }
+
+  function updateStatus(next) {
+    more.textContent = "Load more";
+    more.hidden = next === null;
+    status.hidden = list.hasChildNodes();
+    status.textContent = status.hidden ? "" : next === null ? "Nothing shared here yet" : "No matches on this page";
+  }
+
+  async function load(tab, token, appendMore = false) {
+    showLoading();
+    const current = () => token === generation && body.isConnected;
+    // Keep only one native query active, even if the modal is closed and reopened.
+    while (sharedMediaRequest && current()) {
+      try { await sharedMediaRequest; } catch { /* The previous tab handles its own error. */ }
+    }
+    if (!current()) return;
+    const cached = pages.get(tab);
+    if (cached && (!appendMore || cached.next === null)) {
+      if (!appendMore) append(cached.items, tab);
+      updateStatus(cached.next);
+      return;
+    }
+    const request = ipc("shared_media", { tab, before: cached?.next ?? null, chatId });
+    sharedMediaRequest = request;
     try {
-      const page = await ipc("shared_media", { tab, before: cursor, chatId });
-      if (token !== generation || !body.isConnected) return;
-      for (const item of page.items || []) {
-        list.append(tab === "photos-videos" ? mediaTile(item) : mediaRow(item, tab));
-      }
-      cursor = page.next_before ?? null;
-      more.hidden = cursor === null;
-      status.hidden = list.hasChildNodes() || cursor !== null;
-      status.textContent = status.hidden ? "" : "Nothing shared here yet";
+      const page = await request;
+      if (appendMore && selected === tab && !current()) return;
+      const items = page.items || [];
+      const next = page.next_before ?? null;
+      pages.set(tab, { items: (cached?.items || []).concat(items), next });
+      if (!current()) return;
+      append(items, tab);
+      updateStatus(next);
     } catch (error) {
-      if (token === generation && body.isConnected) status.textContent = error.message;
+      if (current()) {
+        status.textContent = error.message;
+        more.textContent = "Retry";
+        more.hidden = false;
+      }
+    } finally {
+      sharedMediaRequest = null;
     }
   }
 }
@@ -2134,6 +2277,7 @@ function showOfflineSharing() {
   let scansRemaining = 0;
   let lookupUntil = 0;
   let announced = "";
+  let lastAnnouncement = 0;
   let lastConfig = "";
   let lastPhase = "";
   let selectedEndpoint = "";
@@ -2591,8 +2735,9 @@ function showOfflineSharing() {
         const target = joinedAddress ? addresses.find((row) => ipv4(row.address) === joinedAddress)
           : addresses.find((row) => row.address === selectedEndpoint || (!canHost && joinedName && row.address === address.value));
         const endpoint = target?.can_announce ? target : null;
-        if (endpoint && endpoint.address !== announced) {
+        if (endpoint && (endpoint.address !== announced || Date.now() - lastAnnouncement >= 6000)) {
           announced = endpoint.address;
+          lastAnnouncement = Date.now();
           const gateway = ipv4(endpoint.address) === joinedAddress ? joinedGateway : undefined;
           await ipc("announce_hotspot", { address: endpoint.address, gateway })
             .catch(() => gateway && ipc("announce_hotspot", { address: endpoint.address }).catch(() => {}));

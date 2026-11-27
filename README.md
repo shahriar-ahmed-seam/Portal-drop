@@ -61,11 +61,13 @@ Each desktop pairs with one Android device. Android can remember multiple deskto
 
 Use **Save location** to choose where new downloads go. Android uses the system folder picker, which can grant access to a folder on internal storage or a mounted microSD card.
 
+On Android, open **Settings → Appearance → Theme** to choose System, Light, or Dark.
+
 ### v0.4.0
 
 - On desktop, paste a PNG, JPEG, GIF, or WebP image into the composer and press **Send**. Portal Drop previews the image before sending. Clipboard images can be up to 16 MiB.
 - Use **Search messages** on Android or desktop to search message bodies and filenames across conversations. On desktop, **Ctrl+F** opens message search. The sidebar field still filters chat titles.
-- Use **Shared media** to browse photos and videos, files, and links. Available videos show a preview and duration when the device supports the format.
+- Use **Shared media** to browse photos and videos, files, and links. Available videos show a static preview and duration when the device supports the format. Linux uses optional FFmpeg for video previews.
 - Pause, resume, cancel, or retry an individual file transfer from its chat bubble. Android also offers active transfer controls in the notification. Paused transfers retain their progress.
 - Drop a folder onto the desktop window or select **Send folder** in an Android chat. Completed files keep their subfolder structure under `Folders/` in the save location. Update both devices to use folder transfer. Empty directories and symlinks are skipped.
 - The desktop system tray shows connection status and unread activity, and offers **Send clipboard**, **Pause service**, and **Resume service**. Clipboard text expires after five minutes. Enable **Minimize to tray on close** from the app menu. On Linux, the tray requires desktop support for AppIndicator or the legacy status icon.

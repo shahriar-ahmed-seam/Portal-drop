@@ -18,8 +18,9 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import java.io.File
 import java.util.Locale
-import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 
 internal enum class VisualMedia { PHOTO, VIDEO }
@@ -42,27 +43,30 @@ internal class MediaPreviews(context: Context, private val store: PortalStore) :
 
     private val app = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
-    private val worker = Executors.newFixedThreadPool(2)
+    // A video decoder can retain full-size frames internally while generating a small thumbnail.
+    private val worker = ScheduledThreadPoolExecutor(1).apply { removeOnCancelPolicy = true }
     private val cache = object : LruCache<String, Preview>(12 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Preview): Int = value.bitmap?.allocationByteCount ?: 64
     }
 
     fun load(row: ChatItem, kind: VisualMedia, signal: CancellationSignal, done: (Preview?) -> Unit): Future<*>? {
+        if (worker.isShutdown) return null
         val key = "${row.peerFingerprint}:${row.incoming}:${row.item.id}"
         cache.get(key)?.let {
             done(it)
             return null
         }
         val uri = row.localFileUri()
-        val staged = if (!row.incoming && !row.delivered && uri == null) store.stagedFile(row.item.id) else null
-        if (uri == null && staged == null) {
+        val canUseStagedFile = !row.incoming && !row.delivered && uri == null
+        if (uri == null && !canUseStagedFile) {
             done(null)
             return null
         }
-        return worker.submit {
-            val source = Source(uri, staged)
+        return worker.schedule({
             val preview = try {
                 signal.throwIfCanceled()
+                val staged = if (canUseStagedFile) store.stagedFile(row.item.id) else null
+                val source = Source(uri, staged)
                 if (kind == VisualMedia.VIDEO) video(source, signal) else Preview(photo(source, signal), null)
             } catch (_: Exception) {
                 null
@@ -70,8 +74,8 @@ internal class MediaPreviews(context: Context, private val store: PortalStore) :
             if (!signal.isCanceled && preview != null && (preview.bitmap != null || preview.durationMs != null)) {
                 cache.put(key, preview)
             }
-            handler.post { if (!signal.isCanceled) done(preview) }
-        }
+            if (!signal.isCanceled) handler.post { if (!signal.isCanceled) done(preview) }
+        }, PREVIEW_DELAY_MS, TimeUnit.MILLISECONDS)
     }
 
     private fun thumbnail(uri: Uri, signal: CancellationSignal): Bitmap? {
@@ -84,6 +88,7 @@ internal class MediaPreviews(context: Context, private val store: PortalStore) :
             thumbnail(uri, signal)?.let { return it }
             signal.throwIfCanceled()
             return ImageDecoder.decodeBitmap(ImageDecoder.createSource(app.contentResolver, uri)) { decoder, info, _ ->
+                signal.throwIfCanceled()
                 val size = info.size
                 val sample = ((max(size.width, size.height) + PREVIEW_SIZE - 1) / PREVIEW_SIZE).coerceAtLeast(1)
                 decoder.setTargetSampleSize(sample)
@@ -92,6 +97,7 @@ internal class MediaPreviews(context: Context, private val store: PortalStore) :
         val path = source.file?.absolutePath ?: return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
+        signal.throwIfCanceled()
         val sample = ((max(bounds.outWidth, bounds.outHeight) + PREVIEW_SIZE - 1) / PREVIEW_SIZE).coerceAtLeast(1)
         return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
     }
@@ -104,6 +110,7 @@ internal class MediaPreviews(context: Context, private val store: PortalStore) :
             val uri = source.uri
             if (uri != null) retriever.setDataSource(app, uri)
             else retriever.setDataSource(source.file?.absolutePath ?: return Preview(thumb, null))
+            signal.throwIfCanceled()
             val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
             val bitmap = thumb ?: runCatching {
                 val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
@@ -131,7 +138,10 @@ internal class MediaPreviews(context: Context, private val store: PortalStore) :
         cache.evictAll()
     }
 
-    private companion object { const val PREVIEW_SIZE = 448 }
+    private companion object {
+        const val PREVIEW_SIZE = 384
+        const val PREVIEW_DELAY_MS = 80L
+    }
 }
 
 internal class MediaThumbnail(
@@ -169,6 +179,7 @@ internal class MediaThumbnail(
     }
 
     fun bind(message: ChatItem, media: VisualMedia) {
+        if (row == message && kind == media) return
         stopLoading()
         row = message
         kind = media
@@ -178,6 +189,13 @@ internal class MediaThumbnail(
         placeholder.visibility = if (media == VisualMedia.PHOTO) VISIBLE else GONE
         describe(message, media, null)
         if (isAttachedToWindow) startLoading()
+    }
+
+    fun recycle() {
+        stopLoading()
+        row = null
+        kind = null
+        image.setImageDrawable(null)
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {

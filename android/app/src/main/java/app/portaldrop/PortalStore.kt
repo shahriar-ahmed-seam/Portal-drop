@@ -8,6 +8,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
+import android.os.CancellationSignal
 import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -550,6 +551,13 @@ class PortalStore private constructor(private val app: Context) :
 
     fun backgroundEnabled(): Boolean = settings.getBoolean("background_enabled", false)
 
+    internal fun themeMode(): ThemeMode =
+        ThemeMode.entries.firstOrNull { it.name == settings.getString("theme_mode", null) } ?: ThemeMode.SYSTEM
+
+    internal fun setThemeMode(mode: ThemeMode) {
+        settings.edit().putString("theme_mode", mode.name).apply()
+    }
+
     internal fun setBackgroundEnabled(enabled: Boolean) {
         settings.edit().putBoolean("background_enabled", enabled).commit()
     }
@@ -824,22 +832,25 @@ class PortalStore private constructor(private val app: Context) :
         )
     }
 
-    fun sharedFiles(chatId: String): List<ChatItem> {
+    fun sharedFiles(chatId: String, signal: CancellationSignal): List<ChatItem> {
         val current = peer() ?: return emptyList()
         return list(
             "$CHAT_RANGE AND kind = 'file' AND (incoming = 0 OR done = 1)",
             chatRangeArgs(current, chatId),
             "seq DESC",
+            signal = signal,
         )
     }
 
-    fun sharedLinkMessages(chatId: String): List<ChatItem> {
+    fun sharedLinkMessages(chatId: String, beforeSeq: Long, signal: CancellationSignal): List<ChatItem> {
         val current = peer() ?: return emptyList()
         return list(
-            "$CHAT_RANGE AND kind = 'text' AND (text LIKE '%http://%' OR text LIKE '%https://%' " +
+            "$CHAT_RANGE AND seq < ? AND kind = 'text' AND (text LIKE '%http://%' OR text LIKE '%https://%' " +
                 "OR text LIKE '%www.%' OR (text_size IS NOT NULL AND (incoming = 0 OR done = 1)))",
-            chatRangeArgs(current, chatId),
+            chatRangeArgs(current, chatId) + beforeSeq.toString(),
             "seq DESC",
+            "64",
+            signal = signal,
         )
     }
 
@@ -1672,10 +1683,17 @@ class PortalStore private constructor(private val app: Context) :
         }
     }
 
-    private fun list(where: String, args: Array<String>, order: String? = null,
-                     limit: String? = null): List<ChatItem> =
-        readableDatabase.query("items", null, where, args, null, null, order, limit).use { rows ->
-            buildList { while (rows.moveToNext()) add(rows.chatItem()) }
+    private fun list(
+        where: String, args: Array<String>, order: String? = null, limit: String? = null,
+        signal: CancellationSignal? = null,
+    ): List<ChatItem> =
+        readableDatabase.query(false, "items", null, where, args, null, null, order, limit, signal).use { rows ->
+            buildList {
+                while (rows.moveToNext()) {
+                    signal?.throwIfCanceled()
+                    add(rows.chatItem())
+                }
+            }
         }
 
     private fun Cursor.chatItem(): ChatItem {

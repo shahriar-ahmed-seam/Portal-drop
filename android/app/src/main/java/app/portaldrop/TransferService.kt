@@ -159,11 +159,39 @@ class TransferService : Service() {
                 val hotspot = store.hotspotPeer(peer)
                 val previous = store.previousPeer(peer)
                 val hosting = OfflineHotspotService.isActive()
-                val routes = portalRoutes(
+                val generation = networkGeneration.get()
+                val knownRoutes = portalRoutes(
                     this, peer.host, allowHotspot = hotspot != null || hosting, previousHost = previous?.host,
                 )
-                    .sortedByDescending { route -> route is PortalRoute.Hosted && route.permits(hotspot?.host?.let(::portalAddress)) }
-                val generation = networkGeneration.get()
+                val hostedRoute = knownRoutes.filterIsInstance<PortalRoute.Hosted>().firstOrNull()
+                val hotspotAddress = hotspot?.host?.let(::portalAddress)
+                val activeHosting = hosting && !isVpnActive(this)
+                val routes = buildList {
+                    addAll(knownRoutes)
+                    if (activeHosting) {
+                        if (hotspot != null && hostedRoute?.permits(hotspotAddress) != true) {
+                            probeHostedRoute(this@TransferService, hotspot.host, hotspot.port)?.let(::add)
+                        }
+                        discovered.asSequence().filter {
+                            it.signedHotspotHint && it.route is PortalRoute.Hosted &&
+                                it.generation == generation && it.fingerprint == peer.fingerprint
+                        }.mapTo(this) { it.route }
+                    }
+                }.distinct().sortedByDescending { it is PortalRoute.Hosted && it.permits(hotspotAddress) }
+                val protectedHotspot = (OfflineHotspotService.state as? OfflineHotspotService.State.Active)
+                    ?.passphrase != null
+                hotspotAnnouncements.update(peer, activeHosting, hostedRoute, generation, protectedHotspot) { host, port, signed ->
+                    if (!running || !OfflineHotspotService.isActive() || networkGeneration.get() != generation) {
+                        return@update
+                    }
+                    val route = hostedRoute?.takeIf { it.permits(portalAddress(host)) }
+                        ?: (if (signed) probeHostedRoute(this, host, port) else null)
+                        ?: return@update
+                    if (networkGeneration.get() == generation) {
+                        enqueueEndpoint(Endpoint(peer.fingerprint, route, host, port, generation, signed))
+                        signal()
+                    }
+                }
                 if (previousRoutes != routes || previousGeneration != generation) {
                     previousRoutes = routes
                     previousGeneration = generation
@@ -173,17 +201,6 @@ class TransferService : Service() {
                     retryDelay = 1_000L
                     lastDiscovery = -DISCOVERY_INTERVAL_MS
                     attemptedGateways.clear()
-                }
-                val hostedRoute = routes.filterIsInstance<PortalRoute.Hosted>().firstOrNull()
-                val protectedHotspot = (OfflineHotspotService.state as? OfflineHotspotService.State.Active)
-                    ?.passphrase != null
-                hotspotAnnouncements.update(peer, hostedRoute?.takeIf { hosting }, generation, protectedHotspot) { host, port, signed ->
-                    if (running && hosting && networkGeneration.get() == generation && hostedRoute != null &&
-                        OfflineHotspotService.isActive()
-                    ) {
-                        enqueueEndpoint(Endpoint(peer.fingerprint, hostedRoute, host, port, generation, signed))
-                        signal()
-                    }
                 }
                 if (routes.isEmpty()) {
                     dropLink()
@@ -323,7 +340,7 @@ class TransferService : Service() {
                         retryDelay = (retryDelay * 2).coerceAtMost(DISCOVERY_INTERVAL_MS)
                     }
                 }
-                await(if (hosting && hostedRoute == null) minOf(delay, HOTSPOT_ROUTE_POLL_MS) else delay)
+                await(if (hosting && routes.none { it is PortalRoute.Hosted }) minOf(delay, HOTSPOT_ROUTE_POLL_MS) else delay)
             }
         } finally {
             hotspotAnnouncements.stop()
@@ -1017,7 +1034,7 @@ class TransferService : Service() {
             val eta = if (speed > 0) ceil((size - completed).coerceAtLeast(0) / speed.toDouble()).toLong() else null
             progress = TransferProgress(row.item.id, row.incoming, name, transferred,
                 size, speed, eta)
-            publishUpdate(this)
+            publishUpdate(this, progressOnly = true)
             if (row.item.kind == "file" && now - lastNotice >= 1_000L) {
                 lastNotice = now
                 showTransferNotice(row, transferred, paused = false)
@@ -1354,6 +1371,7 @@ class TransferService : Service() {
 
     companion object {
         const val ACTION_UPDATE = "app.portaldrop.TRANSFERS_UPDATED"
+        internal const val EXTRA_PROGRESS_ONLY = "progress_only"
         const val EXTRA_CHAT_ID = "app.portaldrop.CHAT_ID"
         const val EXTRA_DESKTOP = "app.portaldrop.DESKTOP"
         private const val ACTION_START = "app.portaldrop.START"
@@ -1506,8 +1524,9 @@ class TransferService : Service() {
             instance?.signal()
         }
 
-        internal fun publishUpdate(context: Context) {
-            context.sendBroadcast(Intent(ACTION_UPDATE).setPackage(context.packageName))
+        internal fun publishUpdate(context: Context, progressOnly: Boolean = false) {
+            context.sendBroadcast(Intent(ACTION_UPDATE).setPackage(context.packageName)
+                .putExtra(EXTRA_PROGRESS_ONLY, progressOnly))
         }
     }
 }

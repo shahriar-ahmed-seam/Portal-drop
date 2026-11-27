@@ -73,7 +73,7 @@ Installed-Size: $installed_kb
 Maintainer: Shahriar Ahmed Seam <shahriarseam17@gmail.com>
 Homepage: https://github.com/shahriar-ahmed-seam/Portal-drop
 Depends: libc6, python3, python3-gi, gir1.2-gtk-3.0, gir1.2-webkit2-4.1
-Recommends: pipewire-bin | pulseaudio-utils | alsa-utils, libnotify-bin, gir1.2-ayatanaappindicator3-0.1
+Recommends: pipewire-bin | pulseaudio-utils | alsa-utils, libnotify-bin, gir1.2-ayatanaappindicator3-0.1, ffmpeg
 Description: Direct LAN messaging and file transfer between Linux and Android
  Portal Drop pairs an Android phone with a desktop computer over your local
  network using a QR-pinned TLS certificate. Send text, Markdown, code blocks,

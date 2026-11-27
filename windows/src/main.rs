@@ -8,7 +8,10 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -41,6 +44,13 @@ fn serve_media(cli: &Path, request: http::Request<Vec<u8>>) -> http::Response<Ve
     if request.method() != http::Method::GET || id.len() > 36 {
         return failure(StatusCode::NOT_FOUND);
     }
+    if request
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|origin| origin != "null")
+    {
+        return failure(StatusCode::FORBIDDEN);
+    }
     let Ok(details) = run_cli(cli, &["media-path".into(), id.into()], None).and_then(|source| {
         serde_json::from_str::<Value>(&source).map_err(|error| error.to_string())
     }) else {
@@ -66,6 +76,7 @@ fn serve_media(cli: &Path, request: http::Request<Vec<u8>>) -> http::Response<Ve
     let mut response = http::Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "null")
         .header(header::CACHE_CONTROL, "no-store");
     let (start, end) = if let Some(range) = range {
         let Some((first, last)) = range
@@ -864,6 +875,7 @@ fn main() -> wry::Result<()> {
 
     let initial_prefs = load_prefs(&dir);
     let media_cli = cli.clone();
+    let media_requests = Arc::new(AtomicUsize::new(0));
     let init_script = format!(
         "window.__PORTAL_HOST = \"windows\";\nwindow.__PORTAL_FILE_PROTO = \"http://portal-media.localhost/\";\nwindow.__PORTAL_PREFS = {};\n",
         serde_json::to_string(&initial_prefs).unwrap_or_else(|_| "{\"theme\":\"light\"}".into())
@@ -873,8 +885,22 @@ fn main() -> wry::Result<()> {
         .with_initialization_script(&init_script)
         .with_html(UI_HTML)
         .with_asynchronous_custom_protocol("portal-media".into(), move |_, request, responder| {
+            if media_requests.fetch_add(1, Ordering::Relaxed) >= 3 {
+                media_requests.fetch_sub(1, Ordering::Relaxed);
+                responder.respond(
+                    http::Response::builder()
+                        .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Vec::new())
+                        .unwrap(),
+                );
+                return;
+            }
             let cli = media_cli.clone();
-            thread::spawn(move || responder.respond(serve_media(&cli, request)));
+            let counter = media_requests.clone();
+            thread::spawn(move || {
+                responder.respond(serve_media(&cli, request));
+                counter.fetch_sub(1, Ordering::Relaxed);
+            });
         })
         .with_ipc_handler(move |request| {
             if let Ok(msg) = serde_json::from_str::<IpcMessage>(request.body()) {

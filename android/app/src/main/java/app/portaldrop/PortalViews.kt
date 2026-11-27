@@ -2,6 +2,7 @@ package app.portaldrop
 
 import android.content.Context
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
@@ -17,6 +18,12 @@ import kotlin.math.roundToInt
 
 internal const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 internal const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+internal enum class ThemeMode(val title: String, val nightMode: Int?) {
+    SYSTEM("System", null),
+    LIGHT("Light", Configuration.UI_MODE_NIGHT_NO),
+    DARK("Dark", Configuration.UI_MODE_NIGHT_YES),
+}
 
 internal class PortalViews(private val context: Context) {
     val canvasColor get() = context.getColor(R.color.portal_background)

@@ -74,7 +74,9 @@ object PortalClient {
             "Enter the computer's IPv4 address and optional port."
         }
         val candidate = peer.copy(host = host, port = port)
-        val routes = portalRoutes(context, candidate.host, allowHotspot = true, requireLocal = true)
+        val localRoutes = portalRoutes(context, candidate.host, allowHotspot = true, requireLocal = true)
+        val routes = if (localRoutes.any { it is PortalRoute.Hosted }) localRoutes else
+            localRoutes + listOfNotNull(probeHostedRoute(context, host, port))
         if (routes.isEmpty()) throw IOException("Join the same Wi-Fi or hotspot as your computer.")
         val (_, route) = try {
             tryRoutes(context, candidate, routes) { it.verify() }
@@ -214,7 +216,7 @@ internal class PortalSession(
             socket.inetAddress == portalAddress(peer.host) &&
                 socket.port == peer.port &&
                 !isVpnActive(context) &&
-                route.links.any { it.owns(socket) }
+                route.links.any { it.owns(context, socket) }
         } else null,
     )
 

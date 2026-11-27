@@ -3,7 +3,7 @@ use if_addrs::{Interface, get_if_addrs};
 use ring::hmac;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     path::Path,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -239,21 +239,55 @@ fn route_uses_source(source: Ipv4Addr, destination: (Ipv4Addr, u16), broadcast: 
 
 #[derive(Default)]
 pub struct HotspotDiscovery {
-    // None records an authenticated route, so a later disconnect gets a fresh retry budget.
-    attempts: HashMap<HotspotTarget, Option<(u8, Instant)>>,
+    attempts: HashMap<HotspotTarget, HotspotRetry>,
+    last_sample_at: Option<i64>,
     peer: Option<Peer>,
 }
 
+struct HotspotRetry {
+    observed_since: i64,
+    pending: Option<(u8, Instant)>,
+}
+
+impl HotspotRetry {
+    fn due(&mut self, now: Instant, connected_at: Option<i64>) -> bool {
+        if connected_at.is_some_and(|time| time >= self.observed_since) {
+            // A later disconnect from this route gets a fresh retry budget.
+            self.pending = None;
+            return false;
+        }
+        let (count, next) = self.pending.get_or_insert((0, now));
+        if *count >= 6 || now < *next {
+            return false;
+        }
+        *count += 1;
+        *next = now + Duration::from_secs(u64::from(*count) * 2);
+        true
+    }
+}
+
 impl HotspotDiscovery {
-    pub fn retry(&mut self, listen: SocketAddrV4, peer: Option<Peer>, connected: &[IpAddr]) {
+    pub fn retry(
+        &mut self,
+        listen: SocketAddrV4,
+        peer: Option<Peer>,
+        connected: &BTreeMap<IpAddr, i64>,
+    ) {
         if self.peer != peer {
             self.attempts.clear();
+            self.last_sample_at = None;
             self.peer = peer;
         }
         let Some(peer) = peer else { return };
         let Ok(interfaces) = get_if_addrs() else {
             return;
         };
+        let sampled_at = chrono::Utc::now().timestamp_millis();
+        // A newly observed target may reuse an IPv4 from the previous Wi-Fi link.
+        let observed_since = self
+            .last_sample_at
+            .replace(sampled_at)
+            .unwrap_or(sampled_at);
         let targets: std::collections::HashSet<_> = interfaces
             .iter()
             .filter_map(|interface| hotspot_target(interface, None))
@@ -262,16 +296,12 @@ impl HotspotDiscovery {
         self.attempts.retain(|target, _| targets.contains(target));
         let now = Instant::now();
         for target in targets {
-            let progress = self.attempts.entry(target).or_default();
-            if connected.contains(&IpAddr::V4(target.source)) {
-                *progress = None;
-                continue;
-            }
-            let (count, next) = progress.get_or_insert((0, now));
-            if *count < 4 && now >= *next {
+            let progress = self.attempts.entry(target).or_insert(HotspotRetry {
+                observed_since,
+                pending: None,
+            });
+            if progress.due(now, connected.get(&IpAddr::V4(target.source)).copied()) {
                 let _ = send_hotspot_hint(target, listen.port(), &peer, None);
-                *count += 1;
-                *next = now + Duration::from_secs(u64::from(*count) * 2);
             }
         }
     }
@@ -511,6 +541,23 @@ mod tests {
                 .gateway,
             Some(gateway)
         );
+    }
+
+    #[test]
+    fn hotspot_retry_ignores_an_older_session_on_a_reused_local_ip() {
+        let mut retry = HotspotRetry {
+            observed_since: 100,
+            pending: None,
+        };
+        let start = Instant::now();
+        assert!(retry.due(start, Some(99)));
+        assert!(!retry.due(start + Duration::from_secs(1), Some(99)));
+        for seconds in [2, 6, 12, 20, 30] {
+            assert!(retry.due(start + Duration::from_secs(seconds), Some(99)));
+        }
+        assert!(!retry.due(start + Duration::from_secs(42), Some(99)));
+        assert!(!retry.due(start + Duration::from_secs(43), Some(100)));
+        assert!(retry.due(start + Duration::from_secs(44), None));
     }
 
     #[test]

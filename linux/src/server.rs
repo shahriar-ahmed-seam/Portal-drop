@@ -177,11 +177,11 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
     let _ = store.set_connected(false);
     let _ = store.purge_expired(&files);
 
-    let tls = RustlsConfig::from_pem(identity.cert, identity.key).await?;
     let listener = TcpListener::bind(listen)?;
     let address = listener.local_addr()?;
     #[cfg(target_os = "linux")]
-    crate::watchdog::start(address);
+    crate::watchdog::start(address, &identity.cert);
+    let tls = RustlsConfig::from_pem(identity.cert, identity.key).await?;
 
     let (events_tx, _) = broadcast::channel::<&'static str>(64);
     let wake_path = files.data_dir().join("wake.json");
@@ -266,7 +266,7 @@ pub async fn serve(store: Store, files: Files, listen: SocketAddr, discover: boo
                 let Ok(next) = tokio::task::spawn_blocking(move || {
                     let peer = store.active_peer().ok().flatten();
                     let connected = peer
-                        .map(|peer| connected_ips(&routes, peer))
+                        .map(|peer| connected_route_times(&routes, peer))
                         .unwrap_or_default();
                     discovery.retry(address, peer, &connected);
                     discovery
@@ -680,10 +680,6 @@ async fn info(State(app): State<App>, Authorized(peer): Authorized) -> ApiResult
 struct PresenceGuard {
     app: App,
     route: (Peer, IpAddr, i64),
-}
-
-fn connected_ips(routes: &PeerRoutes, peer: Peer) -> Vec<IpAddr> {
-    connected_route_times(routes, peer).into_keys().collect()
 }
 
 fn connected_route_times(routes: &PeerRoutes, peer: Peer) -> BTreeMap<IpAddr, i64> {

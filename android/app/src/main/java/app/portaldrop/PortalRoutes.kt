@@ -7,8 +7,10 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import java.io.IOException
+import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Proxy
 import java.net.Socket
@@ -57,23 +59,61 @@ internal fun PortalRoute.Attached.hotspotGateway(context: Context, allowValidate
         ?.hostAddress
 }
 
-internal data class HotspotLink(val name: String, val source: Inet4Address, val prefixLength: Int) {
+internal data class HotspotLink(
+    val name: String?,
+    val source: Inet4Address,
+    val prefixLength: Int,
+    private val peerAddress: Inet4Address? = null,
+) {
     private val mask = -1 shl (32 - prefixLength)
     private val subnet = source.asIpv4Number() and mask
 
     fun permits(address: InetAddress?): Boolean =
         address is Inet4Address && address != source && address.isHotspotAddress() &&
+            (peerAddress == null || address == peerAddress) &&
             (address.asIpv4Number() and mask) == subnet
 
-    fun owns(socket: Socket): Boolean =
-        socket.localAddress == source && permits(socket.inetAddress) &&
+    fun owns(context: Context, socket: Socket): Boolean {
+        if (socket.localAddress != source || !permits(socket.inetAddress)) return false
+        return if (name == null) {
+            OfflineHotspotService.isActive() && isDownstreamProbeSource(context, source)
+        } else {
             runCatching { NetworkInterface.getByInetAddress(source)?.name == name }.getOrDefault(false)
+        }
+    }
 }
 
 private fun Inet4Address.asIpv4Number(): Int =
     address.fold(0) { number, octet -> (number shl 8) or (octet.toInt() and 0xff) }
 
-private fun Inet4Address.isHotspotAddress(): Boolean = isSiteLocalAddress || isLinkLocalAddress
+internal fun Inet4Address.isHotspotAddress(): Boolean = isSiteLocalAddress || isLinkLocalAddress
+
+internal fun probeHostedRoute(context: Context, host: String, port: Int): PortalRoute.Hosted? {
+    if (!OfflineHotspotService.isActive() || isVpnActive(context)) return null
+    val address = (portalAddress(host) as? Inet4Address)?.takeIf { it.isHotspotAddress() } ?: return null
+    // Some phones keep the AP out of the app's interface list. Connecting a UDP socket
+    // selects a route without sending a packet. Restrict this fallback to a single peer
+    // on the same /24 and check the source again before sending any HTTPS data.
+    val source = runCatching {
+        DatagramSocket().use {
+            it.connect(InetSocketAddress(address, port))
+            it.localAddress as? Inet4Address
+        }
+    }.getOrNull()?.takeIf { it.isHotspotAddress() } ?: return null
+    val link = HotspotLink(name = null, source = source, prefixLength = 24, peerAddress = address)
+    if (!link.permits(address) || !isDownstreamProbeSource(context, source)) return null
+    return PortalRoute.Hosted(listOf(link))
+}
+
+@Suppress("DEPRECATION") // Check all attached networks for an uplink using the probe address.
+private fun isDownstreamProbeSource(context: Context, source: Inet4Address): Boolean {
+    val manager = context.getSystemService(ConnectivityManager::class.java)
+    val active = manager.activeNetwork
+    return (listOfNotNull(active) + manager.allNetworks).distinct().none { network ->
+        val properties = manager.getLinkProperties(network)
+        if (properties == null) network == active else properties.linkAddresses.any { it.address == source }
+    }
+}
 
 internal fun portalAddress(host: String): InetAddress? =
     runCatching { InetAddresses.parseNumericAddress(host.removePrefix("[").removeSuffix("]")) }.getOrNull()
